@@ -591,12 +591,14 @@ async function processTweets(
         console.log(`[${twitterUsername}] 🔄 Found quoted tweet in local history.`);
         quoteEmbed = { $type: 'app.bsky.embed.record', record: { uri: quoteRef.uri, cid: quoteRef.cid } };
       } else {
+        // If it's NOT in our managed account history, it's external
         const quoteUrlEntity = urls.find((u) => u.expanded_url?.includes(quoteId));
         externalQuoteUrl = quoteUrlEntity?.expanded_url || `https://twitter.com/i/status/${quoteId}`;
         console.log(`[${twitterUsername}] 🔗 Quoted tweet is external: ${externalQuoteUrl}`);
       }
     }
 
+    // Only append link for external quotes
     if (externalQuoteUrl && !text.includes(externalQuoteUrl)) {
       text += `\n\nQT: ${externalQuoteUrl}`;
     }
