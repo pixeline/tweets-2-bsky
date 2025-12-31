@@ -593,13 +593,13 @@ async function processTweets(
       const quoteId = tweet.quoted_status_id_str;
       const quoteRef = processedTweets[quoteId];
       if (quoteRef && !quoteRef.migrated && quoteRef.uri && quoteRef.cid) {
-        console.log(`[${twitterUsername}] 🔄 Found quoted tweet in local history.`);
+        console.log(`[${twitterUsername}] 🔄 Found quoted tweet in local history. Natively embedding.`);
         quoteEmbed = { $type: 'app.bsky.embed.record', record: { uri: quoteRef.uri, cid: quoteRef.cid } };
       } else {
         const quoteUrlEntity = urls.find((u) => u.expanded_url?.includes(quoteId));
         const qUrl = quoteUrlEntity?.expanded_url || `https://twitter.com/i/status/${quoteId}`;
         
-        // Check if it's a self-quote
+        // Check if it's a self-quote (same user)
         const isSelfQuote = qUrl.toLowerCase().includes(`twitter.com/${twitterUsername.toLowerCase()}/`) || 
                            qUrl.toLowerCase().includes(`x.com/${twitterUsername.toLowerCase()}/`);
         
@@ -607,13 +607,13 @@ async function processTweets(
           externalQuoteUrl = qUrl;
           console.log(`[${twitterUsername}] 🔗 Quoted tweet is external: ${externalQuoteUrl}`);
         } else {
-          console.log(`[${twitterUsername}] 🔁 Quoted tweet is a self-quote, skipping 'QT:' link.`);
+          console.log(`[${twitterUsername}] 🔁 Quoted tweet is a self-quote, skipping link.`);
         }
       }
     }
 
-    // Only append link for external quotes
-    if (externalQuoteUrl && !text.includes(externalQuoteUrl)) {
+    // Only append link for external quotes IF we couldn't natively embed it
+    if (externalQuoteUrl && !quoteEmbed && !text.includes(externalQuoteUrl)) {
       text += `\n\nQT: ${externalQuoteUrl}`;
     }
 
