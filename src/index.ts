@@ -342,28 +342,73 @@ async function captureTweetScreenshot(tweetUrl: string): Promise<Buffer | null> 
   return null;
 }
 
+async function pollForVideoProcessing(agent: BskyAgent, jobId: string): Promise<BlobRef> {
+  console.log(`[VIDEO] ⏳ Polling for processing completion (this can take a minute)...`);
+  let attempts = 0;
+  let blob: BlobRef | undefined;
+
+  while (!blob) {
+    attempts++;
+    const statusUrl = new URL("https://video.bsky.app/xrpc/app.bsky.video.getJobStatus");
+    statusUrl.searchParams.append("jobId", jobId);
+
+    const statusResponse = await fetch(statusUrl);
+    if (!statusResponse.ok) {
+      console.warn(`[VIDEO] ⚠️ Job status fetch failed (${statusResponse.status}), retrying...`);
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+      continue;
+    }
+
+    const statusData = (await statusResponse.json()) as any;
+    const state = statusData.jobStatus.state;
+    const progress = statusData.jobStatus.progress || 0;
+
+    console.log(`[VIDEO] 🔄 Job ${jobId}: ${state} (${progress}%)`);
+
+    if (statusData.jobStatus.blob) {
+      blob = statusData.jobStatus.blob;
+      console.log(`[VIDEO] 🎉 Video processing complete! Blob ref obtained.`);
+    } else if (state === "JOB_STATE_FAILED") {
+      throw new Error(`Video processing failed: ${statusData.jobStatus.error || "Unknown error"}`);
+    } else {
+      // Wait before next poll
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+
+    if (attempts > 60) {
+      // ~5 minute timeout
+      throw new Error("Video processing timed out after 5 minutes.");
+    }
+  }
+  return blob!;
+}
+
 async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: string): Promise<BlobRef> {
-  const sanitizedFilename = filename.split('?')[0] || 'video.mp4';
-  console.log(`[VIDEO] 🟢 Starting upload process for ${sanitizedFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
-  
+  const sanitizedFilename = filename.split("?")[0] || "video.mp4";
+  console.log(
+    `[VIDEO] 🟢 Starting upload process for ${sanitizedFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`,
+  );
+
   try {
     // 1. Get Service Auth
     // We need to resolve the actual PDS host for this DID
     console.log(`[VIDEO] 🔍 Resolving PDS host for DID: ${agent.session!.did}...`);
     const { data: repoDesc } = await agent.com.atproto.repo.describeRepo({ repo: agent.session!.did! });
-    
+
     // didDoc might be present in repoDesc
-    const pdsService = (repoDesc as any).didDoc?.service?.find((s: any) => s.id === '#atproto_pds' || s.type === 'AtProtoPds');
+    const pdsService = (repoDesc as any).didDoc?.service?.find(
+      (s: any) => s.id === "#atproto_pds" || s.type === "AtProtoPds",
+    );
     const pdsUrl = pdsService?.serviceEndpoint;
-    const pdsHost = pdsUrl ? new URL(pdsUrl).host : 'bsky.social';
-    
+    const pdsHost = pdsUrl ? new URL(pdsUrl).host : "bsky.social";
+
     console.log(`[VIDEO] 🌐 PDS Host detected: ${pdsHost}`);
     console.log(`[VIDEO] 🔑 Requesting service auth token for audience: did:web:${pdsHost}...`);
-    
+
     const { data: serviceAuth } = await agent.com.atproto.server.getServiceAuth({
-        aud: `did:web:${pdsHost}`,
-        lxm: "com.atproto.repo.uploadBlob",
-        exp: Math.floor(Date.now() / 1000) + 60 * 30,
+      aud: `did:web:${pdsHost}`,
+      lxm: "com.atproto.repo.uploadBlob",
+      exp: Math.floor(Date.now() / 1000) + 60 * 30,
     });
     console.log(`[VIDEO] ✅ Service auth token obtained.`);
 
@@ -385,55 +430,31 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
     });
 
     if (!uploadResponse.ok) {
-        const errText = await uploadResponse.text();
-        console.error(`[VIDEO] ❌ Server responded with ${uploadResponse.status}: ${errText}`);
-        throw new Error(`Video upload failed: ${uploadResponse.status} ${errText}`);
+      const errorText = await uploadResponse.text();
+      console.error(`[VIDEO] ❌ Server responded with ${uploadResponse.status}: ${errorText}`);
+
+      try {
+        const errorJson = JSON.parse(errorText);
+        if (errorJson.error === "already_exists" && errorJson.jobId) {
+          console.log(`[VIDEO] ♻️ Video already exists. Resuming with Job ID: ${errorJson.jobId}`);
+          return await pollForVideoProcessing(agent, errorJson.jobId);
+        }
+      } catch (e) {
+        // Not JSON or missing fields, proceed with throwing
+      }
+
+      throw new Error(`Video upload failed: ${uploadResponse.status} ${errorText}`);
     }
 
     const jobStatus = (await uploadResponse.json()) as any;
     console.log(`[VIDEO] 📦 Upload accepted. Job ID: ${jobStatus.jobId}, State: ${jobStatus.state}`);
-    
-    let blob: BlobRef | undefined = jobStatus.blob;
 
-    // 3. Poll for processing status
-    if (!blob) {
-        console.log(`[VIDEO] ⏳ Polling for processing completion (this can take a minute)...`);
-        let attempts = 0;
-        while (!blob) {
-            attempts++;
-            const statusUrl = new URL("https://video.bsky.app/xrpc/app.bsky.video.getJobStatus");
-            statusUrl.searchParams.append("jobId", jobStatus.jobId);
-            
-            const statusResponse = await fetch(statusUrl);
-            if (!statusResponse.ok) {
-                console.warn(`[VIDEO] ⚠️ Job status fetch failed (${statusResponse.status}), retrying...`);
-                await new Promise((resolve) => setTimeout(resolve, 5000));
-                continue;
-            }
-
-            const statusData = await statusResponse.json() as any;
-            const state = statusData.jobStatus.state;
-            const progress = statusData.jobStatus.progress || 0;
-            
-            console.log(`[VIDEO] 🔄 Job ${jobStatus.jobId}: ${state} (${progress}%)`);
-            
-            if (statusData.jobStatus.blob) {
-                blob = statusData.jobStatus.blob;
-                console.log(`[VIDEO] 🎉 Video processing complete! Blob ref obtained.`);
-            } else if (state === 'JOB_STATE_FAILED') {
-                throw new Error(`Video processing failed: ${statusData.jobStatus.error || 'Unknown error'}`);
-            } else {
-                // Wait before next poll
-                await new Promise((resolve) => setTimeout(resolve, 5000));
-            }
-            
-            if (attempts > 60) { // ~5 minute timeout
-                throw new Error("Video processing timed out after 5 minutes.");
-            }
-        }
+    if (jobStatus.blob) {
+      return jobStatus.blob;
     }
 
-    return blob!;
+    // 3. Poll for processing status
+    return await pollForVideoProcessing(agent, jobStatus.jobId);
   } catch (err) {
     console.error(`[VIDEO] ❌ Error in uploadVideoToBluesky:`, (err as Error).message);
     throw err;
@@ -540,13 +561,22 @@ async function processTweets(
   const processedTweets = loadProcessedTweets(twitterUsername);
   tweets.reverse();
 
+  let count = 0;
   for (const tweet of tweets) {
+    count++;
     const tweetId = tweet.id_str || tweet.id;
     if (!tweetId) continue;
 
     if (processedTweets[tweetId]) continue;
 
     console.log(`\n[${twitterUsername}] 🕒 Processing tweet: ${tweetId}`);
+    updateAppStatus({
+      state: 'processing',
+      currentAccount: twitterUsername,
+      processedCount: count,
+      totalCount: tweets.length,
+      message: `Processing tweet ${tweetId}`,
+    });
 
     const replyStatusId = tweet.in_reply_to_status_id_str || tweet.in_reply_to_status_id;
     const replyUserId = tweet.in_reply_to_user_id_str || tweet.in_reply_to_user_id;
@@ -624,8 +654,10 @@ async function processTweets(
         if (!url) continue;
         try {
           console.log(`[${twitterUsername}] 📥 Downloading image: ${url}`);
+          updateAppStatus({ message: `Downloading image: ${path.basename(url)}` });
           const { buffer, mimeType } = await downloadMedia(url);
           console.log(`[${twitterUsername}] 📤 Uploading image to Bluesky...`);
+          updateAppStatus({ message: `Uploading image to Bluesky...` });
           const blob = await uploadToBluesky(agent, buffer, mimeType);
           images.push({ alt: media.ext_alt_text || 'Image from Twitter', image: blob, aspectRatio });
           console.log(`[${twitterUsername}] ✅ Image uploaded.`);
@@ -644,10 +676,12 @@ async function processTweets(
             const videoUrl = firstVariant.url;
             try {
               console.log(`[${twitterUsername}] 📥 Downloading video: ${videoUrl}`);
+              updateAppStatus({ message: `Downloading video: ${path.basename(videoUrl)}` });
               const { buffer, mimeType } = await downloadMedia(videoUrl);
               
               if (buffer.length <= 100 * 1024 * 1024) {
                 const filename = videoUrl.split('/').pop() || 'video.mp4';
+                updateAppStatus({ message: `Uploading video to Bluesky...` });
                 videoBlob = await uploadVideoToBluesky(agent, buffer, filename);
                 videoAspectRatio = aspectRatio;
                 console.log(`[${twitterUsername}] ✅ Video upload process complete.`);
@@ -726,6 +760,7 @@ async function processTweets(
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i] as string;
       console.log(`[${twitterUsername}] 📤 Posting chunk ${i + 1}/${chunks.length}...`);
+      updateAppStatus({ message: `Posting chunk ${i + 1}/${chunks.length}...` });
       
       const rt = new RichText({ text: chunk });
       await rt.detectFacets(agent);
@@ -793,6 +828,7 @@ async function processTweets(
     
     const wait = getRandomDelay(2000, 5000);
     console.log(`[${twitterUsername}] 😴 Pacing: Waiting ${wait}ms before next tweet.`);
+    updateAppStatus({ state: 'pacing', message: `Pacing: Waiting ${Math.round(wait/1000)}s...` });
     await new Promise((r) => setTimeout(r, wait));
   }
 }
@@ -824,6 +860,8 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
   const config = getConfig();
   if (config.mappings.length === 0) return;
 
+  updateAppStatus({ state: 'checking', message: 'Starting account check...' });
+
   const pendingBackfills = getPendingBackfills();
 
   console.log(`[${new Date().toISOString()}] Checking all accounts...`);
@@ -834,14 +872,16 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
       const agent = await getAgent(mapping);
       if (!agent) continue;
 
-      const backfillReq = pendingBackfills.find(b => b.id === mapping.id);
+      const backfillReq = getPendingBackfills().find(b => b.id === mapping.id);
       if (forceBackfill || backfillReq) {
         const limit = backfillReq?.limit || 100;
         console.log(`[${mapping.twitterUsername}] Running backfill (limit ${limit})...`);
+        updateAppStatus({ state: 'backfilling', currentAccount: mapping.twitterUsername, message: `Starting backfill (limit ${limit})...` });
         await importHistory(mapping.twitterUsername, limit, dryRun);
         clearBackfill(mapping.id);
         console.log(`[${mapping.twitterUsername}] Backfill complete.`);
       } else {
+        updateAppStatus({ state: 'checking', currentAccount: mapping.twitterUsername, message: 'Fetching latest tweets...' });
         const result = await safeSearch(`from:${mapping.twitterUsername}`, 30);
         if (!result.success || !result.tweets) continue;
         await processTweets(agent, mapping.twitterUsername, result.tweets, dryRun);
@@ -851,6 +891,7 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
     }
   }
 
+  updateAppStatus({ state: 'idle', currentAccount: undefined, message: 'Check complete.' });
   if (!dryRun) {
     updateLastCheckTime();
   }
@@ -876,10 +917,18 @@ async function importHistory(twitterUsername: string, limit = 100, dryRun = fals
   const processedTweets = loadProcessedTweets(twitterUsername);
 
   while (true) {
+    // Check if this backfill request was cancelled
+    const stillPending = getPendingBackfills().some(b => b.id === mapping.id);
+    if (!stillPending) {
+      console.log(`[${twitterUsername}] 🛑 Backfill cancelled by user.`);
+      return;
+    }
+
     let query = `from:${twitterUsername}`;
     if (maxId) query += ` max_id:${maxId}`;
 
     console.log(`Fetching batch... (Collected: ${allFoundTweets.length})`);
+    updateAppStatus({ message: `Fetching batch... (Collected: ${allFoundTweets.length})` });
     const result = await safeSearch(query, batchSize);
 
     if (!result.success || !result.tweets || result.tweets.length === 0) break;
@@ -911,7 +960,14 @@ async function importHistory(twitterUsername: string, limit = 100, dryRun = fals
   }
 }
 
-import { startServer, updateLastCheckTime, getPendingBackfills, clearBackfill, getNextCheckTime } from './server.js';
+import {
+  startServer,
+  updateLastCheckTime,
+  getPendingBackfills,
+  clearBackfill,
+  getNextCheckTime,
+  updateAppStatus,
+} from './server.js';
 
 async function main(): Promise<void> {
   const program = new Command();

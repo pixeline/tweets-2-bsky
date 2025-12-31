@@ -23,6 +23,20 @@ interface PendingBackfill {
 }
 let pendingBackfills: PendingBackfill[] = [];
 
+interface AppStatus {
+  state: 'idle' | 'checking' | 'backfilling' | 'pacing' | 'processing';
+  currentAccount?: string;
+  processedCount?: number;
+  totalCount?: number;
+  message?: string;
+  lastUpdate: number;
+}
+
+let currentAppStatus: AppStatus = {
+  state: 'idle',
+  lastUpdate: Date.now()
+};
+
 app.use(cors());
 app.use(express.json());
 
@@ -169,6 +183,7 @@ app.get('/api/status', authenticateToken, (_req, res) => {
     nextCheckMinutes: Math.ceil(nextRunMs / 60000),
     checkIntervalMinutes: config.checkIntervalMinutes,
     pendingBackfills,
+    currentStatus: currentAppStatus,
   });
 });
 
@@ -204,11 +219,24 @@ app.delete('/api/backfill/:id', authenticateToken, (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res) => {
+  pendingBackfills = [];
+  res.json({ success: true, message: 'All backfills cleared' });
+});
+
 // Export for use by index.ts
 export function updateLastCheckTime() {
   const config = getConfig();
   lastCheckTime = Date.now();
   nextCheckTime = lastCheckTime + (config.checkIntervalMinutes || 5) * 60 * 1000;
+}
+
+export function updateAppStatus(status: Partial<AppStatus>) {
+  currentAppStatus = {
+    ...currentAppStatus,
+    ...status,
+    lastUpdate: Date.now()
+  };
 }
 
 export function getPendingBackfills(): PendingBackfill[] {

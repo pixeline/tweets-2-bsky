@@ -221,6 +221,29 @@
                 }
             };
 
+            const cancelBackfill = async (id) => {
+                try {
+                    await axios.delete(`/api/backfill/${id}`, { 
+                        headers: { Authorization: `Bearer ${token}` } 
+                    });
+                    fetchStatus();
+                } catch (err) {
+                    alert('Failed to cancel backfill');
+                }
+            };
+
+            const clearAllBackfills = async () => {
+                if (!confirm('Stop all pending and running backfills?')) return;
+                try {
+                    await axios.post('/api/backfill/clear-all', {}, { 
+                        headers: { Authorization: `Bearer ${token}` } 
+                    });
+                    fetchStatus();
+                } catch (err) {
+                    alert('Failed to clear backfills');
+                }
+            };
+
             const clearCache = async (id, twitterUsername) => {
                 if (!confirm(`Clear processed tweets cache for @${twitterUsername}? This will make the next run re-process recent tweets (potentially causing duplicates if they were already posted).`)) return;
                 try {
@@ -319,6 +342,11 @@
                                 <button className="btn btn-outline-secondary btn-sm" onClick={runNow}>
                                     Run Now
                                 </button>
+                                {isAdmin && status.pendingBackfills?.length > 0 && (
+                                    <button className="btn btn-outline-danger btn-sm" onClick={clearAllBackfills}>
+                                        Stop All Backfills ({status.pendingBackfills.length})
+                                    </button>
+                                )}
                                 <button className="btn btn-outline-secondary btn-sm" onClick={() => setDarkMode(!darkMode)}>
                                     {darkMode ? 'Light' : 'Dark'}
                                 </button>
@@ -328,6 +356,40 @@
                     </nav>
 
                     <div className="container">
+                        {status.currentStatus && status.currentStatus.state !== 'idle' && (
+                            <div className="row mb-4">
+                                <div className="col-12">
+                                    <div className={`card p-3 border-start border-4 ${status.currentStatus.state === 'backfilling' ? 'border-warning' : 'border-primary'}`}>
+                                        <div className="d-flex justify-content-between align-items-center">
+                                            <div>
+                                                <h6 className="mb-1 d-flex align-items-center text-capitalize">
+                                                    <div className="spinner-border spinner-border-sm text-primary me-2" role="status"></div>
+                                                    {status.currentStatus.state} 
+                                                    {status.currentStatus.currentAccount && ` - @${status.currentStatus.currentAccount}`}
+                                                </h6>
+                                                <div className="text-muted small">
+                                                    {status.currentStatus.message}
+                                                </div>
+                                            </div>
+                                            {status.currentStatus.totalCount > 0 && (
+                                                <div className="text-end">
+                                                    <div className="h4 mb-0">{Math.round((status.currentStatus.processedCount / status.currentStatus.totalCount) * 100)}%</div>
+                                                    <div className="text-muted small">{status.currentStatus.processedCount} / {status.currentStatus.totalCount}</div>
+                                                </div>
+                                            )}
+                                        </div>
+                                        {status.currentStatus.totalCount > 0 && (
+                                            <div className="progress mt-2" style={{ height: '4px' }}>
+                                                <div 
+                                                    className="progress-bar progress-bar-striped progress-bar-animated" 
+                                                    style={{ width: `${(status.currentStatus.processedCount / status.currentStatus.totalCount) * 100}%` }}
+                                                ></div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                         <div className="row">
                             {isAdmin && (
                             <div className="col-md-4 mb-4">
@@ -403,6 +465,11 @@
                                                         <td>
                                                             <span className={`status-dot ${isBackfillQueued(m.id) ? 'status-queued' : 'status-active'}`}></span>
                                                             {isBackfillQueued(m.id) ? 'Backfill' : 'Active'}
+                                                            {isBackfillQueued(m.id) && (
+                                                                <button onClick={() => cancelBackfill(m.id)} className="btn btn-link btn-sm text-danger p-0 ms-1" title="Stop Backfill">
+                                                                    <span className="material-icons" style={{fontSize: '14px'}}>cancel</span>
+                                                                </button>
+                                                            )}
                                                         </td>
                                                         <td className="text-end">
                                                             {isAdmin && (
