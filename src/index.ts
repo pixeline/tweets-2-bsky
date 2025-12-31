@@ -519,8 +519,8 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
       if (!agent) continue;
 
       if (forceBackfill || pendingBackfills.includes(mapping.id)) {
-        console.log(`[${mapping.twitterUsername}] Running backfill...`);
-        await importHistory(mapping.twitterUsername, undefined, dryRun);
+        console.log(`[${mapping.twitterUsername}] Running backfill (limit 100)...`);
+        await importHistory(mapping.twitterUsername, 100, dryRun);
         clearBackfill(mapping.id);
         console.log(`[${mapping.twitterUsername}] Backfill complete.`);
       } else {
@@ -538,7 +538,7 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
   }
 }
 
-async function importHistory(twitterUsername: string, limit?: number, dryRun = false): Promise<void> {
+async function importHistory(twitterUsername: string, limit = 100, dryRun = false): Promise<void> {
   const config = getConfig();
   const mapping = config.mappings.find((m) => m.twitterUsername.toLowerCase() === twitterUsername.toLowerCase());
   if (!mapping) {
