@@ -264,12 +264,28 @@ async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: strin
 }
 
 async function captureTweetScreenshot(tweetUrl: string): Promise<Buffer | null> {
-  console.log(`[SCREENSHOT] 📸 Capturing screenshot for: ${tweetUrl}`);
+  const browserPaths = [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/usr/bin/google-chrome-stable',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ];
+
+  const executablePath = browserPaths.find(p => fs.existsSync(p));
+  
+  if (!executablePath) {
+    console.warn(`[SCREENSHOT] ⏩ Skipping screenshot (no Chrome/Chromium found at common paths).`);
+    return null;
+  }
+
+  console.log(`[SCREENSHOT] 📸 Capturing screenshot for: ${tweetUrl} using ${executablePath}`);
   let browser;
   try {
     browser = await puppeteer.launch({
-      executablePath: '/usr/bin/google-chrome',
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+      executablePath,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
     const page = await browser.newPage();
     await page.setViewport({ width: 800, height: 1200, deviceScaleFactor: 2 });
@@ -558,7 +574,12 @@ async function processTweets(
       continue;
     }
 
-    let text = tweetText;
+    let text = tweetText
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
     
     // 1. Link Expansion
     console.log(`[${twitterUsername}] 🔗 Expanding links...`);
