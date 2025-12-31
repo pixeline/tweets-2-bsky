@@ -1,0 +1,3 @@
+#!/bin/bash
+# A simple wrapper to run the CLI
+npx tsx src/cli.ts "$@"

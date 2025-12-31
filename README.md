@@ -1,5 +1,7 @@
 # 🐦 Tweets-2-Bsky
 
+> **Note**: This project is built on top of [**bird**](https://github.com/steipete/bird) by [@steipete](https://github.com/steipete), which provides the core Twitter interaction capabilities.
+
 A powerful tool to crosspost your Tweets to Bluesky automatically. Now supports **multiple accounts**, **custom PDS (hosting) locations**, and a **user-friendly CLI** for easy management.
 
 ## ✨ Features
@@ -33,10 +35,10 @@ npm install
 Instead of editing files, use our simple setup command:
 ```bash
 # 1. Set your Twitter cookies (one set of cookies works for all mappings)
-npm run cli setup-twitter
+./crosspost setup-twitter
 
 # 2. Add your first account mapping
-npm run cli add-mapping
+./crosspost add-mapping
 ```
 *Note: You can find your Twitter `auth_token` and `ct0` in your browser's developer tools under Application -> Cookies.*
 
@@ -57,7 +59,7 @@ npm start
 If you want to import your historical tweets for a specific account:
 ```bash
 # Get the command from the CLI help
-npm run cli import-history
+./crosspost import-history
 
 # Example: Import the last 10 tweets for a specific user
 npm run import -- --username YOUR_TWITTER_HANDLE --limit 10
@@ -71,9 +73,9 @@ npm start -- --dry-run
 
 ### Management Commands
 ```bash
-npm run cli list             # Show all active mappings
-npm run cli remove           # Remove an account mapping
-npm run cli set-interval     # Change how often to check for new tweets
+./crosspost list             # Show all active mappings
+./crosspost remove           # Remove an account mapping
+./crosspost set-interval     # Change how often to check for new tweets
 ```
 
 ---
