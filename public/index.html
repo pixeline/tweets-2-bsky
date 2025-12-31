@@ -416,23 +416,44 @@
                                     </h5>
                                     <form onSubmit={addMapping}>
                                         <div className="mb-2">
-                                            <input name="owner" placeholder="Owner" className="form-control form-control-sm" required />
+                                            <input name="owner" placeholder="Owner (e.g. My Brand)" className="form-control form-control-sm" required />
                                         </div>
                                         <div className="mb-2">
-                                            <input name="twitterUsername" placeholder="Twitter" className="form-control form-control-sm" required />
+                                            <input name="twitterUsername" placeholder="Twitter Username" className="form-control form-control-sm" required />
                                         </div>
-                                        <hr className="my-2"/>
-                                        <div className="mb-2">
-                                            <input name="bskyIdentifier" placeholder="Bluesky" className="form-control form-control-sm" required />
-                                        </div>
-                                        <div className="mb-2">
-                                            <input name="bskyPassword" type="password" placeholder="App Password" className="form-control form-control-sm" required />
-                                        </div>
-                                        <div className="mb-3">
+                                        
+                                        <div className="mt-3 mb-2">
+                                            <label className="form-label small fw-bold text-muted">Bluesky Destination</label>
+                                            {mappings.length > 0 && (
+                                                <div className="mb-2">
+                                                    <select 
+                                                        className="form-select form-select-sm" 
+                                                        onChange={(e) => {
+                                                            if (e.target.value) {
+                                                                const m = mappings.find(x => x.bskyIdentifier === e.target.value);
+                                                                if (m) {
+                                                                    const form = e.target.form;
+                                                                    form.bskyIdentifier.value = m.bskyIdentifier;
+                                                                    form.bskyPassword.value = m.bskyPassword;
+                                                                    form.bskyServiceUrl.value = m.bskyServiceUrl;
+                                                                }
+                                                            }
+                                                        }}
+                                                    >
+                                                        <option value="">-- Use Existing Bluesky Account --</option>
+                                                        {[...new Set(mappings.map(m => m.bskyIdentifier))].map(id => (
+                                                            <option key={id} value={id}>{id}</option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            )}
+                                            <input name="bskyIdentifier" placeholder="Bluesky Handle" className="form-control form-control-sm mb-2" required />
+                                            <input name="bskyPassword" type="password" placeholder="App Password" className="form-control form-control-sm mb-2" required />
                                             <input name="bskyServiceUrl" defaultValue="https://bsky.social" className="form-control form-control-sm" />
                                         </div>
+                                        
                                         <button className="btn btn-success btn-sm w-100" disabled={loading}>
-                                            {loading ? 'Adding...' : 'Add'}
+                                            {loading ? 'Adding...' : 'Add Account Mapping'}
                                         </button>
                                     </form>
                                 </div>
