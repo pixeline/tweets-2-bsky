@@ -128,9 +128,14 @@ async function migrateJsonToSqlite() {
   if (files.length === 0) return;
 
   console.log(`📦 Found ${files.length} legacy cache files. Migrating to SQLite...`);
+  const config = getConfig();
   
   for (const file of files) {
-    const username = file.replace('.json', '');
+    const username = file.replace('.json', '').toLowerCase();
+    // Try to find a matching bskyIdentifier from config
+    const mapping = config.mappings.find(m => m.twitterUsername.toLowerCase() === username);
+    const bskyIdentifier = mapping?.bskyIdentifier || 'unknown';
+
     try {
       const filePath = path.join(PROCESSED_DIR, file);
       const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as ProcessedTweetsMap;
@@ -139,6 +144,7 @@ async function migrateJsonToSqlite() {
         dbService.saveTweet({
           twitter_id: twitterId,
           twitter_username: username,
+          bsky_identifier: bskyIdentifier,
           bsky_uri: entry.uri,
           bsky_cid: entry.cid,
           bsky_root_uri: entry.root?.uri,
@@ -157,14 +163,15 @@ async function migrateJsonToSqlite() {
   console.log('✅ Migration complete.');
 }
 
-function loadProcessedTweets(twitterUsername: string): ProcessedTweetsMap {
-  return dbService.getTweetsByUsername(twitterUsername);
+function loadProcessedTweets(bskyIdentifier: string): ProcessedTweetsMap {
+  return dbService.getTweetsByBskyIdentifier(bskyIdentifier);
 }
 
-function saveProcessedTweet(twitterUsername: string, twitterId: string, entry: ProcessedTweetEntry): void {
+function saveProcessedTweet(twitterUsername: string, bskyIdentifier: string, twitterId: string, entry: ProcessedTweetEntry): void {
   dbService.saveTweet({
     twitter_id: twitterId,
     twitter_username: twitterUsername.toLowerCase(),
+    bsky_identifier: bskyIdentifier.toLowerCase(),
     bsky_uri: entry.uri,
     bsky_cid: entry.cid,
     bsky_root_uri: entry.root?.uri,
@@ -618,18 +625,19 @@ async function safeSearch(query: string, limit: number): Promise<TwitterSearchRe
 async function processTweets(
   agent: BskyAgent,
   twitterUsername: string,
+  bskyIdentifier: string,
   tweets: Tweet[],
   dryRun = false,
 ): Promise<void> {
-  const processedTweets = loadProcessedTweets(twitterUsername);
+  const processedTweets = loadProcessedTweets(bskyIdentifier);
   const toProcess = tweets.filter(t => !processedTweets[t.id_str || t.id || '']);
   
   if (toProcess.length === 0) {
-    console.log(`[${twitterUsername}] ✅ No new tweets to process.`);
+    console.log(`[${twitterUsername}] ✅ No new tweets to process for ${bskyIdentifier}.`);
     return;
   }
 
-  console.log(`[${twitterUsername}] 🚀 Processing ${toProcess.length} new tweets...`);
+  console.log(`[${twitterUsername}] 🚀 Processing ${toProcess.length} new tweets for ${bskyIdentifier}...`);
   
   tweets.reverse();
   let count = 0;
@@ -658,12 +666,12 @@ async function processTweets(
 
     if (isReply) {
       if (replyStatusId && processedTweets[replyStatusId] && !processedTweets[replyStatusId]?.migrated) {
-        console.log(`[${twitterUsername}] 🧵 Threading reply to local post: ${replyStatusId}`);
+        console.log(`[${twitterUsername}] 🧵 Threading reply to post in ${bskyIdentifier}: ${replyStatusId}`);
         replyParentInfo = processedTweets[replyStatusId] ?? null;
       } else {
         console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply.`);
         if (!dryRun) {
-          saveProcessedTweet(twitterUsername, tweetId, { skipped: true });
+          saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, { skipped: true });
         }
         continue;
       }
@@ -880,7 +888,7 @@ async function processTweets(
         };
 
         if (i === 0) {
-          saveProcessedTweet(twitterUsername, tweetId, currentPostInfo);
+          saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, currentPostInfo);
         }
         
         lastPostInfo = currentPostInfo;
@@ -946,14 +954,14 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
         const limit = backfillReq?.limit || 15;
         console.log(`[${mapping.twitterUsername}] Running backfill (limit ${limit})...`);
         updateAppStatus({ state: 'backfilling', currentAccount: mapping.twitterUsername, message: `Starting backfill (limit ${limit})...` });
-        await importHistory(mapping.twitterUsername, limit, dryRun);
+        await importHistory(mapping.twitterUsername, mapping.bskyIdentifier, limit, dryRun);
         clearBackfill(mapping.id);
         console.log(`[${mapping.twitterUsername}] Backfill complete.`);
       } else {
         updateAppStatus({ state: 'checking', currentAccount: mapping.twitterUsername, message: 'Fetching latest tweets...' });
         const result = await safeSearch(`from:${mapping.twitterUsername}`, 30);
         if (!result.success || !result.tweets) continue;
-        await processTweets(agent, mapping.twitterUsername, result.tweets, dryRun);
+        await processTweets(agent, mapping.twitterUsername, mapping.bskyIdentifier, result.tweets, dryRun);
       }
     } catch (err) {
       console.error(`Error processing mapping ${mapping.twitterUsername}:`, err);
@@ -967,7 +975,7 @@ async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void
   }
 }
 
-async function importHistory(twitterUsername: string, limit = 15, dryRun = false): Promise<void> {
+async function importHistory(twitterUsername: string, bskyIdentifier: string, limit = 15, dryRun = false): Promise<void> {
   const config = getConfig();
   const mapping = config.mappings.find((m) => m.twitterUsername.toLowerCase() === twitterUsername.toLowerCase());
   if (!mapping) {
@@ -984,7 +992,7 @@ async function importHistory(twitterUsername: string, limit = 15, dryRun = false
   const batchSize = 100;
   const allFoundTweets: Tweet[] = [];
   const seenIds = new Set<string>();
-  const processedTweets = loadProcessedTweets(twitterUsername);
+  const processedTweets = loadProcessedTweets(bskyIdentifier);
 
   while (true) {
     // Check if this backfill request was cancelled
@@ -1032,7 +1040,7 @@ async function importHistory(twitterUsername: string, limit = 15, dryRun = false
 
   console.log(`Fetch complete. Found ${allFoundTweets.length} new tweets to import.`);
   if (allFoundTweets.length > 0) {
-    await processTweets(agent, twitterUsername, allFoundTweets, dryRun);
+    await processTweets(agent, twitterUsername, bskyIdentifier, allFoundTweets, dryRun);
     console.log('History import complete.');
   }
 }
@@ -1083,7 +1091,12 @@ async function main(): Promise<void> {
       console.error('Twitter credentials not set. Cannot import history.');
       process.exit(1);
     }
-    await importHistory(options.username, options.limit, options.dryRun);
+    const mapping = config.mappings.find(m => m.twitterUsername.toLowerCase() === options.username.toLowerCase());
+    if (!mapping) {
+      console.error(`No mapping found for ${options.username}`);
+      process.exit(1);
+    }
+    await importHistory(options.username, mapping.bskyIdentifier, options.limit, options.dryRun);
     process.exit(0);
   }
 
