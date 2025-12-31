@@ -262,13 +262,19 @@ async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: strin
 }
 
 async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: string): Promise<BlobRef> {
-  console.log(`[VIDEO] 🟢 Starting upload process for ${filename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+  const sanitizedFilename = filename.split('?')[0] || 'video.mp4';
+  console.log(`[VIDEO] 🟢 Starting upload process for ${sanitizedFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
   
   try {
     // 1. Get Service Auth
-    console.log(`[VIDEO] 🔑 Requesting service auth token for video.bsky.app...`);
+    // The audience (aud) must be the user's PDS DID (did:web:HOST)
+    const pdsUrl = new URL(agent.service as any);
+    const pdsHost = pdsUrl.host;
+    console.log(`[VIDEO] 🌐 PDS Host detected: ${pdsHost}`);
+    console.log(`[VIDEO] 🔑 Requesting service auth token for audience: did:web:${pdsHost}...`);
+    
     const { data: serviceAuth } = await agent.com.atproto.server.getServiceAuth({
-        aud: `did:web:video.bsky.app`,
+        aud: `did:web:${pdsHost}`,
         lxm: "com.atproto.repo.uploadBlob",
         exp: Math.floor(Date.now() / 1000) + 60 * 30,
     });
@@ -279,7 +285,7 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
     // 2. Upload to Video Service
     const uploadUrl = new URL("https://video.bsky.app/xrpc/app.bsky.video.uploadVideo");
     uploadUrl.searchParams.append("did", agent.session!.did!);
-    uploadUrl.searchParams.append("name", filename);
+    uploadUrl.searchParams.append("name", sanitizedFilename);
 
     console.log(`[VIDEO] 📤 Uploading to ${uploadUrl.href}...`);
     const uploadResponse = await fetch(uploadUrl, {
@@ -293,27 +299,29 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
 
     if (!uploadResponse.ok) {
         const errText = await uploadResponse.text();
+        console.error(`[VIDEO] ❌ Server responded with ${uploadResponse.status}: ${errText}`);
         throw new Error(`Video upload failed: ${uploadResponse.status} ${errText}`);
     }
 
     const jobStatus = (await uploadResponse.json()) as any;
-    console.log(`[VIDEO] 📦 Upload accepted. Job ID: ${jobStatus.jobId}, Initial State: ${jobStatus.state}`);
+    console.log(`[VIDEO] 📦 Upload accepted. Job ID: ${jobStatus.jobId}, State: ${jobStatus.state}`);
     
     let blob: BlobRef | undefined = jobStatus.blob;
 
     // 3. Poll for processing status
     if (!blob) {
-        console.log(`[VIDEO] ⏳ Polling for processing completion...`);
+        console.log(`[VIDEO] ⏳ Polling for processing completion (this can take a minute)...`);
         let attempts = 0;
         while (!blob) {
             attempts++;
             const statusUrl = new URL("https://video.bsky.app/xrpc/app.bsky.video.getJobStatus");
             statusUrl.searchParams.append("jobId", jobStatus.jobId);
             
+            // Using a plain fetch for the status check as it doesn't always need auth
             const statusResponse = await fetch(statusUrl);
             if (!statusResponse.ok) {
                 console.warn(`[VIDEO] ⚠️ Job status fetch failed (${statusResponse.status}), retrying...`);
-                await new Promise((resolve) => setTimeout(resolve, 3000));
+                await new Promise((resolve) => setTimeout(resolve, 5000));
                 continue;
             }
 
@@ -330,10 +338,10 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
                 throw new Error(`Video processing failed: ${statusData.jobStatus.error || 'Unknown error'}`);
             } else {
                 // Wait before next poll
-                await new Promise((resolve) => setTimeout(resolve, 3000));
+                await new Promise((resolve) => setTimeout(resolve, 5000));
             }
             
-            if (attempts > 100) { // ~5 minute timeout
+            if (attempts > 60) { // ~5 minute timeout
                 throw new Error("Video processing timed out after 5 minutes.");
             }
         }
