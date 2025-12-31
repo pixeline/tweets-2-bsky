@@ -12,6 +12,7 @@ import * as francModule from 'franc-min';
 import iso6391 from 'iso-639-1';
 import os from 'node:os';
 import puppeteer from 'puppeteer-core';
+import sharp from 'sharp';
 import { getConfig } from './config-manager.js';
 
 // ESM __dirname equivalent
@@ -285,7 +286,43 @@ async function downloadMedia(url: string): Promise<DownloadedMedia> {
 }
 
 async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: string): Promise<BlobRef> {
-  const { data } = await agent.uploadBlob(buffer, { encoding: mimeType });
+  let finalBuffer = buffer;
+  let finalMimeType = mimeType;
+  const MAX_SIZE = 950 * 1024; // 950KB safety margin
+
+  if (buffer.length > MAX_SIZE && (mimeType.startsWith('image/') || mimeType === 'application/octet-stream')) {
+    console.log(`[UPLOAD] ⚖️ Image too large (${(buffer.length / 1024).toFixed(2)} KB). Compressing...`);
+    try {
+      const image = sharp(buffer);
+      const metadata = await image.metadata();
+      
+      let pipeline = image;
+      // If it's a very large resolution, downscale it slightly
+      if (metadata.width && metadata.width > 2000) {
+        pipeline = pipeline.resize(2000, undefined, { withoutEnlargement: true });
+      }
+
+      finalBuffer = await pipeline
+        .jpeg({ quality: 85, mozjpeg: true })
+        .toBuffer();
+      finalMimeType = 'image/jpeg';
+      
+      console.log(`[UPLOAD] ✅ Compressed to ${(finalBuffer.length / 1024).toFixed(2)} KB`);
+      
+      // If still too large, aggressive compression
+      if (finalBuffer.length > MAX_SIZE) {
+        finalBuffer = await sharp(buffer)
+          .resize(1200, undefined, { withoutEnlargement: true })
+          .jpeg({ quality: 70 })
+          .toBuffer();
+        console.log(`[UPLOAD] ⚠️ Required aggressive compression: ${(finalBuffer.length / 1024).toFixed(2)} KB`);
+      }
+    } catch (err) {
+      console.warn(`[UPLOAD] ⚠️ Compression failed, attempting original upload:`, (err as Error).message);
+    }
+  }
+
+  const { data } = await agent.uploadBlob(finalBuffer, { encoding: finalMimeType });
   return data.blob;
 }
 
