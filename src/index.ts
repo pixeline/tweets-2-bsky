@@ -265,6 +265,42 @@ function getRandomDelay(min = 1000, max = 4000): number {
   return Math.floor(Math.random() * (max - min + 1) + min);
 }
 
+function splitText(text: string, limit = 300): string[] {
+  if (text.length <= limit) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= limit) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Try to split by paragraph
+    let splitIndex = remaining.lastIndexOf('\n\n', limit);
+    if (splitIndex === -1) {
+      // Try to split by sentence
+      splitIndex = remaining.lastIndexOf('. ', limit);
+      if (splitIndex === -1) {
+        // Try to split by space
+        splitIndex = remaining.lastIndexOf(' ', limit);
+        if (splitIndex === -1) {
+          // Force split
+          splitIndex = limit;
+        }
+      } else {
+        splitIndex += 1; // Include the period
+      }
+    }
+
+    chunks.push(remaining.substring(0, splitIndex).trim());
+    remaining = remaining.substring(splitIndex).trim();
+  }
+
+  return chunks;
+}
+
 function refreshQueryIds(): Promise<void> {
   return new Promise((resolve) => {
     console.log("⚠️  Attempting to refresh Twitter Query IDs via 'bird' CLI...");
@@ -403,21 +439,8 @@ async function processTweets(
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
         if (mp4s.length > 0 && mp4s[0]) {
-          const videoUrl = mp4s[0].url;
-          try {
-            const { buffer, mimeType } = await downloadMedia(videoUrl);
-            if (buffer.length > 95 * 1024 * 1024) {
-              text += `\n[Video: ${media.media_url_https}]`;
-              continue;
-            }
-            const blob = await uploadToBluesky(agent, buffer, mimeType);
-            videoBlob = blob;
-            videoAspectRatio = aspectRatio;
-            break;
-          } catch (err) {
-            console.error(`Failed to upload video ${videoUrl}:`, (err as Error).message);
-            text += `\n${media.media_url_https}`;
-          }
+          // Reverting to links for video for now as native upload is failing
+          text += `\n${media.media_url_https}`;
         }
       }
     }
@@ -434,50 +457,69 @@ async function processTweets(
       }
     }
 
-    const rt = new RichText({ text });
-    await rt.detectFacets(agent);
-    const detectedLangs = detectLanguage(text);
+    const chunks = splitText(text);
+    let lastPostInfo: ProcessedTweetEntry | null = replyParentInfo;
 
-    // biome-ignore lint/suspicious/noExplicitAny: dynamic record construction
-    const postRecord: Record<string, any> = {
-      text: rt.text,
-      facets: rt.facets,
-      langs: detectedLangs,
-      createdAt: tweet.created_at ? new Date(tweet.created_at).toISOString() : new Date().toISOString(),
-    };
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i] as string;
+      const rt = new RichText({ text: chunk });
+      await rt.detectFacets(agent);
+      const detectedLangs = detectLanguage(chunk);
 
-    if (videoBlob) {
-      postRecord.embed = { $type: 'app.bsky.embed.video', video: videoBlob, aspectRatio: videoAspectRatio };
-    } else if (images.length > 0) {
-      const imagesEmbed = { $type: 'app.bsky.embed.images', images };
-      if (quoteEmbed) {
-        postRecord.embed = { $type: 'app.bsky.embed.recordWithMedia', media: imagesEmbed, record: quoteEmbed };
-      } else {
-        postRecord.embed = imagesEmbed;
+      // biome-ignore lint/suspicious/noExplicitAny: dynamic record construction
+      const postRecord: Record<string, any> = {
+        text: rt.text,
+        facets: rt.facets,
+        langs: detectedLangs,
+        createdAt: tweet.created_at ? new Date(tweet.created_at).toISOString() : new Date().toISOString(),
+      };
+
+      // Only attach media/quotes to the first chunk
+      if (i === 0) {
+        if (images.length > 0) {
+          const imagesEmbed = { $type: 'app.bsky.embed.images', images };
+          if (quoteEmbed) {
+            postRecord.embed = { $type: 'app.bsky.embed.recordWithMedia', media: imagesEmbed, record: quoteEmbed };
+          } else {
+            postRecord.embed = imagesEmbed;
+          }
+        } else if (quoteEmbed) {
+          postRecord.embed = quoteEmbed;
+        }
       }
-    } else if (quoteEmbed) {
-      postRecord.embed = quoteEmbed;
-    }
 
-    if (replyParentInfo?.uri && replyParentInfo?.cid) {
-      postRecord.reply = {
-        root: replyParentInfo.root || { uri: replyParentInfo.uri, cid: replyParentInfo.cid },
-        parent: { uri: replyParentInfo.uri, cid: replyParentInfo.cid },
-      };
-    }
+      if (lastPostInfo?.uri && lastPostInfo?.cid) {
+        postRecord.reply = {
+          root: lastPostInfo.root || { uri: lastPostInfo.uri, cid: lastPostInfo.cid },
+          parent: { uri: lastPostInfo.uri, cid: lastPostInfo.cid },
+        };
+      }
 
-    try {
-      const response = await agent.post(postRecord);
-      processedTweets[tweetId] = {
-        uri: response.uri,
-        cid: response.cid,
-        root: postRecord.reply ? postRecord.reply.root : { uri: response.uri, cid: response.cid },
-      };
-      saveProcessedTweets(twitterUsername, processedTweets);
-      await new Promise((r) => setTimeout(r, getRandomDelay(1000, 4000)));
-    } catch (err) {
-      console.error(`Failed to post ${tweetId}:`, err);
+      try {
+        const response = await agent.post(postRecord);
+        const currentPostInfo = {
+          uri: response.uri,
+          cid: response.cid,
+          root: postRecord.reply ? postRecord.reply.root : { uri: response.uri, cid: response.cid },
+        };
+
+        if (i === 0) {
+          processedTweets[tweetId] = currentPostInfo;
+          saveProcessedTweets(twitterUsername, processedTweets);
+        }
+        
+        lastPostInfo = currentPostInfo;
+        
+        if (chunks.length > 1) {
+          await new Promise((r) => setTimeout(r, 1000)); // Short delay between thread parts
+        }
+      } catch (err) {
+        console.error(`Failed to post ${tweetId} (chunk ${i + 1}):`, err);
+        break; // Stop threading if a chunk fails
+      }
     }
+    
+    await new Promise((r) => setTimeout(r, getRandomDelay(1000, 4000)));
   }
 }
 
