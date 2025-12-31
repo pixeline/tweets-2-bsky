@@ -358,10 +358,13 @@ async function processTweets(tweets: Tweet[]): Promise<void> {
         let replyParentInfo: ProcessedTweetEntry | null = null;
 
         if (isReply) {
-            if (replyStatusId && processedTweets[replyStatusId] && !processedTweets[replyStatusId]?.migrated) {
+            const parentEntry = replyStatusId ? processedTweets[replyStatusId] : undefined;
+            // Only thread if parent was successfully posted (has uri/cid) and not migrated/skipped
+            if (parentEntry && parentEntry.uri && parentEntry.cid && !parentEntry.migrated && !parentEntry.skipped) {
                 console.log(`Threading reply to ${replyStatusId}`);
-                replyParentInfo = processedTweets[replyStatusId] ?? null;
+                replyParentInfo = parentEntry;
             } else {
+                // Reply to unknown, external, or skipped tweet -> Skip
                 console.log(`Skipping reply: ${tweetId}`);
                 processedTweets[tweetId] = { skipped: true };
                 saveProcessedTweets();
