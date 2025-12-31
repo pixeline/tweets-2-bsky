@@ -6,6 +6,7 @@ import cors from 'cors';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { getConfig, saveConfig } from './config-manager.js';
+import { dbService } from './db.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -145,13 +146,8 @@ app.delete('/api/mappings/:id/cache', authenticateToken, requireAdmin, (req, res
     return;
   }
 
-  const cachePath = path.join(__dirname, '../processed', `${mapping.twitterUsername.toLowerCase()}.json`);
-  if (fs.existsSync(cachePath)) {
-    fs.unlinkSync(cachePath);
-    res.json({ success: true, message: 'Cache cleared' });
-  } else {
-    res.json({ success: true, message: 'No cache found' });
-  }
+  dbService.deleteTweetsByUsername(mapping.twitterUsername);
+  res.json({ success: true, message: 'Cache cleared' });
 });
 
 // --- Twitter Config Routes (Admin Only) ---

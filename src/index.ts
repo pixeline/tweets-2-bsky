@@ -112,38 +112,64 @@ interface ImageEmbed {
   aspectRatio?: AspectRatio;
 }
 
+import { dbService } from './db.js';
+
 // ============================================================================
 // State Management
 // ============================================================================
 
 const PROCESSED_DIR = path.join(__dirname, '..', 'processed');
-if (!fs.existsSync(PROCESSED_DIR)) {
-  fs.mkdirSync(PROCESSED_DIR);
-}
 
-function getProcessedFilePath(twitterUsername: string): string {
-  return path.join(PROCESSED_DIR, `${twitterUsername.toLowerCase()}.json`);
+async function migrateJsonToSqlite() {
+  if (!fs.existsSync(PROCESSED_DIR)) return;
+  
+  const files = fs.readdirSync(PROCESSED_DIR).filter(f => f.endsWith('.json'));
+  if (files.length === 0) return;
+
+  console.log(`📦 Found ${files.length} legacy cache files. Migrating to SQLite...`);
+  
+  for (const file of files) {
+    const username = file.replace('.json', '');
+    try {
+      const filePath = path.join(PROCESSED_DIR, file);
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as ProcessedTweetsMap;
+      
+      for (const [twitterId, entry] of Object.entries(data)) {
+        dbService.saveTweet({
+          twitter_id: twitterId,
+          twitter_username: username,
+          bsky_uri: entry.uri,
+          bsky_cid: entry.cid,
+          bsky_root_uri: entry.root?.uri,
+          bsky_root_cid: entry.root?.cid,
+          status: entry.migrated ? 'migrated' : (entry.skipped ? 'skipped' : 'failed')
+        });
+      }
+      // Move file to backup
+      const backupDir = path.join(PROCESSED_DIR, 'backup');
+      if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir);
+      fs.renameSync(filePath, path.join(backupDir, file));
+    } catch (err) {
+      console.error(`❌ Failed to migrate ${file}:`, err);
+    }
+  }
+  console.log('✅ Migration complete.');
 }
 
 function loadProcessedTweets(twitterUsername: string): ProcessedTweetsMap {
-  const filePath = getProcessedFilePath(twitterUsername);
-  try {
-    if (fs.existsSync(filePath)) {
-      return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    }
-  } catch (err) {
-    console.error(`Error loading processed tweets for ${twitterUsername}:`, err);
-  }
-  return {};
+  return dbService.getTweetsByUsername(twitterUsername);
 }
 
-function saveProcessedTweets(twitterUsername: string, data: ProcessedTweetsMap): void {
-  const filePath = getProcessedFilePath(twitterUsername);
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error(`Error saving processed tweets for ${twitterUsername}:`, err);
-  }
+function saveProcessedTweet(twitterUsername: string, twitterId: string, entry: ProcessedTweetEntry): void {
+  dbService.saveTweet({
+    twitter_id: twitterId,
+    twitter_username: twitterUsername.toLowerCase(),
+    bsky_uri: entry.uri,
+    bsky_cid: entry.cid,
+    bsky_root_uri: entry.root?.uri,
+    bsky_root_cid: entry.root?.cid,
+    status: entry.migrated || (entry.uri && entry.cid) ? 'migrated' : (entry.skipped ? 'skipped' : 'failed')
+  });
 }
 
 // ============================================================================
@@ -592,8 +618,7 @@ async function processTweets(
       } else {
         console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply.`);
         if (!dryRun) {
-          processedTweets[tweetId] = { skipped: true };
-          saveProcessedTweets(twitterUsername, processedTweets);
+          saveProcessedTweet(twitterUsername, tweetId, { skipped: true });
         }
         continue;
       }
@@ -810,8 +835,7 @@ async function processTweets(
         };
 
         if (i === 0) {
-          processedTweets[tweetId] = currentPostInfo;
-          saveProcessedTweets(twitterUsername, processedTweets);
+          saveProcessedTweet(twitterUsername, tweetId, currentPostInfo);
         }
         
         lastPostInfo = currentPostInfo;
@@ -984,6 +1008,8 @@ async function main(): Promise<void> {
   const options = program.opts();
 
   const config = getConfig();
+
+  await migrateJsonToSqlite();
 
   if (!options.web) {
     console.log('🌐 Web interface is disabled.');
