@@ -437,44 +437,31 @@ async function processTweets(
         const variants = media.video_info?.variants || [];
         const mp4s = variants
           .filter((v) => v.content_type === 'video/mp4')
-          .sort((a, b) => (a.bitrate || 0) - (b.bitrate || 0)); // Sort ASCENDING to pick smaller variants
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0)); // Largest first
 
         if (mp4s.length > 0) {
-          // Pick a medium variant if available, otherwise the smallest
-          const variantIndex = mp4s.length > 1 ? 1 : 0;
-          const variant = mp4s[variantIndex];
-          if (!variant) continue;
-          
-          const videoUrl = variant.url;
-          try {
-            const { buffer, mimeType } = await downloadMedia(videoUrl);
-            if (buffer.length > 95 * 1024 * 1024) {
-              console.warn('Video too large (>95MB). Linking to tweet.');
-              const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
-              if (!text.includes(tweetUrl)) text += `\n${tweetUrl}`;
-              continue;
-            }
-            
-            // 1. Upload Video
-            const blob = await uploadToBluesky(agent, buffer, mimeType);
-            videoBlob = blob;
-            videoAspectRatio = aspectRatio;
+          for (const variant of mp4s) {
+            const videoUrl = variant.url;
+            try {
+              const { buffer, mimeType } = await downloadMedia(videoUrl);
+              if (buffer.length > 95 * 1024 * 1024) continue;
+              
+              const blob = await uploadToBluesky(agent, buffer, mimeType);
+              videoBlob = blob;
+              videoAspectRatio = aspectRatio;
 
-            // 2. Try to upload thumbnail
-            if (media.media_url_https) {
-              try {
-                const thumb = await downloadMedia(media.media_url_https);
-                videoThumbnailBlob = await uploadToBluesky(agent, thumb.buffer, thumb.mimeType);
-              } catch (e) {
-                console.warn('Failed to upload video thumbnail');
+              if (media.media_url_https) {
+                try {
+                  const thumb = await downloadMedia(media.media_url_https);
+                  videoThumbnailBlob = await uploadToBluesky(agent, thumb.buffer, thumb.mimeType);
+                } catch (e) {
+                  console.warn('Failed to upload video thumbnail');
+                }
               }
+              break; 
+            } catch (err) {
+              console.warn(`Variant failed, trying next:`, (err as Error).message);
             }
-
-            break; // Prioritize video
-          } catch (err) {
-            console.warn(`Failed to upload video ${videoUrl}, linking to tweet instead:`, (err as Error).message);
-            const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
-            if (!text.includes(tweetUrl)) text += `\n${tweetUrl}`;
           }
         }
       }
@@ -526,12 +513,13 @@ async function processTweets(
       // Only attach media/quotes to the first chunk
       if (i === 0) {
         if (videoBlob) {
-          postRecord.embed = {
+          const videoEmbed: any = {
             $type: 'app.bsky.embed.video',
             video: videoBlob,
-            thumbnail: videoThumbnailBlob,
-            aspectRatio: videoAspectRatio,
           };
+          if (videoAspectRatio) videoEmbed.aspectRatio = videoAspectRatio;
+          if (videoThumbnailBlob) videoEmbed.thumbnail = videoThumbnailBlob;
+          postRecord.embed = videoEmbed;
         } else if (images.length > 0) {
           const imagesEmbed = { $type: 'app.bsky.embed.images', images };
           if (quoteEmbed) {
