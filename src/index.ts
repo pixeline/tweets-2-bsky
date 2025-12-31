@@ -10,6 +10,8 @@ import axios from 'axios';
 import { Command } from 'commander';
 import * as francModule from 'franc-min';
 import iso6391 from 'iso-639-1';
+import os from 'node:os';
+import puppeteer from 'puppeteer-core';
 import { getConfig } from './config-manager.js';
 
 // ESM __dirname equivalent
@@ -259,6 +261,69 @@ async function downloadMedia(url: string): Promise<DownloadedMedia> {
 async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: string): Promise<BlobRef> {
   const { data } = await agent.uploadBlob(buffer, { encoding: mimeType });
   return data.blob;
+}
+
+async function captureTweetScreenshot(tweetUrl: string): Promise<Buffer | null> {
+  console.log(`[SCREENSHOT] 📸 Capturing screenshot for: ${tweetUrl}`);
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      executablePath: '/usr/bin/google-chrome',
+      args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 800, height: 1200, deviceScaleFactor: 2 });
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <style>
+          body { 
+            margin: 0; 
+            padding: 20px; 
+            background: #ffffff; 
+            display: flex; 
+            justify-content: center;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          }
+          #container { width: 550px; }
+        </style>
+      </head>
+      <body>
+        <div id="container">
+          <blockquote class="twitter-tweet" data-dnt="true">
+            <a href="${tweetUrl}"></a>
+          </blockquote>
+          <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+        </div>
+      </body>
+      </html>
+    `;
+
+    await page.setContent(html, { waitUntil: 'networkidle0' });
+    
+    // Wait for the twitter iframe to load and render
+    try {
+      await page.waitForSelector('iframe', { timeout: 10000 });
+      // Small extra wait for images inside iframe
+      await new Promise(r => setTimeout(r, 2000));
+    } catch (e) {
+      console.warn(`[SCREENSHOT] ⚠️ Timeout waiting for tweet iframe, taking screenshot anyway.`);
+    }
+
+    const element = await page.$('#container');
+    if (element) {
+      const buffer = await element.screenshot({ type: 'png', omitBackground: true });
+      console.log(`[SCREENSHOT] ✅ Captured successfully (${(buffer.length / 1024).toFixed(2)} KB)`);
+      return buffer as Buffer;
+    }
+  } catch (err) {
+    console.error(`[SCREENSHOT] ❌ Error capturing tweet:`, (err as Error).message);
+  } finally {
+    if (browser) await browser.close();
+  }
+  return null;
 }
 
 async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: string): Promise<BlobRef> {
@@ -606,14 +671,28 @@ async function processTweets(
         if (!isSelfQuote) {
           externalQuoteUrl = qUrl;
           console.log(`[${twitterUsername}] 🔗 Quoted tweet is external: ${externalQuoteUrl}`);
+          
+          // Try to capture screenshot for external QTs if we have space for images
+          if (images.length < 4 && !videoBlob) {
+            const ssBuffer = await captureTweetScreenshot(externalQuoteUrl);
+            if (ssBuffer) {
+              try {
+                const blob = await uploadToBluesky(agent, ssBuffer, 'image/png');
+                images.push({ alt: `Quote Tweet: ${externalQuoteUrl}`, image: blob });
+              } catch (e) {
+                console.warn(`[${twitterUsername}] ⚠️ Failed to upload screenshot blob.`);
+              }
+            }
+          }
         } else {
           console.log(`[${twitterUsername}] 🔁 Quoted tweet is a self-quote, skipping link.`);
         }
       }
     }
 
-    // Only append link for external quotes IF we couldn't natively embed it
-    if (externalQuoteUrl && !quoteEmbed && !text.includes(externalQuoteUrl)) {
+    // Only append link for external quotes IF we couldn't natively embed it OR screenshot it
+    const hasScreenshot = images.some(img => img.alt.startsWith('Quote Tweet:'));
+    if (externalQuoteUrl && !quoteEmbed && !hasScreenshot && !text.includes(externalQuoteUrl)) {
       text += `\n\nQT: ${externalQuoteUrl}`;
     }
 
