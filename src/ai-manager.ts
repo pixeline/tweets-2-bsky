@@ -26,9 +26,8 @@ export async function generateAltText(buffer: Buffer, mimeType: string, contextT
       apiKey = process.env.GEMINI_API_KEY;
   }
 
-  if (!apiKey) {
-     // If no API key found, we can't do anything.
-     // Silently fail or log warning? The original code returned undefined.
+  // API Key is mandatory for Gemini and Anthropic
+  if (!apiKey && (provider === 'gemini' || provider === 'anthropic')) {
      return undefined;
   }
 
@@ -42,12 +41,14 @@ export async function generateAltText(buffer: Buffer, mimeType: string, contextT
   try {
     switch (provider) {
       case 'gemini':
-        return await callGemini(apiKey, model || 'models/gemini-2.5-flash', buffer, mimeType, contextText);
+        // apiKey is guaranteed by check above
+        return await callGemini(apiKey!, model || 'models/gemini-2.5-flash', buffer, mimeType, contextText);
       case 'openai':
       case 'custom':
         return await callOpenAICompatible(apiKey, model || 'gpt-4o', baseUrl, buffer, mimeType, contextText);
       case 'anthropic':
-        return await callAnthropic(apiKey, model || 'claude-3-5-sonnet-20241022', baseUrl, buffer, mimeType, contextText);
+        // apiKey is guaranteed by check above
+        return await callAnthropic(apiKey!, model || 'claude-3-5-sonnet-20241022', baseUrl, buffer, mimeType, contextText);
       default:
         console.warn(`[AI] ⚠️ Unknown provider: ${provider}`);
         return undefined;
@@ -79,7 +80,7 @@ async function callGemini(apiKey: string, modelName: string, buffer: Buffer, mim
   return response.text();
 }
 
-async function callOpenAICompatible(apiKey: string, model: string, baseUrl: string | undefined, buffer: Buffer, mimeType: string, contextText: string): Promise<string | undefined> {
+async function callOpenAICompatible(apiKey: string | undefined, model: string, baseUrl: string | undefined, buffer: Buffer, mimeType: string, contextText: string): Promise<string | undefined> {
   const url = baseUrl ? `${baseUrl.replace(/\/+$/, '')}/chat/completions` : 'https://api.openai.com/v1/chat/completions';
   
   const base64Image = `data:${mimeType};base64,${buffer.toString('base64')}`;
@@ -106,17 +107,21 @@ async function callOpenAICompatible(apiKey: string, model: string, baseUrl: stri
     max_tokens: 300
   };
 
-  const response = await axios.post(url, payload, {
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      // OpenRouter specific headers (optional but good practice)
-      ...(url.includes('openrouter.ai') ? {
-          'HTTP-Referer': 'https://github.com/tweets-2-bsky',
-          'X-Title': 'Tweets to Bluesky'
-      } : {})
-    }
-  });
+  const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+  };
+
+  if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  // OpenRouter specific headers (optional but good practice)
+  if (url.includes('openrouter.ai')) {
+      headers['HTTP-Referer'] = 'https://github.com/tweets-2-bsky';
+      headers['X-Title'] = 'Tweets to Bluesky';
+  }
+
+  const response = await axios.post(url, payload, { headers });
 
   return response.data.choices[0]?.message?.content || undefined;
 }

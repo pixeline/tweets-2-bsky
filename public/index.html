@@ -517,7 +517,13 @@
                                             </div>
                                             <div className="mb-3">
                                                 <label className="form-label small fw-bold">API Key</label>
-                                                <input name="apiKey" defaultValue={aiConfig.apiKey} className="form-control form-control-sm" placeholder="sk-..." required />
+                                                <input 
+                                                    name="apiKey" 
+                                                    defaultValue={aiConfig.apiKey} 
+                                                    className="form-control form-control-sm" 
+                                                    placeholder={['gemini', 'anthropic'].includes(aiConfig.provider) ? "Required" : "Optional (e.g. for Ollama)"} 
+                                                    required={['gemini', 'anthropic'].includes(aiConfig.provider)}
+                                                />
                                             </div>
                                             
                                             {(aiConfig.provider !== 'gemini') && (

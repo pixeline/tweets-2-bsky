@@ -37,8 +37,14 @@ program
       {
         type: 'input',
         name: 'apiKey',
-        message: 'Enter API Key:',
+        message: 'Enter API Key (optional for some custom providers):',
         default: currentAi.apiKey,
+        validate: (input: string, answers: any) => {
+            if (['gemini', 'anthropic'].includes(answers.provider) && !input) {
+                return 'API Key is required for this provider.';
+            }
+            return true;
+        }
       },
       {
         type: 'input',
