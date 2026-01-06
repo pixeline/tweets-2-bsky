@@ -83,6 +83,15 @@ JWT_SECRET=your-super-secret-key-change-this
 - **Import History**: `npm run cli import-history`
 - **List Accounts**: `npm run cli list`
 
+### 🤖 Gemini AI Alt Text (Optional)
+
+This tool can automatically generate Alt Text for images using Google's Gemini AI if the original tweet lacks it.
+
+1.  **Get an API Key**: Get a free API Key from [Google AI Studio](https://aistudio.google.com/app/apikey).
+2.  **Configure**:
+    *   **Web UI**: Go to the Admin Dashboard and paste your key in the "Gemini AI (Alt Text)" section.
+    *   **Disable**: Leave the field empty to disable this feature (default).
+
 ## Twitter Cookies (Auth)
 
 You need your Twitter `auth_token` and `ct0` cookies.
