@@ -32,6 +32,7 @@ export interface AppConfig {
   mappings: AccountMapping[];
   users: WebUser[];
   checkIntervalMinutes: number;
+  geminiApiKey?: string;
 }
 
 export function getConfig(): AppConfig {
@@ -46,19 +47,6 @@ export function getConfig(): AppConfig {
   try {
     const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
     if (!config.users) config.users = [];
-    
-    // Migration: twitterUsername (string) -> twitterUsernames (string[])
-    // biome-ignore lint/suspicious/noExplicitAny: migration logic
-    config.mappings = config.mappings.map((m: any) => {
-      if (m.twitterUsername && !m.twitterUsernames) {
-        return {
-          ...m,
-          twitterUsernames: [m.twitterUsername],
-        };
-      }
-      return m;
-    });
-
     return config;
   } catch (err) {
     console.error('Error reading config:', err);

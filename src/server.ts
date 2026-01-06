@@ -213,6 +213,19 @@ app.post('/api/twitter-config', authenticateToken, requireAdmin, (req, res) => {
   res.json({ success: true });
 });
 
+app.get('/api/gemini-config', authenticateToken, requireAdmin, (_req, res) => {
+    const config = getConfig();
+    res.json({ apiKey: config.geminiApiKey || '' });
+});
+  
+app.post('/api/gemini-config', authenticateToken, requireAdmin, (req, res) => {
+    const { apiKey } = req.body;
+    const config = getConfig();
+    config.geminiApiKey = apiKey;
+    saveConfig(config);
+    res.json({ success: true });
+});
+
 // --- Status & Actions Routes ---
 
 app.get('/api/status', authenticateToken, (_req, res) => {

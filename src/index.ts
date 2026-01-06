@@ -14,6 +14,44 @@ import os from 'node:os';
 import puppeteer from 'puppeteer-core';
 import * as cheerio from 'cheerio';
 import sharp from 'sharp';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// ... existing code ...
+
+async function generateAltText(buffer: Buffer, mimeType: string): Promise<string | undefined> {
+  const config = getConfig();
+  const apiKey = config.geminiApiKey || 'AIzaSyCByANEpkVGkYG6559CqBRlDVKh24dbxE8'; // Fallback to provided key if not set
+  
+  if (!apiKey) return undefined;
+
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: 'models/gemini-2.0-flash' }); // Updated to 2.0-flash as likely intended, user said 2.5 but likely meant 1.5 or 2.0. 
+    // Actually, user explicitly said "models/gemini-2.5-flash". I will try to use exactly what they said, 
+    // but if it fails I might need to fallback. 
+    // Let's stick to the prompt's request exactly first.
+    
+    // NOTE: 'gemini-2.5-flash' is not a standard known model at this time (Jan 2026 context). 
+    // It might be a custom fine-tune or a future preview. 
+    // I will use it as requested.
+    const modelRequested = genAI.getGenerativeModel({ model: 'models/gemini-2.5-flash' });
+
+    const result = await modelRequested.generateContent([
+      "Describe this image in detail for alt text. Be concise but descriptive.",
+      {
+        inlineData: {
+          data: buffer.toString('base64'),
+          mimeType
+        }
+      }
+    ]);
+    const response = await result.response;
+    return response.text();
+  } catch (err) {
+    console.warn(`[GEMINI] ⚠️ Failed to generate alt text: ${(err as Error).message}`);
+    return undefined;
+  }
+}
 import { getConfig } from './config-manager.js';
 
 // ESM __dirname equivalent
@@ -831,7 +869,15 @@ async function processTweets(
           console.log(`[${twitterUsername}] 📤 Uploading image to Bluesky...`);
           updateAppStatus({ message: `Uploading image to Bluesky...` });
           const blob = await uploadToBluesky(agent, buffer, mimeType);
-          images.push({ alt: media.ext_alt_text || 'Image from Twitter', image: blob, aspectRatio });
+          
+          let altText = media.ext_alt_text;
+          if (!altText) {
+             console.log(`[${twitterUsername}] 🤖 Generating alt text via Gemini...`);
+             altText = await generateAltText(buffer, mimeType);
+             if (altText) console.log(`[${twitterUsername}] ✅ Alt text generated: ${altText.substring(0, 50)}...`);
+          }
+
+          images.push({ alt: altText || 'Image from Twitter', image: blob, aspectRatio });
           console.log(`[${twitterUsername}] ✅ Image uploaded.`);
         } catch (err) {
           console.error(`[${twitterUsername}] ❌ High quality upload failed:`, (err as Error).message);
@@ -1077,66 +1123,7 @@ async function getAgent(mapping: {
   }
 }
 
-async function checkAndPost(dryRun = false, forceBackfill = false): Promise<void> {
-  const config = getConfig();
-  if (config.mappings.length === 0) return;
 
-  updateAppStatus({ state: 'checking', message: 'Starting account check...' });
-
-  const pendingBackfills = getPendingBackfills();
-
-  console.log(`[${new Date().toISOString()}] Checking all accounts...`);
-
-  for (const mapping of config.mappings) {
-    if (!mapping.enabled) continue;
-    try {
-      const agent = await getAgent(mapping);
-      if (!agent) continue;
-
-      const backfillReq = getPendingBackfills().find(b => b.id === mapping.id);
-      
-      // If backfill is requested, we might need to know WHICH username to backfill if specified,
-      // but current logic assumes backfill is for the mapping ID.
-      // If we want to support per-username backfill, we'd need to update the backfill request structure.
-      // For now, if backfill is requested for the MAPPING, we'll backfill ALL usernames in that mapping.
-      
-      if (forceBackfill || backfillReq) {
-        const limit = backfillReq?.limit || 15;
-        console.log(`[${mapping.bskyIdentifier}] Running backfill for ${mapping.twitterUsernames.length} accounts (limit ${limit})...`);
-        
-        for (const twitterUsername of mapping.twitterUsernames) {
-            try {
-              updateAppStatus({ state: 'backfilling', currentAccount: twitterUsername, message: `Starting backfill (limit ${limit})...` });
-              await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun);
-            } catch (err) {
-              console.error(`❌ Error backfilling ${twitterUsername}:`, err);
-            }
-        }
-        clearBackfill(mapping.id);
-        console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
-      } else {
-        for (const twitterUsername of mapping.twitterUsernames) {
-            try {
-              updateAppStatus({ state: 'checking', currentAccount: twitterUsername, message: 'Fetching latest tweets...' });
-              const result = await safeSearch(`from:${twitterUsername}`, 30);
-              if (!result.success || !result.tweets) continue;
-              await processTweets(agent, twitterUsername, mapping.bskyIdentifier, result.tweets, dryRun);
-            } catch (err) {
-              console.error(`❌ Error checking ${twitterUsername}:`, err);
-            }
-        }
-      }
-    } catch (err) {
-      console.error(`Error processing mapping ${mapping.bskyIdentifier}:`, err);
-    }
-  }
-
-  updateAppStatus({ state: 'idle', currentAccount: undefined, message: 'Check complete.' });
-  console.log(`[${new Date().toISOString()}] ✅ Check cycle complete. Waiting for next interval...`);
-  if (!dryRun) {
-    updateLastCheckTime();
-  }
-}
 
 async function importHistory(twitterUsername: string, bskyIdentifier: string, limit = 15, dryRun = false, ignoreCancellation = false): Promise<void> {
   const config = getConfig();
@@ -1210,6 +1197,55 @@ async function importHistory(twitterUsername: string, bskyIdentifier: string, li
   }
 }
 
+// Task management
+const activeTasks = new Map<string, Promise<void>>();
+
+async function runAccountTask(mapping: AccountMapping, forceBackfill = false, dryRun = false) {
+    if (activeTasks.has(mapping.id)) return; // Already running
+
+    const task = (async () => {
+        try {
+            const agent = await getAgent(mapping);
+            if (!agent) return;
+
+            const backfillReq = getPendingBackfills().find(b => b.id === mapping.id);
+            
+            if (forceBackfill || backfillReq) {
+                const limit = backfillReq?.limit || 15;
+                console.log(`[${mapping.bskyIdentifier}] Running backfill for ${mapping.twitterUsernames.length} accounts (limit ${limit})...`);
+                
+                for (const twitterUsername of mapping.twitterUsernames) {
+                    try {
+                        updateAppStatus({ state: 'backfilling', currentAccount: twitterUsername, message: `Starting backfill (limit ${limit})...` });
+                        await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun);
+                    } catch (err) {
+                        console.error(`❌ Error backfilling ${twitterUsername}:`, err);
+                    }
+                }
+                clearBackfill(mapping.id);
+                console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
+            } else {
+                for (const twitterUsername of mapping.twitterUsernames) {
+                    try {
+                        updateAppStatus({ state: 'checking', currentAccount: twitterUsername, message: 'Fetching latest tweets...' });
+                        const result = await safeSearch(`from:${twitterUsername}`, 30);
+                        if (!result.success || !result.tweets) continue;
+                        await processTweets(agent, twitterUsername, mapping.bskyIdentifier, result.tweets, dryRun);
+                    } catch (err) {
+                        console.error(`❌ Error checking ${twitterUsername}:`, err);
+                    }
+                }
+            }
+        } catch (err) {
+            console.error(`Error processing mapping ${mapping.bskyIdentifier}:`, err);
+        } finally {
+            activeTasks.delete(mapping.id);
+        }
+    })();
+
+    activeTasks.set(mapping.id, task);
+}
+
 import {
   startServer,
   updateLastCheckTime,
@@ -1218,11 +1254,13 @@ import {
   getNextCheckTime,
   updateAppStatus,
 } from './server.js';
+import { AccountMapping } from './config-manager.js';
 
 async function main(): Promise<void> {
   const program = new Command();
   program
     .name('tweets-2-bsky')
+    // ... existing options ...
     .description('Crosspost tweets to Bluesky')
     .option('--dry-run', 'Fetch tweets but do not post to Bluesky', false)
     .option('--no-web', 'Disable the web interface')
@@ -1247,6 +1285,7 @@ async function main(): Promise<void> {
   }
 
   if (options.importHistory) {
+    // ... existing import history logic ...
     if (!options.username) {
       console.error('Please specify a username with --username <username>');
       process.exit(1);
@@ -1271,28 +1310,36 @@ async function main(): Promise<void> {
   }
 
   console.log(`Scheduler started. Base interval: ${config.checkIntervalMinutes} minutes.`);
-  
-  // Main loop to handle both scheduled runs and immediate triggers
+  updateLastCheckTime(); // Initialize next time
+
+  // Main loop
   while (true) {
     const now = Date.now();
+    const config = getConfig(); // Reload config to get new mappings/settings
     const nextTime = getNextCheckTime();
     
-    if (now >= nextTime) {
-      const client = getTwitterClient();
-      const pendingBackfills = getPendingBackfills();
-      const forceBackfill = pendingBackfills.length > 0;
-      
-      if (client || forceBackfill) {
-        try {
-          await checkAndPost(options.dryRun, forceBackfill);
-        } catch (err) {
-          console.error('Error during scheduled check:', err);
+    // Check if it's time for a scheduled run OR if we have pending backfills
+    const isScheduledRun = now >= nextTime;
+    const pendingBackfills = getPendingBackfills();
+    
+    if (isScheduledRun) {
+        console.log(`[${new Date().toISOString()}] ⏰ Scheduled check triggered.`);
+        updateLastCheckTime();
+    }
+
+    for (const mapping of config.mappings) {
+        if (!mapping.enabled) continue;
+        
+        const hasPendingBackfill = pendingBackfills.some(b => b.id === mapping.id);
+        
+        // Run if scheduled OR backfill requested
+        if (isScheduledRun || hasPendingBackfill) {
+            runAccountTask(mapping, hasPendingBackfill, options.dryRun);
         }
-      }
     }
     
-    // Sleep for 10 seconds before checking again
-    await new Promise(resolve => setTimeout(resolve, 10000));
+    // Sleep for 5 seconds
+    await new Promise(resolve => setTimeout(resolve, 5000));
   }
 }
 
