@@ -62,6 +62,7 @@ interface VideoVariant {
 
 interface VideoInfo {
   variants?: VideoVariant[];
+  duration_millis?: number;
 }
 
 interface MediaEntity {
@@ -705,7 +706,7 @@ async function processTweets(
     let replyParentInfo: ProcessedTweetEntry | null = null;
 
     if (isReply) {
-      if (replyStatusId && processedTweets[replyStatusId] && !processedTweets[replyStatusId]?.migrated) {
+      if (replyStatusId && processedTweets[replyStatusId]) {
         console.log(`[${twitterUsername}] 🧵 Threading reply to post in ${bskyIdentifier}: ${replyStatusId}`);
         replyParentInfo = processedTweets[replyStatusId] ?? null;
       } else {
@@ -795,6 +796,15 @@ async function processTweets(
         }
       } else if (media.type === 'video' || media.type === 'animated_gif') {
         const variants = media.video_info?.variants || [];
+        const duration = media.video_info?.duration_millis || 0;
+        
+        if (duration > 180000) { // 3 minutes
+           console.warn(`[${twitterUsername}] ⚠️ Video too long (${(duration / 1000).toFixed(1)}s). Fallback to link.`);
+           const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
+           if (!text.includes(tweetUrl)) text += `\n\nVideo: ${tweetUrl}`;
+           continue;
+        }
+
         const mp4s = variants
           .filter((v) => v.content_type === 'video/mp4')
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -808,7 +818,7 @@ async function processTweets(
               updateAppStatus({ message: `Downloading video: ${path.basename(videoUrl)}` });
               const { buffer, mimeType } = await downloadMedia(videoUrl);
               
-              if (buffer.length <= 100 * 1024 * 1024) {
+              if (buffer.length <= 90 * 1024 * 1024) {
                 const filename = videoUrl.split('/').pop() || 'video.mp4';
                 updateAppStatus({ message: `Uploading video to Bluesky...` });
                 videoBlob = await uploadVideoToBluesky(agent, buffer, filename);
