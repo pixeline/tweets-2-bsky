@@ -12,6 +12,7 @@ import * as francModule from 'franc-min';
 import iso6391 from 'iso-639-1';
 import os from 'node:os';
 import puppeteer from 'puppeteer-core';
+import * as cheerio from 'cheerio';
 import sharp from 'sharp';
 import { getConfig } from './config-manager.js';
 
@@ -498,6 +499,57 @@ async function pollForVideoProcessing(agent: BskyAgent, jobId: string): Promise<
   return blob!;
 }
 
+async function fetchEmbedUrlCard(agent: BskyAgent, url: string): Promise<any> {
+  try {
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Tweets2Bsky/1.0; +https://github.com/j4ckxyz/tweets-2-bsky)',
+      },
+      timeout: 10000,
+    });
+    
+    const $ = cheerio.load(response.data);
+    const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
+    const description = $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '';
+    let thumbBlob: BlobRef | undefined;
+
+    let imageUrl = $('meta[property="og:image"]').attr('content');
+    if (imageUrl) {
+        if (!imageUrl.startsWith('http')) {
+            const baseUrl = new URL(url);
+            imageUrl = new URL(imageUrl, baseUrl.origin).toString();
+        }
+        try {
+            const { buffer, mimeType } = await downloadMedia(imageUrl);
+            thumbBlob = await uploadToBluesky(agent, buffer, mimeType);
+        } catch (e) {
+            console.warn(`Failed to upload thumbnail for ${url}:`, e);
+        }
+    }
+
+    if (!title && !description) return null;
+
+    const external: any = {
+        uri: url,
+        title: title || url,
+        description: description,
+    };
+
+    if (thumbBlob) {
+        external.thumb = thumbBlob;
+    }
+
+    return {
+        $type: 'app.bsky.embed.external',
+        external,
+    };
+
+  } catch (err) {
+    console.warn(`Failed to fetch embed card for ${url}:`, err);
+    return null;
+  }
+}
+
 async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: string): Promise<BlobRef> {
   const sanitizedFilename = filename.split("?")[0] || "video.mp4";
   console.log(
@@ -847,6 +899,7 @@ async function processTweets(
     // 3. Quoting Logic
     let quoteEmbed: { $type: string; record: { uri: string; cid: string } } | null = null;
     let externalQuoteUrl: string | null = null;
+    let linkCard: any = null;
 
     if (tweet.is_quote_status && tweet.quoted_status_id_str) {
       const quoteId = tweet.quoted_status_id_str;
@@ -882,6 +935,20 @@ async function processTweets(
           console.log(`[${twitterUsername}] 🔁 Quoted tweet is a self-quote, skipping link.`);
         }
       }
+    } else if (images.length === 0 && !videoBlob) {
+        // If no media and no quote, check for external links to embed
+        // We prioritize the LAST link found as it's often the main content
+        const potentialLinks = urls
+            .map(u => u.expanded_url)
+            .filter(u => u && !u.includes('twitter.com') && !u.includes('x.com')) as string[];
+        
+        if (potentialLinks.length > 0) {
+            const linkToEmbed = potentialLinks[potentialLinks.length - 1];
+            if (linkToEmbed) {
+                console.log(`[${twitterUsername}] 🃏 Fetching link card for: ${linkToEmbed}`);
+                linkCard = await fetchEmbedUrlCard(agent, linkToEmbed);
+            }
+        }
     }
 
     // Only append link for external quotes IF we couldn't natively embed it OR screenshot it
@@ -930,6 +997,8 @@ async function processTweets(
           }
         } else if (quoteEmbed) {
           postRecord.embed = quoteEmbed;
+        } else if (linkCard) {
+          postRecord.embed = linkCard;
         }
       }
 
