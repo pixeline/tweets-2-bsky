@@ -226,8 +226,8 @@ function mapScraperTweetToLocalTweet(scraperTweet: ScraperTweet): Tweet {
             full_text: scraperTweet.text,
             // Construct minimal entities from parsed data
             entities: {
-                urls: scraperTweet.urls.map(url => ({ url, expanded_url: url })),
-                media: scraperTweet.photos.map(p => ({
+                urls: scraperTweet.urls.map((url: string) => ({ url, expanded_url: url })),
+                media: scraperTweet.photos.map((p: any) => ({
                     url: p.url,
                     expanded_url: p.url,
                     media_url_https: p.url,
@@ -608,7 +608,7 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
         Authorization: `Bearer ${token}`,
         "Content-Type": "video/mp4",
       },
-      body: buffer,
+      body: new Blob([new Uint8Array(buffer)]),
     });
 
     if (!uploadResponse.ok) {
