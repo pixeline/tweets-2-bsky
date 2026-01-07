@@ -301,6 +301,50 @@ app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res)
   res.json({ success: true, message: 'All backfills cleared' });
 });
 
+// --- Config Management Routes ---
+
+app.get('/api/config/export', authenticateToken, requireAdmin, (_req, res) => {
+  const config = getConfig();
+  // Create a copy without user data (passwords)
+  const { users, ...cleanConfig } = config;
+  
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', 'attachment; filename=tweets-2-bsky-config.json');
+  res.json(cleanConfig);
+});
+
+app.post('/api/config/import', authenticateToken, requireAdmin, (req, res) => {
+  try {
+    const importData = req.body;
+    const currentConfig = getConfig();
+
+    // Validate minimal structure
+    if (!importData.mappings || !Array.isArray(importData.mappings)) {
+        res.status(400).json({ error: 'Invalid config format: missing mappings array' });
+        return;
+    }
+
+    // Merge logic:
+    // 1. Keep current users (don't overwrite admin/passwords)
+    // 2. Overwrite mappings, twitter, ai config from import
+    // 3. Keep current values if import is missing them (optional, but safer to just replace sections)
+    
+    const newConfig = {
+        ...currentConfig,
+        mappings: importData.mappings,
+        twitter: importData.twitter || currentConfig.twitter,
+        ai: importData.ai || currentConfig.ai,
+        checkIntervalMinutes: importData.checkIntervalMinutes || currentConfig.checkIntervalMinutes
+    };
+
+    saveConfig(newConfig);
+    res.json({ success: true, message: 'Configuration imported successfully' });
+  } catch (err) {
+    console.error('Import failed:', err);
+    res.status(500).json({ error: 'Failed to process import file' });
+  }
+});
+
 app.get('/api/recent-activity', authenticateToken, (req, res) => {
   const limit = req.query.limit ? Number(req.query.limit) : 50;
   const tweets = dbService.getRecentProcessedTweets(limit);

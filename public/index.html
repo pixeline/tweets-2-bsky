@@ -394,6 +394,50 @@
                 }
             };
 
+            const handleExportConfig = async () => {
+                try {
+                    const response = await axios.get('/api/config/export', {
+                        headers: { Authorization: `Bearer ${token}` },
+                        responseType: 'blob',
+                    });
+                    const url = window.URL.createObjectURL(new Blob([response.data]));
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.setAttribute('download', `tweets-2-bsky-config-${new Date().toISOString().split('T')[0]}.json`);
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                } catch (err) {
+                    alert('Failed to export configuration');
+                }
+            };
+
+            const handleImportConfig = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                if (!confirm('This will OVERWRITE your current accounts and settings (except login). Are you sure?')) {
+                    e.target.value = ''; // Reset input
+                    return;
+                }
+
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    try {
+                        const config = JSON.parse(event.target.result);
+                        await axios.post('/api/config/import', config, {
+                            headers: { Authorization: `Bearer ${token}` }
+                        });
+                        alert('Configuration imported successfully! Reloading...');
+                        fetchData();
+                    } catch (err) {
+                        alert('Failed to import configuration: ' + (err.response?.data?.error || err.message));
+                    }
+                    e.target.value = ''; // Reset input
+                };
+                reader.readAsText(file);
+            };
+
             if (view === 'login' || view === 'register' || !token) {
                 return (
                     <div className="container d-flex justify-content-center align-items-center min-vh-100">
@@ -783,6 +827,37 @@
                                                     </div>
                                                 </div>
                                             </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Data Management */}
+                                <div className="card mt-4">
+                                    <div className="card-header">
+                                        <span className="d-flex align-items-center gap-2">
+                                            <span className="material-icons text-muted">save</span> Data Management
+                                        </span>
+                                    </div>
+                                    <div className="card-body">
+                                        <div className="d-grid gap-2">
+                                            <button onClick={handleExportConfig} className="btn btn-outline-secondary btn-sm d-flex align-items-center justify-content-center gap-2">
+                                                <span className="material-icons" style={{fontSize: '18px'}}>download</span> Export Configuration
+                                            </button>
+                                            <div className="position-relative">
+                                                <input 
+                                                    type="file" 
+                                                    accept=".json" 
+                                                    className="form-control d-none" 
+                                                    id="importConfigInput"
+                                                    onChange={handleImportConfig}
+                                                />
+                                                <button onClick={() => document.getElementById('importConfigInput').click()} className="btn btn-outline-primary btn-sm w-100 d-flex align-items-center justify-content-center gap-2">
+                                                    <span className="material-icons" style={{fontSize: '18px'}}>upload</span> Import Configuration
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <div className="form-text small mt-2 text-center">
+                                            Exports accounts, Twitter keys, and AI settings. User logins are NOT exported.
                                         </div>
                                     </div>
                                 </div>
