@@ -93,6 +93,7 @@ interface Tweet {
   entities?: TweetEntities;
   extended_entities?: TweetEntities;
   quoted_status_id_str?: string;
+  retweeted_status_id_str?: string;
   is_quote_status?: boolean;
   in_reply_to_status_id_str?: string;
   in_reply_to_status_id?: string;
@@ -281,6 +282,7 @@ function mapScraperTweetToLocalTweet(scraperTweet: ScraperTweet): Tweet {
       // biome-ignore lint/suspicious/noExplicitAny: raw types match compatible structure
       extended_entities: raw.extended_entities as any,
       quoted_status_id_str: raw.quoted_status_id_str,
+      retweeted_status_id_str: raw.retweeted_status_id_str,
       is_quote_status: !!raw.quoted_status_id_str,
       in_reply_to_status_id_str: raw.in_reply_to_status_id_str,
       // biome-ignore lint/suspicious/noExplicitAny: missing in LegacyTweetRaw type
@@ -427,7 +429,13 @@ async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: strin
   return data.blob;
 }
 
-async function captureTweetScreenshot(tweetUrl: string): Promise<Buffer | null> {
+interface ScreenshotResult {
+  buffer: Buffer;
+  width: number;
+  height: number;
+}
+
+async function captureTweetScreenshot(tweetUrl: string): Promise<ScreenshotResult | null> {
   const browserPaths = [
     '/usr/bin/google-chrome',
     '/usr/bin/chromium-browser',
@@ -494,9 +502,12 @@ async function captureTweetScreenshot(tweetUrl: string): Promise<Buffer | null> 
 
     const element = await page.$('#container');
     if (element) {
+      const box = await element.boundingBox();
       const buffer = await element.screenshot({ type: 'png', omitBackground: true });
-      console.log(`[SCREENSHOT] ✅ Captured successfully (${(buffer.length / 1024).toFixed(2)} KB)`);
-      return buffer as Buffer;
+      if (box) {
+          console.log(`[SCREENSHOT] ✅ Captured successfully (${(buffer.length / 1024).toFixed(2)} KB) - ${Math.round(box.width)}x${Math.round(box.height)}`);
+          return { buffer: buffer as Buffer, width: Math.round(box.width), height: Math.round(box.height) };
+      }
     }
   } catch (err) {
     console.error(`[SCREENSHOT] ❌ Error capturing tweet:`, (err as Error).message);
@@ -806,6 +817,11 @@ async function processTweets(
 
     if (processedTweets[tweetId]) continue;
 
+    if (tweet.retweeted_status_id_str) {
+      console.log(`[${twitterUsername}] ⏩ Skipping retweet ${tweetId}.`);
+      continue;
+    }
+
     console.log(`\n[${twitterUsername}] 🔍 Inspecting tweet: ${tweetId}`);
     updateAppStatus({
       state: 'processing',
@@ -1013,17 +1029,21 @@ async function processTweets(
           
           // Try to capture screenshot for external QTs if we have space for images
           if (images.length < 4 && !videoBlob) {
-            const ssBuffer = await captureTweetScreenshot(externalQuoteUrl);
-            if (ssBuffer) {
+            const ssResult = await captureTweetScreenshot(externalQuoteUrl);
+            if (ssResult) {
               try {
                 let blob: BlobRef;
                 if (dryRun) {
-                    console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would upload screenshot for quote (${(ssBuffer.length/1024).toFixed(2)} KB)`);
-                    blob = { ref: { toString: () => 'mock-ss-blob' }, mimeType: 'image/png', size: ssBuffer.length } as any;
+                    console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would upload screenshot for quote (${(ssResult.buffer.length/1024).toFixed(2)} KB)`);
+                    blob = { ref: { toString: () => 'mock-ss-blob' }, mimeType: 'image/png', size: ssResult.buffer.length } as any;
                 } else {
-                    blob = await uploadToBluesky(agent, ssBuffer, 'image/png');
+                    blob = await uploadToBluesky(agent, ssResult.buffer, 'image/png');
                 }
-                images.push({ alt: `Quote Tweet: ${externalQuoteUrl}`, image: blob });
+                images.push({ 
+                    alt: `Quote Tweet: ${externalQuoteUrl}`, 
+                    image: blob,
+                    aspectRatio: { width: ssResult.width, height: ssResult.height }
+                });
               } catch (e) {
                 console.warn(`[${twitterUsername}] ⚠️ Failed to upload screenshot blob.`);
               }
