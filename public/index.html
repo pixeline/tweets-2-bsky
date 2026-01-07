@@ -366,7 +366,9 @@
                 try {
                     await axios.post('/api/twitter-config', {
                         authToken: formData.get('authToken'),
-                        ct0: formData.get('ct0')
+                        ct0: formData.get('ct0'),
+                        backupAuthToken: formData.get('backupAuthToken'),
+                        backupCt0: formData.get('backupCt0')
                     }, { headers: { Authorization: `Bearer ${token}` } });
                     alert('Twitter config updated!');
                     fetchData();
@@ -661,13 +663,26 @@
                                                     <div className="accordion-body bg-light bg-opacity-50">
                                                         <form onSubmit={updateTwitter}>
                                                             <div className="mb-3">
-                                                                <label className="form-label small fw-bold text-muted">Auth Token</label>
+                                                                <label className="form-label small fw-bold text-muted">Primary Auth Token</label>
                                                                 <input name="authToken" defaultValue={twitterConfig.authToken} className="form-control form-control-sm" placeholder="auth_token" required />
                                                             </div>
                                                             <div className="mb-3">
-                                                                <label className="form-label small fw-bold text-muted">CT0</label>
+                                                                <label className="form-label small fw-bold text-muted">Primary CT0</label>
                                                                 <input name="ct0" defaultValue={twitterConfig.ct0} className="form-control form-control-sm" placeholder="ct0" required />
                                                             </div>
+                                                            
+                                                            <div className="border-top my-3 pt-3">
+                                                                <h6 className="small text-uppercase text-muted fw-bold mb-3">Backup Credentials (Optional)</h6>
+                                                                <div className="mb-3">
+                                                                    <label className="form-label small fw-bold text-muted">Backup Auth Token</label>
+                                                                    <input name="backupAuthToken" defaultValue={twitterConfig.backupAuthToken} className="form-control form-control-sm" placeholder="auth_token" />
+                                                                </div>
+                                                                <div className="mb-3">
+                                                                    <label className="form-label small fw-bold text-muted">Backup CT0</label>
+                                                                    <input name="backupCt0" defaultValue={twitterConfig.backupCt0} className="form-control form-control-sm" placeholder="ct0" />
+                                                                </div>
+                                                            </div>
+
                                                             <button className="btn btn-primary btn-sm w-100">Save Credentials</button>
                                                         </form>
                                                     </div>

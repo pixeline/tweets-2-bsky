@@ -10,6 +10,8 @@ const CONFIG_FILE = path.join(__dirname, '..', 'config.json');
 export interface TwitterConfig {
   authToken: string;
   ct0: string;
+  backupAuthToken?: string;
+  backupCt0?: string;
 }
 
 export interface WebUser {

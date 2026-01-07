@@ -211,9 +211,9 @@ app.get('/api/twitter-config', authenticateToken, requireAdmin, (_req, res) => {
 });
 
 app.post('/api/twitter-config', authenticateToken, requireAdmin, (req, res) => {
-  const { authToken, ct0 } = req.body;
+  const { authToken, ct0, backupAuthToken, backupCt0 } = req.body;
   const config = getConfig();
-  config.twitter = { authToken, ct0 };
+  config.twitter = { authToken, ct0, backupAuthToken, backupCt0 };
   saveConfig(config);
   res.json({ success: true });
 });

@@ -197,28 +197,53 @@ function saveProcessedTweet(twitterUsername: string, bskyIdentifier: string, twi
 
 let scraper: Scraper | null = null;
 let currentTwitterCookies = { authToken: '', ct0: '' };
+let useBackupCredentials = false;
 
-async function getTwitterScraper(): Promise<Scraper | null> {
+async function getTwitterScraper(forceReset = false): Promise<Scraper | null> {
   const config = getConfig();
-  if (!config.twitter.authToken || !config.twitter.ct0) return null;
+  let authToken = config.twitter.authToken;
+  let ct0 = config.twitter.ct0;
+
+  // Use backup if toggled
+  if (useBackupCredentials && config.twitter.backupAuthToken && config.twitter.backupCt0) {
+    authToken = config.twitter.backupAuthToken;
+    ct0 = config.twitter.backupCt0;
+  }
+
+  if (!authToken || !ct0) return null;
   
-  // Re-initialize if config changed or not yet initialized
-  if (!scraper || 
-      currentTwitterCookies.authToken !== config.twitter.authToken || 
-      currentTwitterCookies.ct0 !== config.twitter.ct0) {
-    
+  // Re-initialize if config changed, not yet initialized, or forced reset
+  if (
+    !scraper || 
+    forceReset ||
+    currentTwitterCookies.authToken !== authToken || 
+    currentTwitterCookies.ct0 !== ct0
+  ) {
+    console.log(`🔄 Initializing Twitter scraper with ${useBackupCredentials ? 'BACKUP' : 'PRIMARY'} credentials...`);
     scraper = new Scraper();
     await scraper.setCookies([
-        `auth_token=${config.twitter.authToken}`,
-        `ct0=${config.twitter.ct0}`
+        `auth_token=${authToken}`,
+        `ct0=${ct0}`
     ]);
 
     currentTwitterCookies = { 
-      authToken: config.twitter.authToken, 
-      ct0: config.twitter.ct0 
+      authToken: authToken, 
+      ct0: ct0 
     };
   }
   return scraper;
+}
+
+async function switchCredentials() {
+  const config = getConfig();
+  if (config.twitter.backupAuthToken && config.twitter.backupCt0) {
+    useBackupCredentials = !useBackupCredentials;
+    console.log(`⚠️ Switching to ${useBackupCredentials ? 'BACKUP' : 'PRIMARY'} Twitter credentials...`);
+    await getTwitterScraper(true);
+    return true;
+  }
+  console.log("⚠️ No backup credentials available to switch to.");
+  return false;
 }
 
 function mapScraperTweetToLocalTweet(scraperTweet: ScraperTweet): Tweet {
@@ -710,12 +735,22 @@ async function fetchUserTweets(username: string, limit: number): Promise<Tweet[]
       return tweets;
     } catch (e: any) {
       retries--;
-      const isRetryable = e.message?.includes('ServiceUnavailable') || e.message?.includes('Timeout') || e.message?.includes('429');
+      const isRetryable = e.message?.includes('ServiceUnavailable') || e.message?.includes('Timeout') || e.message?.includes('429') || e.message?.includes('401');
       
-      if (retries > 0 && isRetryable) {
-        console.warn(`⚠️ Error fetching tweets for ${username} (${e.message}). Retrying in 5s...`);
-        await new Promise(r => setTimeout(r, 5000));
-        continue;
+      if (isRetryable) {
+        console.warn(`⚠️ Error fetching tweets for ${username} (${e.message}).`);
+        
+        // Attempt credential switch if we have backups
+        if (await switchCredentials()) {
+            console.log(`🔄 Retrying with new credentials...`);
+            continue; // Retry loop with new credentials
+        }
+
+        if (retries > 0) {
+            console.log(`Waiting 5s before retry...`);
+            await new Promise(r => setTimeout(r, 5000));
+            continue;
+        }
       }
       
       console.warn(`Error fetching tweets for ${username}:`, e);
@@ -1118,7 +1153,8 @@ async function processTweets(
       }
     }
     
-    const wait = 10000;
+    // Add a random delay between 5s and 15s to be more human-like
+    const wait = Math.floor(Math.random() * 10000) + 5000;
     console.log(`[${twitterUsername}] 😴 Pacing: Waiting ${wait / 1000}s before next tweet.`);
     updateAppStatus({ state: 'pacing', message: `Pacing: Waiting ${wait / 1000}s...` });
     await new Promise((r) => setTimeout(r, wait));
@@ -1276,6 +1312,7 @@ async function runAccountTask(mapping: AccountMapping, forceBackfill = false, dr
     })();
 
     activeTasks.set(mapping.id, task);
+    return task; // Return task promise for await in main loop
 }
 
 import {
@@ -1366,7 +1403,13 @@ async function main(): Promise<void> {
         
         // Run if scheduled OR backfill requested
         if (isScheduledRun || hasPendingBackfill) {
-            runAccountTask(mapping, hasPendingBackfill, options.dryRun);
+            // Await the task to ensure we don't bombard twitter
+            await runAccountTask(mapping, hasPendingBackfill, options.dryRun);
+            
+            // Random delay between 2-5 seconds between accounts
+            const accountDelay = Math.floor(Math.random() * 3000) + 2000;
+            console.log(`[Scheduler] ⏳ Waiting ${accountDelay}ms before next account...`);
+            await new Promise(r => setTimeout(r, accountDelay));
         }
     }
     
