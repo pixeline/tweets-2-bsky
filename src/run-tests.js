@@ -21,11 +21,14 @@ console.log('Test 1: Twitter URL Manipulation (High Quality Download)');
   const url1 = 'https://pbs.twimg.com/media/ABC123.jpg';
   const highQuality1 = url1.includes('?') ? url1.replace('?', ':orig?') : url1 + ':orig';
   assert(highQuality1 === 'https://pbs.twimg.com/media/ABC123.jpg:orig', 'Should append :orig to plain URLs');
-  
+
   const url2 = 'https://pbs.twimg.com/media/ABC123.jpg?format=jpg&name=small';
   const highQuality2 = url2.includes('?') ? url2.replace('?', ':orig?') : url2 + ':orig';
-  assert(highQuality2 === 'https://pbs.twimg.com/media/ABC123.jpg:orig?format=jpg&name=small', 'Should replace ? with :orig? for query URLs');
-  
+  assert(
+    highQuality2 === 'https://pbs.twimg.com/media/ABC123.jpg:orig?format=jpg&name=small',
+    'Should replace ? with :orig? for query URLs',
+  );
+
   const url3 = 'https://pbs.twimg.com/media/DEF456.png?name=large';
   const highQuality3 = url3.includes('?') ? url3.replace('?', ':orig?') : url3 + ':orig';
   assert(highQuality3 === 'https://pbs.twimg.com/media/DEF456.png:orig?name=large', 'Should work with PNGs too');
@@ -70,7 +73,7 @@ console.log('Test 2: Text Splitting Logic');
   const text2 = 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.';
   const result2 = splitText(text2, 50);
   assert(result2.length >= 2, `Should split at paragraph breaks (got ${result2.length} chunks)`);
-  const allHaveContent = result2.every(c => c.length > 0);
+  const allHaveContent = result2.every((c) => c.length > 0);
   assert(allHaveContent, 'All chunks have content');
   console.log();
 }
@@ -102,7 +105,7 @@ console.log('Test 4: Aspect Ratio Calculation');
   const sizes = {
     large: { w: 1200, h: 800 },
     medium: { w: 600, h: 400 },
-    small: { w: 300, h: 200 }
+    small: { w: 300, h: 200 },
   };
 
   const getAspectRatio = (mediaSizes, originalInfo) => {
@@ -132,7 +135,7 @@ console.log('Test 5: Video Variant Sorting (Highest Quality First)');
     { content_type: 'video/mp4', url: 'low.mp4', bitrate: 500000 },
     { content_type: 'video/mp4', url: 'high.mp4', bitrate: 2000000 },
     { content_type: 'video/mp4', url: 'medium.mp4', bitrate: 1000000 },
-    { content_type: 'audio/mp4', url: 'audio.mp4', bitrate: 128000 }
+    { content_type: 'audio/mp4', url: 'audio.mp4', bitrate: 128000 },
   ];
 
   const mp4s = variants
@@ -196,16 +199,16 @@ console.log('Test 8: Retry Logic Simulation (High Quality -> Standard)');
       const downloadWithRetry = async (url) => {
         callCount++;
         const isHighQuality = url.includes(':orig');
-        
+
         if (isHighQuality && callCount === 1) {
           throw new Error('High quality download failed');
         }
-        
+
         if (isHighQuality && callCount === 2) {
           const fallbackUrl = url.replace(':orig?', '?');
           return { buffer: Buffer.from('standard quality'), mimeType: 'image/jpeg' };
         }
-        
+
         return { buffer: Buffer.from('standard quality'), mimeType: 'image/jpeg' };
       };
 
@@ -228,7 +231,7 @@ console.log('Test 8: Retry Logic Simulation (High Quality -> Standard)');
     }
   };
 
-  runRetryTests().catch(err => {
+  runRetryTests().catch((err) => {
     console.log(`  ✗ Retry test error: ${err.message}`);
     testsFailed++;
   });
@@ -242,7 +245,7 @@ console.log('Test 9: Image Compression Quality Settings');
     jpeg: { quality: 92, mozjpeg: true },
     jpegFallback: { quality: 85, mozjpeg: true },
     png: { compressionLevel: 9, adaptiveFiltering: true },
-    webp: { quality: 90, effort: 6 }
+    webp: { quality: 90, effort: 6 },
   };
 
   assert(settings.jpeg.quality === 92, 'JPEG quality is 92%');

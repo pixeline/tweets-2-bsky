@@ -1,6 +1,6 @@
 import { Command } from 'commander';
 import inquirer from 'inquirer';
-import { addMapping, getConfig, removeMapping, saveConfig, updateTwitterConfig, type AIConfig } from './config-manager.js';
+import { addMapping, getConfig, removeMapping, saveConfig, updateTwitterConfig } from './config-manager.js';
 
 const program = new Command();
 
@@ -15,10 +15,10 @@ program
   .action(async () => {
     const config = getConfig();
     const currentAi = config.ai || { provider: 'gemini' };
-    
+
     // Check legacy gemini key if not in new config
     if (!config.ai && config.geminiApiKey) {
-        currentAi.apiKey = config.geminiApiKey;
+      currentAi.apiKey = config.geminiApiKey;
     }
 
     const answers = await inquirer.prompt([
@@ -30,9 +30,9 @@ program
           { name: 'Google Gemini (Default)', value: 'gemini' },
           { name: 'OpenAI / OpenRouter', value: 'openai' },
           { name: 'Anthropic (Claude)', value: 'anthropic' },
-          { name: 'Custom (OpenAI Compatible)', value: 'custom' }
+          { name: 'Custom (OpenAI Compatible)', value: 'custom' },
         ],
-        default: currentAi.provider
+        default: currentAi.provider,
       },
       {
         type: 'input',
@@ -40,11 +40,11 @@ program
         message: 'Enter API Key (optional for some custom providers):',
         default: currentAi.apiKey,
         validate: (input: string, answers: any) => {
-            if (['gemini', 'anthropic'].includes(answers.provider) && !input) {
-                return 'API Key is required for this provider.';
-            }
-            return true;
-        }
+          if (['gemini', 'anthropic'].includes(answers.provider) && !input) {
+            return 'API Key is required for this provider.';
+          }
+          return true;
+        },
       },
       {
         type: 'input',
@@ -57,20 +57,20 @@ program
         name: 'baseUrl',
         message: 'Enter Base URL (optional, e.g. for OpenRouter):',
         default: currentAi.baseUrl,
-        when: (answers) => ['openai', 'anthropic', 'custom'].includes(answers.provider)
-      }
+        when: (answers) => ['openai', 'anthropic', 'custom'].includes(answers.provider),
+      },
     ]);
 
     config.ai = {
-        provider: answers.provider,
-        apiKey: answers.apiKey,
-        model: answers.model || undefined,
-        baseUrl: answers.baseUrl || undefined
+      provider: answers.provider,
+      apiKey: answers.apiKey,
+      model: answers.model || undefined,
+      baseUrl: answers.baseUrl || undefined,
     };
-    
+
     // Clear legacy key to avoid confusion
     delete config.geminiApiKey;
-    
+
     saveConfig(config);
     console.log('AI configuration updated!');
   });
@@ -125,9 +125,12 @@ program
         default: 'https://bsky.social',
       },
     ]);
-    
-    const usernames = answers.twitterUsernames.split(',').map((u: string) => u.trim()).filter((u: string) => u.length > 0);
-    
+
+    const usernames = answers.twitterUsernames
+      .split(',')
+      .map((u: string) => u.trim())
+      .filter((u: string) => u.length > 0);
+
     addMapping({
       ...answers,
       twitterUsernames: usernames,
@@ -144,7 +147,7 @@ program
       console.log('No mappings found.');
       return;
     }
-    
+
     const { id } = await inquirer.prompt([
       {
         type: 'list',
@@ -186,27 +189,30 @@ program
       },
     ]);
 
-    const usernames = answers.twitterUsernames.split(',').map((u: string) => u.trim()).filter((u: string) => u.length > 0);
+    const usernames = answers.twitterUsernames
+      .split(',')
+      .map((u: string) => u.trim())
+      .filter((u: string) => u.length > 0);
 
     // Update the mapping directly
-    const index = config.mappings.findIndex(m => m.id === id);
+    const index = config.mappings.findIndex((m) => m.id === id);
     const existingMapping = config.mappings[index];
-    
+
     if (index !== -1 && existingMapping) {
-       const updatedMapping = {
-         ...existingMapping,
-         twitterUsernames: usernames,
-         bskyIdentifier: answers.bskyIdentifier,
-         bskyServiceUrl: answers.bskyServiceUrl,
-       };
-       
-       if (answers.bskyPassword && answers.bskyPassword.trim().length > 0) {
-         updatedMapping.bskyPassword = answers.bskyPassword;
-       }
-       
-       config.mappings[index] = updatedMapping;
-       saveConfig(config);
-       console.log('Mapping updated successfully!');
+      const updatedMapping = {
+        ...existingMapping,
+        twitterUsernames: usernames,
+        bskyIdentifier: answers.bskyIdentifier,
+        bskyServiceUrl: answers.bskyServiceUrl,
+      };
+
+      if (answers.bskyPassword && answers.bskyPassword.trim().length > 0) {
+        updatedMapping.bskyPassword = answers.bskyPassword;
+      }
+
+      config.mappings[index] = updatedMapping;
+      saveConfig(config);
+      console.log('Mapping updated successfully!');
     }
   });
 

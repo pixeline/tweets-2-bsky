@@ -2,16 +2,20 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import axios from 'axios';
 import { getConfig } from './config-manager.js';
 
-export async function generateAltText(buffer: Buffer, mimeType: string, contextText: string): Promise<string | undefined> {
+export async function generateAltText(
+  buffer: Buffer,
+  mimeType: string,
+  contextText: string,
+): Promise<string | undefined> {
   const config = getConfig();
-  
+
   // 1. Determine Provider and Credentials
   // Priority: AI Config > Legacy Gemini Config > Environment Variables
-  
-  let provider = config.ai?.provider || 'gemini';
+
+  const provider = config.ai?.provider || 'gemini';
   let apiKey = config.ai?.apiKey;
   let model = config.ai?.model;
-  let baseUrl = config.ai?.baseUrl;
+  const baseUrl = config.ai?.baseUrl;
 
   // Fallbacks for Environment Variables
   if (!apiKey) {
@@ -23,12 +27,12 @@ export async function generateAltText(buffer: Buffer, mimeType: string, contextT
 
   // Fallback for Gemini specific legacy env var if provider is implicitly gemini
   if (!apiKey && provider === 'gemini') {
-      apiKey = process.env.GEMINI_API_KEY;
+    apiKey = process.env.GEMINI_API_KEY;
   }
 
   // API Key is mandatory for Gemini and Anthropic
   if (!apiKey && (provider === 'gemini' || provider === 'anthropic')) {
-     return undefined;
+    return undefined;
   }
 
   // Default Models
@@ -48,7 +52,14 @@ export async function generateAltText(buffer: Buffer, mimeType: string, contextT
         return await callOpenAICompatible(apiKey, model || 'gpt-4o', baseUrl, buffer, mimeType, contextText);
       case 'anthropic':
         // apiKey is guaranteed by check above
-        return await callAnthropic(apiKey!, model || 'claude-3-5-sonnet-20241022', baseUrl, buffer, mimeType, contextText);
+        return await callAnthropic(
+          apiKey!,
+          model || 'claude-3-5-sonnet-20241022',
+          baseUrl,
+          buffer,
+          mimeType,
+          contextText,
+        );
       default:
         console.warn(`[AI] ⚠️ Unknown provider: ${provider}`);
         return undefined;
@@ -59,7 +70,13 @@ export async function generateAltText(buffer: Buffer, mimeType: string, contextT
   }
 }
 
-async function callGemini(apiKey: string, modelName: string, buffer: Buffer, mimeType: string, contextText: string): Promise<string | undefined> {
+async function callGemini(
+  apiKey: string,
+  modelName: string,
+  buffer: Buffer,
+  mimeType: string,
+  contextText: string,
+): Promise<string | undefined> {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({ model: modelName });
 
@@ -72,53 +89,62 @@ async function callGemini(apiKey: string, modelName: string, buffer: Buffer, mim
     {
       inlineData: {
         data: buffer.toString('base64'),
-        mimeType
-      }
-    }
+        mimeType,
+      },
+    },
   ]);
   const response = await result.response;
   return response.text();
 }
 
-async function callOpenAICompatible(apiKey: string | undefined, model: string, baseUrl: string | undefined, buffer: Buffer, mimeType: string, contextText: string): Promise<string | undefined> {
-  const url = baseUrl ? `${baseUrl.replace(/\/+$/, '')}/chat/completions` : 'https://api.openai.com/v1/chat/completions';
-  
+async function callOpenAICompatible(
+  apiKey: string | undefined,
+  model: string,
+  baseUrl: string | undefined,
+  buffer: Buffer,
+  mimeType: string,
+  contextText: string,
+): Promise<string | undefined> {
+  const url = baseUrl
+    ? `${baseUrl.replace(/\/+$/, '')}/chat/completions`
+    : 'https://api.openai.com/v1/chat/completions';
+
   const base64Image = `data:${mimeType};base64,${buffer.toString('base64')}`;
 
   const payload = {
     model: model,
     messages: [
       {
-        role: "user",
+        role: 'user',
         content: [
           {
-            type: "text",
-            text: `Describe this image for alt text. Be concise but descriptive. Context from the tweet text: "${contextText}".`
+            type: 'text',
+            text: `Describe this image for alt text. Be concise but descriptive. Context from the tweet text: "${contextText}".`,
           },
           {
-            type: "image_url",
+            type: 'image_url',
             image_url: {
-              url: base64Image
-            }
-          }
-        ]
-      }
+              url: base64Image,
+            },
+          },
+        ],
+      },
     ],
-    max_tokens: 300
+    max_tokens: 300,
   };
 
   const headers: Record<string, string> = {
-      'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
   };
 
   if (apiKey) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
+    headers['Authorization'] = `Bearer ${apiKey}`;
   }
 
   // OpenRouter specific headers (optional but good practice)
   if (url.includes('openrouter.ai')) {
-      headers['HTTP-Referer'] = 'https://github.com/tweets-2-bsky';
-      headers['X-Title'] = 'Tweets to Bluesky';
+    headers['HTTP-Referer'] = 'https://github.com/tweets-2-bsky';
+    headers['X-Title'] = 'Tweets to Bluesky';
   }
 
   const response = await axios.post(url, payload, { headers });
@@ -126,9 +152,16 @@ async function callOpenAICompatible(apiKey: string | undefined, model: string, b
   return response.data.choices[0]?.message?.content || undefined;
 }
 
-async function callAnthropic(apiKey: string, model: string, baseUrl: string | undefined, buffer: Buffer, mimeType: string, contextText: string): Promise<string | undefined> {
+async function callAnthropic(
+  apiKey: string,
+  model: string,
+  baseUrl: string | undefined,
+  buffer: Buffer,
+  mimeType: string,
+  contextText: string,
+): Promise<string | undefined> {
   const url = baseUrl ? `${baseUrl.replace(/\/+$/, '')}/v1/messages` : 'https://api.anthropic.com/v1/messages';
-  
+
   const base64Data = buffer.toString('base64');
 
   const payload = {
@@ -136,31 +169,31 @@ async function callAnthropic(apiKey: string, model: string, baseUrl: string | un
     max_tokens: 300,
     messages: [
       {
-        role: "user",
+        role: 'user',
         content: [
           {
-            type: "image",
+            type: 'image',
             source: {
-              type: "base64",
+              type: 'base64',
               media_type: mimeType,
-              data: base64Data
-            }
+              data: base64Data,
+            },
           },
           {
-            type: "text",
-            text: `Describe this image for alt text. Be concise but descriptive. Context from the tweet text: "${contextText}".`
-          }
-        ]
-      }
-    ]
+            type: 'text',
+            text: `Describe this image for alt text. Be concise but descriptive. Context from the tweet text: "${contextText}".`,
+          },
+        ],
+      },
+    ],
   };
 
   const response = await axios.post(url, payload, {
     headers: {
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
-      'Content-Type': 'application/json'
-    }
+      'Content-Type': 'application/json',
+    },
   });
 
   return response.data.content[0]?.text || undefined;

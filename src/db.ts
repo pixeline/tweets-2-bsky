@@ -1,7 +1,7 @@
-import Database from 'better-sqlite3';
-import path from 'node:path';
 import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import Database from 'better-sqlite3';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -17,11 +17,11 @@ const db = new Database(path.join(DB_DIR, 'database.sqlite'));
 db.pragma('journal_mode = WAL');
 
 // --- Migration Support ---
-const tableInfo = db.prepare("PRAGMA table_info(processed_tweets)").all() as any[];
+const tableInfo = db.prepare('PRAGMA table_info(processed_tweets)').all() as any[];
 
 if (tableInfo.length > 0) {
-  const hasBskyIdentifier = tableInfo.some(col => col.name === 'bsky_identifier');
-  
+  const hasBskyIdentifier = tableInfo.some((col) => col.name === 'bsky_identifier');
+
   if (!hasBskyIdentifier) {
     console.log('🔄 Upgrading database schema to support multiple accounts...');
     // SQLite doesn't support easy PK changes, so we recreate the table
@@ -96,7 +96,7 @@ export const dbService = {
       bsky_cid: row.bsky_cid,
       bsky_root_uri: row.bsky_root_uri,
       bsky_root_cid: row.bsky_root_cid,
-      status: row.status
+      status: row.status,
     };
   },
 
@@ -114,7 +114,7 @@ export const dbService = {
       tweet.bsky_cid || null,
       tweet.bsky_root_uri || null,
       tweet.bsky_root_cid || null,
-      tweet.status
+      tweet.status,
     );
   },
 
@@ -128,7 +128,7 @@ export const dbService = {
         cid: row.bsky_cid,
         root: row.bsky_root_uri ? { uri: row.bsky_root_uri, cid: row.bsky_root_cid } : undefined,
         migrated: row.status === 'migrated',
-        skipped: row.status === 'skipped'
+        skipped: row.status === 'skipped',
       };
     }
     return map;
@@ -144,7 +144,7 @@ export const dbService = {
         cid: row.bsky_cid,
         root: row.bsky_root_uri ? { uri: row.bsky_root_uri, cid: row.bsky_root_cid } : undefined,
         migrated: row.status === 'migrated',
-        skipped: row.status === 'skipped'
+        skipped: row.status === 'skipped',
       };
     }
     return map;
@@ -156,11 +156,13 @@ export const dbService = {
   },
 
   repairUnknownIdentifiers(twitterUsername: string, bskyIdentifier: string) {
-    const stmt = db.prepare('UPDATE processed_tweets SET bsky_identifier = ? WHERE bsky_identifier = "unknown" AND twitter_username = ?');
+    const stmt = db.prepare(
+      'UPDATE processed_tweets SET bsky_identifier = ? WHERE bsky_identifier = "unknown" AND twitter_username = ?',
+    );
     stmt.run(bskyIdentifier.toLowerCase(), twitterUsername.toLowerCase());
   },
 
   clearAll() {
     db.prepare('DELETE FROM processed_tweets').run();
-  }
+  },
 };
