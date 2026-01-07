@@ -1,4 +1,3 @@
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcryptjs';
@@ -35,7 +34,7 @@ interface AppStatus {
 
 let currentAppStatus: AppStatus = {
   state: 'idle',
-  lastUpdate: Date.now()
+  lastUpdate: Date.now(),
 };
 
 app.use(cors());
@@ -119,7 +118,10 @@ app.post('/api/mappings', authenticateToken, (req, res) => {
   if (Array.isArray(twitterUsernames)) {
     usernames = twitterUsernames;
   } else if (typeof twitterUsernames === 'string') {
-    usernames = twitterUsernames.split(',').map(u => u.trim()).filter(u => u.length > 0);
+    usernames = twitterUsernames
+      .split(',')
+      .map((u) => u.trim())
+      .filter((u) => u.length > 0);
   }
 
   const newMapping = {
@@ -141,10 +143,10 @@ app.put('/api/mappings/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
   const { twitterUsernames, bskyIdentifier, bskyPassword, bskyServiceUrl, owner } = req.body;
   const config = getConfig();
-  
+
   const index = config.mappings.findIndex((m) => m.id === id);
   const existingMapping = config.mappings[index];
-  
+
   if (index === -1 || !existingMapping) {
     res.status(404).json({ error: 'Mapping not found' });
     return;
@@ -155,7 +157,10 @@ app.put('/api/mappings/:id', authenticateToken, (req, res) => {
     if (Array.isArray(twitterUsernames)) {
       usernames = twitterUsernames;
     } else if (typeof twitterUsernames === 'string') {
-      usernames = twitterUsernames.split(',').map(u => u.trim()).filter(u => u.length > 0);
+      usernames = twitterUsernames
+        .split(',')
+        .map((u) => u.trim())
+        .filter((u) => u.length > 0);
     }
   }
 
@@ -164,7 +169,7 @@ app.put('/api/mappings/:id', authenticateToken, (req, res) => {
     twitterUsernames: usernames,
     bskyIdentifier: bskyIdentifier || existingMapping.bskyIdentifier,
     // Only update password if provided
-    bskyPassword: bskyPassword || existingMapping.bskyPassword, 
+    bskyPassword: bskyPassword || existingMapping.bskyPassword,
     bskyServiceUrl: bskyServiceUrl || existingMapping.bskyServiceUrl,
     owner: owner || existingMapping.owner,
   };
@@ -194,7 +199,7 @@ app.delete('/api/mappings/:id/cache', authenticateToken, requireAdmin, (req, res
   for (const username of mapping.twitterUsernames) {
     dbService.deleteTweetsByUsername(username);
   }
-  
+
   res.json({ success: true, message: 'Cache cleared for all associated accounts' });
 });
 
@@ -214,31 +219,31 @@ app.post('/api/twitter-config', authenticateToken, requireAdmin, (req, res) => {
 });
 
 app.get('/api/ai-config', authenticateToken, requireAdmin, (_req, res) => {
-    const config = getConfig();
-    // Return legacy gemini key as part of new structure if needed
-    const aiConfig = config.ai || { 
-        provider: 'gemini', 
-        apiKey: config.geminiApiKey || '' 
-    };
-    res.json(aiConfig);
+  const config = getConfig();
+  // Return legacy gemini key as part of new structure if needed
+  const aiConfig = config.ai || {
+    provider: 'gemini',
+    apiKey: config.geminiApiKey || '',
+  };
+  res.json(aiConfig);
 });
-  
+
 app.post('/api/ai-config', authenticateToken, requireAdmin, (req, res) => {
-    const { provider, apiKey, model, baseUrl } = req.body;
-    const config = getConfig();
-    
-    config.ai = {
-        provider,
-        apiKey,
-        model: model || undefined,
-        baseUrl: baseUrl || undefined
-    };
-    
-    // Clear legacy key to avoid confusion
-    delete config.geminiApiKey;
-    
-    saveConfig(config);
-    res.json({ success: true });
+  const { provider, apiKey, model, baseUrl } = req.body;
+  const config = getConfig();
+
+  config.ai = {
+    provider,
+    apiKey,
+    model: model || undefined,
+    baseUrl: baseUrl || undefined,
+  };
+
+  // Clear legacy key to avoid confusion
+  delete config.geminiApiKey;
+
+  saveConfig(config);
+  res.json({ success: true });
 });
 
 // --- Status & Actions Routes ---
@@ -276,7 +281,7 @@ app.post('/api/backfill/:id', authenticateToken, requireAdmin, (req, res) => {
     return;
   }
 
-  if (!pendingBackfills.find(b => b.id === id)) {
+  if (!pendingBackfills.find((b) => b.id === id)) {
     pendingBackfills.push({ id, limit: limit ? Number(limit) : undefined });
   }
 
@@ -307,7 +312,7 @@ export function updateAppStatus(status: Partial<AppStatus>) {
   currentAppStatus = {
     ...currentAppStatus,
     ...status,
-    lastUpdate: Date.now()
+    lastUpdate: Date.now(),
   };
 }
 

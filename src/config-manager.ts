@@ -69,7 +69,7 @@ export function getConfig(): AppConfig {
 export function saveConfig(config: AppConfig): void {
   // biome-ignore lint/suspicious/noExplicitAny: cleanup before save
   const configToSave = { ...config } as any;
-  
+
   // Remove legacy field from saved file
   configToSave.mappings = configToSave.mappings.map((m: any) => {
     const { twitterUsername, ...rest } = m;
@@ -94,7 +94,7 @@ export function updateMapping(id: string, updates: Partial<Omit<AccountMapping, 
   const config = getConfig();
   const index = config.mappings.findIndex((m) => m.id === id);
   const existing = config.mappings[index];
-  
+
   if (index !== -1 && existing) {
     config.mappings[index] = { ...existing, ...updates };
     saveConfig(config);
