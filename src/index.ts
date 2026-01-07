@@ -688,17 +688,31 @@ async function fetchUserTweets(username: string, limit: number): Promise<Tweet[]
   const client = await getTwitterScraper();
   if (!client) return [];
   
-  const tweets: Tweet[] = [];
-  try {
-    const generator = client.getTweets(username, limit);
-    for await (const t of generator) {
-      tweets.push(mapScraperTweetToLocalTweet(t));
-      if (tweets.length >= limit) break;
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      const tweets: Tweet[] = [];
+      const generator = client.getTweets(username, limit);
+      for await (const t of generator) {
+        tweets.push(mapScraperTweetToLocalTweet(t));
+        if (tweets.length >= limit) break;
+      }
+      return tweets;
+    } catch (e: any) {
+      retries--;
+      const isRetryable = e.message?.includes('ServiceUnavailable') || e.message?.includes('Timeout') || e.message?.includes('429');
+      
+      if (retries > 0 && isRetryable) {
+        console.warn(`⚠️ Error fetching tweets for ${username} (${e.message}). Retrying in 5s...`);
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+      
+      console.warn(`Error fetching tweets for ${username}:`, e);
+      return [];
     }
-  } catch (e) {
-    console.warn(`Error fetching tweets for ${username}:`, e);
   }
-  return tweets;
+  return [];
 }
 
 // ============================================================================ 
