@@ -732,8 +732,43 @@ function splitText(text: string, limit = 300): string[] {
   return chunks;
 }
 
+// Simple p-limit implementation for concurrency control
+const pLimit = (concurrency: number) => {
+  const queue: (() => Promise<void>)[] = [];
+  let activeCount = 0;
+
+  const next = () => {
+    activeCount--;
+    if (queue.length > 0) {
+      queue.shift()!();
+    }
+  };
+
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    return new Promise<T>((resolve, reject) => {
+      const run = async () => {
+        activeCount++;
+        try {
+          resolve(await fn());
+        } catch (e) {
+          reject(e);
+        } finally {
+          next();
+        }
+      };
+
+      if (activeCount < concurrency) {
+        run();
+      } else {
+        queue.push(run);
+      }
+    });
+  };
+};
+
 // Replaced safeSearch with fetchUserTweets to use UserTweets endpoint instead of Search
-async function fetchUserTweets(username: string, limit: number): Promise<Tweet[]> {
+// Added processedIds for early stopping optimization
+async function fetchUserTweets(username: string, limit: number, processedIds?: Set<string>): Promise<Tweet[]> {
   const client = await getTwitterScraper();
   if (!client) return [];
   
@@ -742,8 +777,25 @@ async function fetchUserTweets(username: string, limit: number): Promise<Tweet[]
     try {
       const tweets: Tweet[] = [];
       const generator = client.getTweets(username, limit);
+      let consecutiveProcessedCount = 0;
+      
       for await (const t of generator) {
-        tweets.push(mapScraperTweetToLocalTweet(t));
+        const tweet = mapScraperTweetToLocalTweet(t);
+        const tweetId = tweet.id_str || tweet.id;
+        
+        // Early stopping logic: if we see 3 consecutive tweets we've already processed, stop.
+        // This assumes timeline order (mostly true).
+        if (processedIds && tweetId && processedIds.has(tweetId)) {
+            consecutiveProcessedCount++;
+            if (consecutiveProcessedCount >= 3) {
+                console.log(`[${username}] 🛑 Found 3 consecutive processed tweets. Stopping fetch early.`);
+                break;
+            }
+        } else {
+            consecutiveProcessedCount = 0;
+        }
+
+        tweets.push(tweet);
         if (tweets.length >= limit) break;
       }
       return tweets;
@@ -1319,12 +1371,17 @@ async function runAccountTask(mapping: AccountMapping, forceBackfill = false, dr
                 clearBackfill(mapping.id);
                 console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
             } else {
+                // Pre-load processed IDs for optimization
+                const processedMap = loadProcessedTweets(mapping.bskyIdentifier);
+                const processedIds = new Set(Object.keys(processedMap));
+
                 for (const twitterUsername of mapping.twitterUsernames) {
                     try {
                         updateAppStatus({ state: 'checking', currentAccount: twitterUsername, message: 'Fetching latest tweets...' });
                         
-                        // Use fetchUserTweets instead of safeSearch
-                        const tweets = await fetchUserTweets(twitterUsername, 30);
+                        // Use fetchUserTweets with early stopping optimization
+                        // Increase limit slightly since we have early stopping now
+                        const tweets = await fetchUserTweets(twitterUsername, 50, processedIds);
                         
                         if (!tweets || tweets.length === 0) continue;
                         await processTweets(agent, twitterUsername, mapping.bskyIdentifier, tweets, dryRun);
@@ -1410,6 +1467,9 @@ async function main(): Promise<void> {
   console.log(`Scheduler started. Base interval: ${config.checkIntervalMinutes} minutes.`);
   updateLastCheckTime(); // Initialize next time
 
+  // Concurrency limit for processing accounts
+  const runLimit = pLimit(3);
+
   // Main loop
   while (true) {
     const now = Date.now();
@@ -1425,6 +1485,8 @@ async function main(): Promise<void> {
         updateLastCheckTime();
     }
 
+    const tasks: Promise<void>[] = [];
+
     for (const mapping of config.mappings) {
         if (!mapping.enabled) continue;
         
@@ -1432,14 +1494,16 @@ async function main(): Promise<void> {
         
         // Run if scheduled OR backfill requested
         if (isScheduledRun || hasPendingBackfill) {
-            // Await the task to ensure we don't bombard twitter
-            await runAccountTask(mapping, hasPendingBackfill, options.dryRun);
-            
-            // Random delay between 2-5 seconds between accounts
-            const accountDelay = Math.floor(Math.random() * 3000) + 2000;
-            console.log(`[Scheduler] ⏳ Waiting ${accountDelay}ms before next account...`);
-            await new Promise(r => setTimeout(r, accountDelay));
+            // Queue task with concurrency limit
+            tasks.push(runLimit(async () => {
+                await runAccountTask(mapping, hasPendingBackfill, options.dryRun);
+            }));
         }
+    }
+
+    if (tasks.length > 0) {
+        await Promise.all(tasks);
+        console.log(`[Scheduler] ✅ All tasks for this cycle complete.`);
     }
     
     // Sleep for 5 seconds
