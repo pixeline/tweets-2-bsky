@@ -863,7 +863,7 @@ async function processTweets(
 
   console.log(`[${twitterUsername}] 🚀 Processing ${toProcess.length} new tweets for ${bskyIdentifier}...`);
 
-  tweets.reverse();
+  filteredTweets.reverse();
   let count = 0;
   for (const tweet of filteredTweets) {
     count++;
