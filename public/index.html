@@ -360,6 +360,19 @@
                 }
             };
 
+            const deleteAllPosts = async (id) => {
+                if (!confirm('DANGER: This will delete ALL posts on the associated Bluesky account. Are you absolutely sure?')) return;
+                const confirmName = prompt('Type "DELETE" to confirm:');
+                if (confirmName !== 'DELETE') return;
+                
+                try {
+                    const res = await axios.post(`/api/mappings/${id}/delete-all-posts`, {}, { headers: { Authorization: `Bearer ${token}` } });
+                    alert(res.data.message);
+                } catch (err) {
+                    alert('Failed to delete posts: ' + (err.response?.data?.error || err.message));
+                }
+            };
+
             const updateTwitter = async (e) => {
                 e.preventDefault();
                 const formData = new FormData(e.target);
@@ -603,6 +616,7 @@
                                                                                 <li><button className="dropdown-item" onClick={() => setEditingMapping(m)}>Edit</button></li>
                                                                                 <li><button className="dropdown-item" onClick={() => runBackfill(m.id)}>Backfill History</button></li>
                                                                                 <li><button className="dropdown-item text-warning" onClick={() => resetAndBackfill(m.id)}>Reset Cache & Backfill</button></li>
+                                                                                <li><button className="dropdown-item text-danger fw-bold" onClick={() => deleteAllPosts(m.id)}>Danger: Delete All Posts</button></li>
                                                                                 <li><hr className="dropdown-divider"/></li>
                                                                             </>
                                                                             )}

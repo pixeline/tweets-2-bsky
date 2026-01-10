@@ -1369,30 +1369,7 @@ async function processTweets(
   }
 }
 
-const activeAgents = new Map<string, BskyAgent>();
-
-async function getAgent(mapping: {
-  bskyIdentifier: string;
-  bskyPassword: string;
-  bskyServiceUrl?: string;
-}): Promise<BskyAgent | null> {
-  const serviceUrl = mapping.bskyServiceUrl || 'https://bsky.social';
-  const cacheKey = `${mapping.bskyIdentifier}-${serviceUrl}`;
-  const existing = activeAgents.get(cacheKey);
-  if (existing) return existing;
-
-  const agent = new BskyAgent({ service: serviceUrl });
-  try {
-    await agent.login({ identifier: mapping.bskyIdentifier, password: mapping.bskyPassword });
-    activeAgents.set(cacheKey, agent);
-    return agent;
-  } catch (err) {
-    console.error(`Failed to login to Bluesky for ${mapping.bskyIdentifier} on ${serviceUrl}:`, err);
-    return null;
-  }
-}
-
-
+import { getAgent } from './bsky.js';
 
 async function importHistory(twitterUsername: string, bskyIdentifier: string, limit = 15, dryRun = false, ignoreCancellation = false): Promise<void> {
   const config = getConfig();

@@ -233,6 +233,11 @@ export const dbService = {
     stmt.run(username.toLowerCase());
   },
 
+  deleteTweetsByBskyIdentifier(bskyIdentifier: string) {
+    const stmt = db.prepare('DELETE FROM processed_tweets WHERE bsky_identifier = ?');
+    stmt.run(bskyIdentifier.toLowerCase());
+  },
+
   repairUnknownIdentifiers(twitterUsername: string, bskyIdentifier: string) {
     const stmt = db.prepare(
       'UPDATE processed_tweets SET bsky_identifier = ? WHERE bsky_identifier = "unknown" AND twitter_username = ?',

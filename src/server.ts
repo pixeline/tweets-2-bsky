@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import cors from 'cors';
 import express from 'express';
 import jwt from 'jsonwebtoken';
+import { deleteAllPosts } from './bsky.js';
 import { getConfig, saveConfig } from './config-manager.js';
 import { dbService } from './db.js';
 
@@ -201,6 +202,31 @@ app.delete('/api/mappings/:id/cache', authenticateToken, requireAdmin, (req, res
   }
 
   res.json({ success: true, message: 'Cache cleared for all associated accounts' });
+});
+
+app.post('/api/mappings/:id/delete-all-posts', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const config = getConfig();
+  const mapping = config.mappings.find((m) => m.id === id);
+  if (!mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+
+  try {
+    const deletedCount = await deleteAllPosts(id);
+    
+    // Clear local cache to stay in sync
+    dbService.deleteTweetsByBskyIdentifier(mapping.bskyIdentifier);
+    
+    res.json({ 
+        success: true, 
+        message: `Deleted ${deletedCount} posts from ${mapping.bskyIdentifier} and cleared local cache.` 
+    });
+  } catch (err) {
+    console.error('Failed to delete all posts:', err);
+    res.status(500).json({ error: (err as Error).message });
+  }
 });
 
 // --- Twitter Config Routes (Admin Only) ---
