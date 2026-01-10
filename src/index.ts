@@ -963,6 +963,57 @@ async function processTweets(
       if (replyStatusId && localProcessedMap[replyStatusId]) {
         console.log(`[${twitterUsername}] 🧵 Threading reply to post in ${bskyIdentifier}: ${replyStatusId}`);
         replyParentInfo = localProcessedMap[replyStatusId] ?? null;
+      } else if (replyStatusId) {
+        // Parent missing from local batch/DB. Attempt to fetch it if it's a self-thread.
+        // We assume it's a self-thread if we don't have it, but we'll verify author after fetch.
+        console.log(`[${twitterUsername}] 🕵️ Parent ${replyStatusId} missing. Checking if backfillable...`);
+        
+        let parentBackfilled = false;
+        try {
+            const scraper = await getTwitterScraper();
+            if (scraper) {
+                const parentRaw = await scraper.getTweet(replyStatusId);
+                if (parentRaw) {
+                    const parentTweet = mapScraperTweetToLocalTweet(parentRaw);
+                    const parentAuthor = parentTweet.user?.screen_name;
+                    
+                    if (parentAuthor?.toLowerCase() === twitterUsername.toLowerCase()) {
+                        console.log(`[${twitterUsername}] 🔄 Parent is ours (@${parentAuthor}). Backfilling parent first...`);
+                        // Recursively process the parent
+                        await processTweets(agent, twitterUsername, bskyIdentifier, [parentTweet], dryRun);
+                        
+                        // Check if it was saved
+                        const savedParent = dbService.getTweet(replyStatusId, bskyIdentifier);
+                        if (savedParent && savedParent.status === 'migrated') {
+                            // Update local map
+                            localProcessedMap[replyStatusId] = {
+                                uri: savedParent.bsky_uri,
+                                cid: savedParent.bsky_cid,
+                                root: (savedParent.bsky_root_uri && savedParent.bsky_root_cid) ? { uri: savedParent.bsky_root_uri, cid: savedParent.bsky_root_cid } : undefined,
+                                tail: (savedParent.bsky_tail_uri && savedParent.bsky_tail_cid) ? { uri: savedParent.bsky_tail_uri, cid: savedParent.bsky_tail_cid } : undefined,
+                                migrated: true
+                            };
+                            replyParentInfo = localProcessedMap[replyStatusId] ?? null;
+                            parentBackfilled = true;
+                            console.log(`[${twitterUsername}] ✅ Parent backfilled. Resuming thread.`);
+                        }
+                    } else {
+                        console.log(`[${twitterUsername}] ⏩ Parent is by @${parentAuthor}. Skipping external reply.`);
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`[${twitterUsername}] ⚠️ Failed to fetch/backfill parent ${replyStatusId}:`, e);
+        }
+
+        if (!parentBackfilled) {
+            console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply (Parent not found or external).`);
+            if (!dryRun) {
+              saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, { skipped: true, text: tweetText });
+              localProcessedMap[tweetId] = { skipped: true, text: tweetText };
+            }
+            continue;
+        }
       } else {
         console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply.`);
         if (!dryRun) {
