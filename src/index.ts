@@ -1714,7 +1714,7 @@ async function main(): Promise<void> {
           backfillRequestId: undefined,
         });
       }
-      nextCheckTime = Date.now() + (config.checkIntervalMinutes || 5) * 60 * 1000;
+      updateLastCheckTime();
     } else if (isScheduledRun) {
       for (const mapping of config.mappings) {
         if (!mapping.enabled) continue;
