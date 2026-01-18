@@ -2,16 +2,16 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BskyAgent, RichText } from '@atproto/api';
+import { type BskyAgent, RichText } from '@atproto/api';
 import type { BlobRef } from '@atproto/api';
 import { Scraper } from '@the-convocation/twitter-scraper';
 import type { Tweet as ScraperTweet } from '@the-convocation/twitter-scraper';
 import axios from 'axios';
+import * as cheerio from 'cheerio';
 import { Command } from 'commander';
 import * as francModule from 'franc-min';
 import iso6391 from 'iso-639-1';
 import puppeteer from 'puppeteer-core';
-import * as cheerio from 'cheerio';
 import sharp from 'sharp';
 import { generateAltText } from './ai-manager.js';
 
@@ -21,9 +21,9 @@ import { getConfig } from './config-manager.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ============================================================================ 
+// ============================================================================
 // Type Definitions
-// ============================================================================ 
+// ============================================================================
 
 interface ProcessedTweetEntry {
   uri?: string;
@@ -42,6 +42,32 @@ interface ProcessedTweetsMap {
 interface UrlEntity {
   url?: string;
   expanded_url?: string;
+}
+
+interface CardImageValue {
+  url?: string;
+  width?: number;
+  height?: number;
+  alt?: string;
+}
+
+interface CardBindingValue {
+  type?: string;
+  string_value?: string;
+  image_value?: CardImageValue;
+}
+
+interface CardBindingEntry {
+  key?: string;
+  value?: CardBindingValue;
+}
+
+type CardBindingValues = Record<string, CardBindingValue> | CardBindingEntry[];
+
+interface TweetCard {
+  name?: string;
+  binding_values?: CardBindingValues;
+  url?: string;
 }
 
 interface MediaSize {
@@ -78,6 +104,7 @@ interface MediaEntity {
   sizes?: MediaSizes;
   original_info?: OriginalInfo;
   video_info?: VideoInfo;
+  source?: 'tweet' | 'card';
 }
 
 interface TweetEntities {
@@ -105,6 +132,8 @@ interface Tweet {
     screen_name?: string;
     id_str?: string;
   };
+  card?: TweetCard | null;
+  permanentUrl?: string;
 }
 
 interface AspectRatio {
@@ -120,31 +149,31 @@ interface ImageEmbed {
 
 import { dbService } from './db.js';
 
-// ============================================================================ 
+// ============================================================================
 // State Management
-// ============================================================================ 
+// ============================================================================
 
 const PROCESSED_DIR = path.join(__dirname, '..', 'processed');
 
 async function migrateJsonToSqlite() {
   if (!fs.existsSync(PROCESSED_DIR)) return;
-  
-  const files = fs.readdirSync(PROCESSED_DIR).filter(f => f.endsWith('.json'));
+
+  const files = fs.readdirSync(PROCESSED_DIR).filter((f) => f.endsWith('.json'));
   if (files.length === 0) return;
 
   console.log(`📦 Found ${files.length} legacy cache files. Migrating to SQLite...`);
   const config = getConfig();
-  
+
   for (const file of files) {
     const username = file.replace('.json', '').toLowerCase();
     // Try to find a matching bskyIdentifier from config
-    const mapping = config.mappings.find(m => m.twitterUsernames.map(u => u.toLowerCase()).includes(username));
+    const mapping = config.mappings.find((m) => m.twitterUsernames.map((u) => u.toLowerCase()).includes(username));
     const bskyIdentifier = mapping?.bskyIdentifier || 'unknown';
 
     try {
       const filePath = path.join(PROCESSED_DIR, file);
       const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as ProcessedTweetsMap;
-      
+
       for (const [twitterId, entry] of Object.entries(data)) {
         dbService.saveTweet({
           twitter_id: twitterId,
@@ -154,7 +183,7 @@ async function migrateJsonToSqlite() {
           bsky_cid: entry.cid,
           bsky_root_uri: entry.root?.uri,
           bsky_root_cid: entry.root?.cid,
-          status: entry.migrated ? 'migrated' : (entry.skipped ? 'skipped' : 'failed')
+          status: entry.migrated ? 'migrated' : entry.skipped ? 'skipped' : 'failed',
         });
       }
       // Move file to backup
@@ -172,7 +201,7 @@ async function migrateJsonToSqlite() {
       dbService.repairUnknownIdentifiers(username, mapping.bskyIdentifier);
     }
   }
-  
+
   console.log('✅ Migration complete.');
 }
 
@@ -180,7 +209,12 @@ function loadProcessedTweets(bskyIdentifier: string): ProcessedTweetsMap {
   return dbService.getTweetsByBskyIdentifier(bskyIdentifier);
 }
 
-function saveProcessedTweet(twitterUsername: string, bskyIdentifier: string, twitterId: string, entry: ProcessedTweetEntry): void {
+function saveProcessedTweet(
+  twitterUsername: string,
+  bskyIdentifier: string,
+  twitterId: string,
+  entry: ProcessedTweetEntry,
+): void {
   dbService.saveTweet({
     twitter_id: twitterId,
     twitter_username: twitterUsername.toLowerCase(),
@@ -192,13 +226,13 @@ function saveProcessedTweet(twitterUsername: string, bskyIdentifier: string, twi
     bsky_root_cid: entry.root?.cid,
     bsky_tail_uri: entry.tail?.uri,
     bsky_tail_cid: entry.tail?.cid,
-    status: entry.migrated || (entry.uri && entry.cid) ? 'migrated' : (entry.skipped ? 'skipped' : 'failed')
+    status: entry.migrated || (entry.uri && entry.cid) ? 'migrated' : entry.skipped ? 'skipped' : 'failed',
   });
 }
 
-// ============================================================================ 
+// ============================================================================
 // Custom Twitter Client
-// ============================================================================ 
+// ============================================================================
 
 let scraper: Scraper | null = null;
 let currentTwitterCookies = { authToken: '', ct0: '' };
@@ -216,24 +250,16 @@ async function getTwitterScraper(forceReset = false): Promise<Scraper | null> {
   }
 
   if (!authToken || !ct0) return null;
-  
+
   // Re-initialize if config changed, not yet initialized, or forced reset
-  if (
-    !scraper || 
-    forceReset ||
-    currentTwitterCookies.authToken !== authToken || 
-    currentTwitterCookies.ct0 !== ct0
-  ) {
+  if (!scraper || forceReset || currentTwitterCookies.authToken !== authToken || currentTwitterCookies.ct0 !== ct0) {
     console.log(`🔄 Initializing Twitter scraper with ${useBackupCredentials ? 'BACKUP' : 'PRIMARY'} credentials...`);
     scraper = new Scraper();
-    await scraper.setCookies([
-        `auth_token=${authToken}`,
-        `ct0=${ct0}`
-    ]);
+    await scraper.setCookies([`auth_token=${authToken}`, `ct0=${ct0}`]);
 
-    currentTwitterCookies = { 
-      authToken: authToken, 
-      ct0: ct0 
+    currentTwitterCookies = {
+      authToken: authToken,
+      ct0: ct0,
     };
   }
   return scraper;
@@ -247,62 +273,323 @@ async function switchCredentials() {
     await getTwitterScraper(true);
     return true;
   }
-  console.log("⚠️ No backup credentials available to switch to.");
+  console.log('⚠️ No backup credentials available to switch to.');
   return false;
 }
 
 function mapScraperTweetToLocalTweet(scraperTweet: ScraperTweet): Tweet {
-    const raw = scraperTweet.__raw_UNSTABLE;
-    if (!raw) {
-        // Fallback if raw data is missing (shouldn't happen for timeline tweets usually)
-        return {
-            id: scraperTweet.id,
-            id_str: scraperTweet.id,
-            text: scraperTweet.text,
-            full_text: scraperTweet.text,
-            isRetweet: scraperTweet.isRetweet,
-            // Construct minimal entities from parsed data
-            entities: {
-                urls: scraperTweet.urls.map((url: string) => ({ url, expanded_url: url })),
-                media: scraperTweet.photos.map((p: any) => ({
-                    url: p.url,
-                    expanded_url: p.url,
-                    media_url_https: p.url,
-                    type: 'photo',
-                    ext_alt_text: p.alt_text,
-                })),
-            },
-            created_at: scraperTweet.timeParsed?.toUTCString()
-        };
-    }
-  
+  const raw = scraperTweet.__raw_UNSTABLE;
+  if (!raw) {
+    // Fallback if raw data is missing (shouldn't happen for timeline tweets usually)
     return {
-      id: raw.id_str,
-      id_str: raw.id_str,
-      text: raw.full_text,
-      full_text: raw.full_text,
-      created_at: raw.created_at,
+      id: scraperTweet.id,
+      id_str: scraperTweet.id,
+      text: scraperTweet.text,
+      full_text: scraperTweet.text,
       isRetweet: scraperTweet.isRetweet,
-      // biome-ignore lint/suspicious/noExplicitAny: raw types match compatible structure
-      entities: raw.entities as any,
-      // biome-ignore lint/suspicious/noExplicitAny: raw types match compatible structure
-      extended_entities: raw.extended_entities as any,
-      quoted_status_id_str: raw.quoted_status_id_str,
-      retweeted_status_id_str: raw.retweeted_status_id_str,
-      is_quote_status: !!raw.quoted_status_id_str,
-      in_reply_to_status_id_str: raw.in_reply_to_status_id_str,
-      // biome-ignore lint/suspicious/noExplicitAny: missing in LegacyTweetRaw type
-      in_reply_to_user_id_str: (raw as any).in_reply_to_user_id_str,
-      user: {
-        screen_name: scraperTweet.username,
-        id_str: scraperTweet.userId,
+      // Construct minimal entities from parsed data
+      entities: {
+        urls: scraperTweet.urls.map((url: string) => ({ url, expanded_url: url })),
+        media: scraperTweet.photos.map((p: any) => ({
+          url: p.url,
+          expanded_url: p.url,
+          media_url_https: p.url,
+          type: 'photo',
+          ext_alt_text: p.alt_text,
+        })),
       },
+      created_at: scraperTweet.timeParsed?.toUTCString(),
+      permanentUrl: scraperTweet.permanentUrl,
     };
+  }
+
+  return {
+    id: raw.id_str,
+    id_str: raw.id_str,
+    text: raw.full_text,
+    full_text: raw.full_text,
+    created_at: raw.created_at,
+    isRetweet: scraperTweet.isRetweet,
+    // biome-ignore lint/suspicious/noExplicitAny: raw types match compatible structure
+    entities: raw.entities as any,
+    // biome-ignore lint/suspicious/noExplicitAny: raw types match compatible structure
+    extended_entities: raw.extended_entities as any,
+    quoted_status_id_str: raw.quoted_status_id_str,
+    retweeted_status_id_str: raw.retweeted_status_id_str,
+    is_quote_status: !!raw.quoted_status_id_str,
+    in_reply_to_status_id_str: raw.in_reply_to_status_id_str,
+    // biome-ignore lint/suspicious/noExplicitAny: missing in LegacyTweetRaw type
+    in_reply_to_user_id_str: (raw as any).in_reply_to_user_id_str,
+    // biome-ignore lint/suspicious/noExplicitAny: card comes from raw tweet
+    card: (raw as any).card,
+    permanentUrl: scraperTweet.permanentUrl,
+    user: {
+      screen_name: scraperTweet.username,
+      id_str: scraperTweet.userId,
+    },
+  };
 }
 
-// ============================================================================ 
+// ============================================================================
 // Helper Functions
-// ============================================================================ 
+// ============================================================================
+
+function normalizeCardBindings(bindingValues?: CardBindingValues): Record<string, CardBindingValue> {
+  if (!bindingValues) return {};
+  if (Array.isArray(bindingValues)) {
+    return bindingValues.reduce(
+      (acc, entry) => {
+        if (entry?.key && entry.value) acc[entry.key] = entry.value;
+        return acc;
+      },
+      {} as Record<string, CardBindingValue>,
+    );
+  }
+  return bindingValues as Record<string, CardBindingValue>;
+}
+
+function isLikelyUrl(value?: string): value is string {
+  if (!value) return false;
+  return /^https?:\/\//i.test(value);
+}
+
+function extractCardImageUrl(bindingValues: CardBindingValues, preferredKeys: string[]): string | undefined {
+  const normalized = normalizeCardBindings(bindingValues);
+  for (const key of preferredKeys) {
+    const value = normalized[key];
+    const imageUrl = value?.image_value?.url;
+    if (imageUrl) return imageUrl;
+  }
+  const fallbackValue = Object.values(normalized).find((value) => value?.image_value?.url);
+  return fallbackValue?.image_value?.url;
+}
+
+function extractCardLink(bindingValues: CardBindingValues, preferredKeys: string[]): string | undefined {
+  const normalized = normalizeCardBindings(bindingValues);
+  for (const key of preferredKeys) {
+    const value = normalized[key];
+    const link = value?.string_value;
+    if (isLikelyUrl(link)) return link;
+  }
+  const fallbackValue = Object.values(normalized).find((value) => isLikelyUrl(value?.string_value));
+  return fallbackValue?.string_value;
+}
+
+function extractCardTitle(bindingValues: CardBindingValues, preferredKeys: string[]): string | undefined {
+  const normalized = normalizeCardBindings(bindingValues);
+  for (const key of preferredKeys) {
+    const value = normalized[key];
+    const title = value?.string_value;
+    if (title && !isLikelyUrl(title)) return title;
+  }
+  const fallbackValue = Object.values(normalized).find(
+    (value) => value?.string_value && !isLikelyUrl(value?.string_value),
+  );
+  return fallbackValue?.string_value;
+}
+
+function extractCardAlt(bindingValues: CardBindingValues): string | undefined {
+  const normalized = normalizeCardBindings(bindingValues);
+  const altValue = Object.values(normalized).find((value) => value?.image_value?.alt);
+  return altValue?.image_value?.alt;
+}
+
+function appendCallToAction(text: string, link?: string, label = 'Sponsored') {
+  if (!link) return text;
+  if (text.includes(link)) return text;
+  return `${text}\n\n${label}: ${link}`.trim();
+}
+
+function detectCardMedia(tweet: Tweet): { imageUrls: string[]; link?: string; title?: string; alt?: string } {
+  if (!tweet.card?.binding_values) return { imageUrls: [] };
+  const bindings = tweet.card.binding_values;
+
+  const imageUrls: string[] = [];
+  const preferredImageKeys = [
+    'photo_image_full_size',
+    'photo_image_full_size_original',
+    'thumbnail_image',
+    'image',
+    'thumbnail',
+    'summary_photo_image',
+    'player_image',
+  ];
+  const preferredLinkKeys = ['site', 'destination', 'landing_url', 'cta_link', 'card_url', 'url'];
+  const preferredTitleKeys = ['title', 'summary', 'card_title'];
+
+  const primaryImage = extractCardImageUrl(bindings, preferredImageKeys);
+  if (primaryImage) imageUrls.push(primaryImage);
+
+  const imageKeys = normalizeCardBindings(bindings);
+  Object.values(imageKeys).forEach((value) => {
+    const url = value?.image_value?.url;
+    if (url && !imageUrls.includes(url)) imageUrls.push(url);
+  });
+
+  const link = extractCardLink(bindings, preferredLinkKeys);
+  const title = extractCardTitle(bindings, preferredTitleKeys);
+  const alt = extractCardAlt(bindings);
+
+  return { imageUrls, link, title, alt };
+}
+
+function buildCardMediaEntities(tweet: Tweet): { media: MediaEntity[]; link?: string } {
+  const cardData = detectCardMedia(tweet);
+  if (cardData.imageUrls.length === 0) return { media: [] };
+
+  const media = cardData.imageUrls.slice(0, 4).map((url) => ({
+    media_url_https: url,
+    type: 'photo' as const,
+    ext_alt_text: cardData.alt || cardData.title || 'Sponsored image',
+    source: 'card' as const,
+  }));
+
+  return { media, link: cardData.link };
+}
+
+function ensureUrlEntity(entities: TweetEntities | undefined, link?: string) {
+  if (!link) return;
+  if (!entities) return;
+  const urls = entities.urls || [];
+  if (!urls.some((url) => url.expanded_url === link || url.url === link)) {
+    urls.push({ url: link, expanded_url: link });
+    entities.urls = urls;
+  }
+}
+
+function detectSponsoredCard(tweet: Tweet): boolean {
+  if (!tweet.card?.binding_values) return false;
+  const cardName = tweet.card.name?.toLowerCase() || '';
+  const cardMedia = detectCardMedia(tweet);
+  const hasMultipleImages = cardMedia.imageUrls.length > 1;
+  const promoKeywords = ['promo', 'unified', 'carousel', 'collection', 'amplify'];
+  const hasPromoName = promoKeywords.some((keyword) => cardName.includes(keyword));
+  return hasMultipleImages || hasPromoName;
+}
+
+function mergeMediaEntities(primary: MediaEntity[], secondary: MediaEntity[], limit = 4): MediaEntity[] {
+  const merged: MediaEntity[] = [];
+  const seen = new Set<string>();
+  const ordered = [
+    ...primary.filter((media) => media?.source !== 'card'),
+    ...primary.filter((media) => media?.source === 'card'),
+    ...secondary.filter((media) => media?.source !== 'card'),
+    ...secondary.filter((media) => media?.source === 'card'),
+  ];
+
+  for (const media of ordered) {
+    if (!media?.media_url_https) continue;
+    if (seen.has(media.media_url_https)) continue;
+    merged.push(media);
+    seen.add(media.media_url_https);
+    if (merged.length >= limit) break;
+  }
+
+  return merged;
+}
+
+function detectCarouselLinks(tweet: Tweet): string[] {
+  if (!tweet.card?.binding_values) return [];
+  const bindings = normalizeCardBindings(tweet.card.binding_values);
+  const links = Object.values(bindings)
+    .map((value) => value?.string_value)
+    .filter((value): value is string => isLikelyUrl(value));
+  return [...new Set(links)];
+}
+
+function mergeUrlEntities(entities: TweetEntities | undefined, links: string[]) {
+  if (!entities || links.length === 0) return;
+  const urls = entities.urls || [];
+  links.forEach((link) => {
+    if (!urls.some((url) => url.expanded_url === link || url.url === link)) {
+      urls.push({ url: link, expanded_url: link });
+    }
+  });
+  entities.urls = urls;
+}
+
+function injectCardMedia(tweet: Tweet) {
+  if (!tweet.card?.binding_values) return;
+  const cardMedia = buildCardMediaEntities(tweet);
+  if (cardMedia.media.length === 0) return;
+
+  const existingMedia = tweet.extended_entities?.media || tweet.entities?.media || [];
+  const mergedMedia = mergeMediaEntities(existingMedia, cardMedia.media);
+
+  if (!tweet.extended_entities) tweet.extended_entities = {};
+  tweet.extended_entities.media = mergedMedia;
+  if (!tweet.entities) tweet.entities = {};
+  if (!tweet.entities.media) tweet.entities.media = mergedMedia;
+
+  if (cardMedia.link) {
+    ensureUrlEntity(tweet.entities, cardMedia.link);
+  }
+
+  const carouselLinks = detectCarouselLinks(tweet);
+  mergeUrlEntities(tweet.entities, carouselLinks);
+}
+
+function ensureSponsoredLinks(text: string, tweet: Tweet): string {
+  if (!tweet.card?.binding_values) return text;
+  const carouselLinks = detectCarouselLinks(tweet);
+  const cardLink = detectCardMedia(tweet).link;
+  const links = [...new Set([cardLink, ...carouselLinks].filter(Boolean))] as string[];
+  if (links.length === 0) return text;
+
+  const appendedLinks = links.slice(0, 2).map((link) => `Link: ${link}`);
+  const updatedText = `${text}\n\n${appendedLinks.join('\n')}`.trim();
+  return updatedText;
+}
+
+function addTextFallbacks(text: string): string {
+  return text.replace(/\s+$/g, '').trim();
+}
+
+async function fetchSyndicationMedia(tweetUrl: string): Promise<{ images: string[] }> {
+  try {
+    const normalized = tweetUrl.replace('twitter.com', 'x.com');
+    const res = await axios.get('https://publish.twitter.com/oembed', {
+      params: { url: normalized },
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    const html = res.data?.html as string | undefined;
+    if (!html) return { images: [] };
+
+    const match = html.match(/status\/(\d+)/);
+    const tweetId = match?.[1];
+    if (!tweetId) return { images: [] };
+
+    const syndicationUrl = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}`;
+    const syndication = await axios.get(syndicationUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+    });
+    const data = syndication.data as Record<string, unknown>;
+    const images = (data?.photos as { url?: string }[] | undefined)
+      ?.map((photo) => photo.url)
+      .filter(Boolean) as string[];
+    return { images: images || [] };
+  } catch (err) {
+    return { images: [] };
+  }
+}
+
+function injectSyndicationMedia(tweet: Tweet, syndication: { images: string[] }) {
+  if (syndication.images.length === 0) return;
+  const media = syndication.images.slice(0, 4).map((url) => ({
+    media_url_https: url,
+    type: 'photo' as const,
+    ext_alt_text: 'Image from Twitter',
+    source: 'card' as const,
+  }));
+
+  const existingMedia = tweet.extended_entities?.media || tweet.entities?.media || [];
+  const mergedMedia = mergeMediaEntities(existingMedia, media);
+
+  if (!tweet.extended_entities) tweet.extended_entities = {};
+  tweet.extended_entities.media = mergedMedia;
+  if (!tweet.entities) tweet.entities = {};
+  if (!tweet.entities.media) tweet.entities.media = mergedMedia;
+}
 
 function detectLanguage(text: string): string[] {
   if (!text || text.trim().length === 0) return ['en'];
@@ -335,8 +622,8 @@ async function expandUrl(shortUrl: string): Promise<string> {
       return (response.request as any)?.res?.responseUrl || shortUrl;
     } catch (e: any) {
       if (e.code === 'ERR_FR_TOO_MANY_REDIRECTS' || e.response?.status === 403 || e.response?.status === 401) {
-         // Silent fallback for common expansion issues (redirect loops, login walls)
-         return shortUrl;
+        // Silent fallback for common expansion issues (redirect loops, login walls)
+        return shortUrl;
       }
       return shortUrl;
     }
@@ -372,7 +659,10 @@ async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: strin
   const isGif = mimeType === 'image/gif';
   const isAnimation = isGif || isWebp;
 
-  if ((buffer.length > MAX_SIZE && (mimeType.startsWith('image/') || mimeType === 'application/octet-stream')) || (isPng && buffer.length > MAX_SIZE)) {
+  if (
+    (buffer.length > MAX_SIZE && (mimeType.startsWith('image/') || mimeType === 'application/octet-stream')) ||
+    (isPng && buffer.length > MAX_SIZE)
+  ) {
     console.log(`[UPLOAD] ⚖️ Image too large (${(buffer.length / 1024).toFixed(2)} KB). Optimizing...`);
     try {
       let image = sharp(buffer);
@@ -386,48 +676,47 @@ async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: strin
       while (currentBuffer.length > MAX_SIZE && attempts < 5) {
         attempts++;
         console.log(`[UPLOAD] 📉 Compression attempt ${attempts}: Width ${width}, Quality ${quality}...`);
-        
+
         if (isAnimation) {
-             // For animations (GIF/WebP), we can only do so much without losing frames
-             // Try to convert to WebP if it's a GIF, or optimize WebP
-             image = sharp(buffer, { animated: true });
-             if (isGif) {
-                 // Convert GIF to WebP for better compression
-                 image = image.webp({ quality: Math.max(quality, 50), effort: 6 });
-                 finalMimeType = 'image/webp';
-             } else {
-                 image = image.webp({ quality: Math.max(quality, 50), effort: 6 });
-             }
-             // Resize if really big
-             if (metadata.width && metadata.width > 800) {
-                 image = image.resize({ width: 800, withoutEnlargement: true });
-             }
+          // For animations (GIF/WebP), we can only do so much without losing frames
+          // Try to convert to WebP if it's a GIF, or optimize WebP
+          image = sharp(buffer, { animated: true });
+          if (isGif) {
+            // Convert GIF to WebP for better compression
+            image = image.webp({ quality: Math.max(quality, 50), effort: 6 });
+            finalMimeType = 'image/webp';
+          } else {
+            image = image.webp({ quality: Math.max(quality, 50), effort: 6 });
+          }
+          // Resize if really big
+          if (metadata.width && metadata.width > 800) {
+            image = image.resize({ width: 800, withoutEnlargement: true });
+          }
         } else {
-            // Static images
-            if (width > 1600) width = 1600;
-            else if (attempts > 1) width = Math.floor(width * 0.8);
-            
-            quality = Math.max(50, quality - 10);
-            
-            image = sharp(buffer)
-                .resize({ width, withoutEnlargement: true })
-                .jpeg({ quality, mozjpeg: true });
-            
-            finalMimeType = 'image/jpeg';
+          // Static images
+          if (width > 1600) width = 1600;
+          else if (attempts > 1) width = Math.floor(width * 0.8);
+
+          quality = Math.max(50, quality - 10);
+
+          image = sharp(buffer).resize({ width, withoutEnlargement: true }).jpeg({ quality, mozjpeg: true });
+
+          finalMimeType = 'image/jpeg';
         }
-        
+
         currentBuffer = await image.toBuffer();
         if (currentBuffer.length <= MAX_SIZE) {
-            finalBuffer = currentBuffer;
-            console.log(`[UPLOAD] ✅ Optimized to ${(finalBuffer.length / 1024).toFixed(2)} KB`);
-            break;
+          finalBuffer = currentBuffer;
+          console.log(`[UPLOAD] ✅ Optimized to ${(finalBuffer.length / 1024).toFixed(2)} KB`);
+          break;
         }
       }
-      
-      if (finalBuffer.length > MAX_SIZE) {
-          console.warn(`[UPLOAD] ⚠️ Could not compress below limit. Current: ${(finalBuffer.length / 1024).toFixed(2)} KB. Upload might fail.`);
-      }
 
+      if (finalBuffer.length > MAX_SIZE) {
+        console.warn(
+          `[UPLOAD] ⚠️ Could not compress below limit. Current: ${(finalBuffer.length / 1024).toFixed(2)} KB. Upload might fail.`,
+        );
+      }
     } catch (err) {
       console.warn(`[UPLOAD] ⚠️ Optimization failed, attempting original upload:`, (err as Error).message);
       finalBuffer = buffer;
@@ -455,8 +744,8 @@ async function captureTweetScreenshot(tweetUrl: string): Promise<ScreenshotResul
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   ];
 
-  const executablePath = browserPaths.find(p => fs.existsSync(p));
-  
+  const executablePath = browserPaths.find((p) => fs.existsSync(p));
+
   if (!executablePath) {
     console.warn(`[SCREENSHOT] ⏩ Skipping screenshot (no Chrome/Chromium found at common paths).`);
     return null;
@@ -500,12 +789,12 @@ async function captureTweetScreenshot(tweetUrl: string): Promise<ScreenshotResul
     `;
 
     await page.setContent(html, { waitUntil: 'networkidle0' });
-    
+
     // Wait for the twitter iframe to load and render
     try {
       await page.waitForSelector('iframe', { timeout: 10000 });
       // Small extra wait for images inside iframe
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise((r) => setTimeout(r, 2000));
     } catch (e) {
       console.warn(`[SCREENSHOT] ⚠️ Timeout waiting for tweet iframe, taking screenshot anyway.`);
     }
@@ -515,8 +804,10 @@ async function captureTweetScreenshot(tweetUrl: string): Promise<ScreenshotResul
       const box = await element.boundingBox();
       const buffer = await element.screenshot({ type: 'png', omitBackground: true });
       if (box) {
-          console.log(`[SCREENSHOT] ✅ Captured successfully (${(buffer.length / 1024).toFixed(2)} KB) - ${Math.round(box.width)}x${Math.round(box.height)}`);
-          return { buffer: buffer as Buffer, width: Math.round(box.width), height: Math.round(box.height) };
+        console.log(
+          `[SCREENSHOT] ✅ Captured successfully (${(buffer.length / 1024).toFixed(2)} KB) - ${Math.round(box.width)}x${Math.round(box.height)}`,
+        );
+        return { buffer: buffer as Buffer, width: Math.round(box.width), height: Math.round(box.height) };
       }
     }
   } catch (err) {
@@ -534,8 +825,8 @@ async function pollForVideoProcessing(agent: BskyAgent, jobId: string): Promise<
 
   while (!blob) {
     attempts++;
-    const statusUrl = new URL("https://video.bsky.app/xrpc/app.bsky.video.getJobStatus");
-    statusUrl.searchParams.append("jobId", jobId);
+    const statusUrl = new URL('https://video.bsky.app/xrpc/app.bsky.video.getJobStatus');
+    statusUrl.searchParams.append('jobId', jobId);
 
     const statusResponse = await fetch(statusUrl);
     if (!statusResponse.ok) {
@@ -553,8 +844,8 @@ async function pollForVideoProcessing(agent: BskyAgent, jobId: string): Promise<
     if (statusData.jobStatus.blob) {
       blob = statusData.jobStatus.blob;
       console.log(`[VIDEO] 🎉 Video processing complete! Blob ref obtained.`);
-    } else if (state === "JOB_STATE_FAILED") {
-      throw new Error(`Video processing failed: ${statusData.jobStatus.error || "Unknown error"}`);
+    } else if (state === 'JOB_STATE_FAILED') {
+      throw new Error(`Video processing failed: ${statusData.jobStatus.error || 'Unknown error'}`);
     } else {
       // Wait before next poll
       await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -562,7 +853,7 @@ async function pollForVideoProcessing(agent: BskyAgent, jobId: string): Promise<
 
     if (attempts > 60) {
       // ~5 minute timeout
-      throw new Error("Video processing timed out after 5 minutes.");
+      throw new Error('Video processing timed out after 5 minutes.');
     }
   }
   return blob!;
@@ -572,54 +863,55 @@ async function fetchEmbedUrlCard(agent: BskyAgent, url: string): Promise<any> {
   try {
     const response = await axios.get(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
       },
       timeout: 10000,
       maxRedirects: 5,
     });
-    
+
     const $ = cheerio.load(response.data);
     const title = $('meta[property="og:title"]').attr('content') || $('title').text() || '';
-    const description = $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '';
+    const description =
+      $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '';
     let thumbBlob: BlobRef | undefined;
 
     let imageUrl = $('meta[property="og:image"]').attr('content');
     if (imageUrl) {
-        if (!imageUrl.startsWith('http')) {
-            const baseUrl = new URL(url);
-            imageUrl = new URL(imageUrl, baseUrl.origin).toString();
-        }
-        try {
-            const { buffer, mimeType } = await downloadMedia(imageUrl);
-            thumbBlob = await uploadToBluesky(agent, buffer, mimeType);
-        } catch (e) {
-            // SIlently fail thumbnail upload
-        }
+      if (!imageUrl.startsWith('http')) {
+        const baseUrl = new URL(url);
+        imageUrl = new URL(imageUrl, baseUrl.origin).toString();
+      }
+      try {
+        const { buffer, mimeType } = await downloadMedia(imageUrl);
+        thumbBlob = await uploadToBluesky(agent, buffer, mimeType);
+      } catch (e) {
+        // SIlently fail thumbnail upload
+      }
     }
 
     if (!title && !description) return null;
 
     const external: any = {
-        uri: url,
-        title: title || url,
-        description: description,
+      uri: url,
+      title: title || url,
+      description: description,
     };
 
     if (thumbBlob) {
-        external.thumb = thumbBlob;
+      external.thumb = thumbBlob;
     }
 
     return {
-        $type: 'app.bsky.embed.external',
-        external,
+      $type: 'app.bsky.embed.external',
+      external,
     };
-
   } catch (err: any) {
     if (err.code === 'ERR_FR_TOO_MANY_REDIRECTS') {
-        // Ignore redirect loops
-        return null;
+      // Ignore redirect loops
+      return null;
     }
     console.warn(`Failed to fetch embed card for ${url}:`, err.message || err);
     return null;
@@ -627,7 +919,7 @@ async function fetchEmbedUrlCard(agent: BskyAgent, url: string): Promise<any> {
 }
 
 async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: string): Promise<BlobRef> {
-  const sanitizedFilename = filename.split("?")[0] || "video.mp4";
+  const sanitizedFilename = filename.split('?')[0] || 'video.mp4';
   console.log(
     `[VIDEO] 🟢 Starting upload process for ${sanitizedFilename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`,
   );
@@ -640,17 +932,17 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
 
     // didDoc might be present in repoDesc
     const pdsService = (repoDesc as any).didDoc?.service?.find(
-      (s: any) => s.id === "#atproto_pds" || s.type === "AtProtoPds",
+      (s: any) => s.id === '#atproto_pds' || s.type === 'AtProtoPds',
     );
     const pdsUrl = pdsService?.serviceEndpoint;
-    const pdsHost = pdsUrl ? new URL(pdsUrl).host : "bsky.social";
+    const pdsHost = pdsUrl ? new URL(pdsUrl).host : 'bsky.social';
 
     console.log(`[VIDEO] 🌐 PDS Host detected: ${pdsHost}`);
     console.log(`[VIDEO] 🔑 Requesting service auth token for audience: did:web:${pdsHost}...`);
 
     const { data: serviceAuth } = await agent.com.atproto.server.getServiceAuth({
       aud: `did:web:${pdsHost}`,
-      lxm: "com.atproto.repo.uploadBlob",
+      lxm: 'com.atproto.repo.uploadBlob',
       exp: Math.floor(Date.now() / 1000) + 60 * 30,
     });
     console.log(`[VIDEO] ✅ Service auth token obtained.`);
@@ -658,16 +950,16 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
     const token = serviceAuth.token;
 
     // 2. Upload to Video Service
-    const uploadUrl = new URL("https://video.bsky.app/xrpc/app.bsky.video.uploadVideo");
-    uploadUrl.searchParams.append("did", agent.session!.did!);
-    uploadUrl.searchParams.append("name", sanitizedFilename);
+    const uploadUrl = new URL('https://video.bsky.app/xrpc/app.bsky.video.uploadVideo');
+    uploadUrl.searchParams.append('did', agent.session!.did!);
+    uploadUrl.searchParams.append('name', sanitizedFilename);
 
     console.log(`[VIDEO] 📤 Uploading to ${uploadUrl.href}...`);
     const uploadResponse = await fetch(uploadUrl, {
-      method: "POST",
+      method: 'POST',
       headers: {
         Authorization: `Bearer ${token}`,
-        "Content-Type": "video/mp4",
+        'Content-Type': 'video/mp4',
       },
       body: new Blob([new Uint8Array(buffer)]),
     });
@@ -678,26 +970,34 @@ async function uploadVideoToBluesky(agent: BskyAgent, buffer: Buffer, filename: 
       // Handle specific error cases
       try {
         const errorJson = JSON.parse(errorText);
-        
+
         // Handle server overload gracefully
-        if (uploadResponse.status === 503 || errorJson.error === "Server does not have enough capacity to handle uploads") {
-            console.warn(`[VIDEO] ⚠️ Server overloaded (503). Skipping video upload and falling back to link.`);
-            throw new Error("VIDEO_FALLBACK_503");
+        if (
+          uploadResponse.status === 503 ||
+          errorJson.error === 'Server does not have enough capacity to handle uploads'
+        ) {
+          console.warn(`[VIDEO] ⚠️ Server overloaded (503). Skipping video upload and falling back to link.`);
+          throw new Error('VIDEO_FALLBACK_503');
         }
 
-        if (errorJson.error === "already_exists" && errorJson.jobId) {
+        if (errorJson.error === 'already_exists' && errorJson.jobId) {
           console.log(`[VIDEO] ♻️ Video already exists. Resuming with Job ID: ${errorJson.jobId}`);
           return await pollForVideoProcessing(agent, errorJson.jobId);
         }
-        if (errorJson.error === "unconfirmed_email" || (errorJson.jobStatus && errorJson.jobStatus.error === "unconfirmed_email")) {
-            console.error(`[VIDEO] 🛑 BLUESKY ERROR: Your email is unconfirmed. You MUST verify your email on Bluesky to upload videos.`);
-            throw new Error("Bluesky Email Unconfirmed - Video Upload Rejected");
+        if (
+          errorJson.error === 'unconfirmed_email' ||
+          (errorJson.jobStatus && errorJson.jobStatus.error === 'unconfirmed_email')
+        ) {
+          console.error(
+            `[VIDEO] 🛑 BLUESKY ERROR: Your email is unconfirmed. You MUST verify your email on Bluesky to upload videos.`,
+          );
+          throw new Error('Bluesky Email Unconfirmed - Video Upload Rejected');
         }
       } catch (e) {
-         if ((e as Error).message === "VIDEO_FALLBACK_503") throw e;
-         // Not JSON or missing fields, proceed with throwing original error
+        if ((e as Error).message === 'VIDEO_FALLBACK_503') throw e;
+        // Not JSON or missing fields, proceed with throwing original error
       }
-      
+
       console.error(`[VIDEO] ❌ Server responded with ${uploadResponse.status}: ${errorText}`);
       throw new Error(`Video upload failed: ${uploadResponse.status} ${errorText}`);
     }
@@ -740,32 +1040,32 @@ function splitText(text: string, limit = 300): string[] {
     // 4. Force split
 
     let splitIndex = -1;
-    
+
     // Check paragraphs
     let checkIndex = remaining.lastIndexOf('\n\n', effectiveLimit);
     if (checkIndex !== -1) splitIndex = checkIndex;
 
     // Check sentences
     if (splitIndex === -1) {
-        // Look for punctuation followed by space
-        const sentenceMatches = Array.from(remaining.substring(0, effectiveLimit).matchAll(/[.!?]\s/g));
-        if (sentenceMatches.length > 0) {
-            const lastMatch = sentenceMatches[sentenceMatches.length - 1];
-            if (lastMatch && lastMatch.index !== undefined) {
-                splitIndex = lastMatch.index + 1; // Include punctuation
-            }
+      // Look for punctuation followed by space
+      const sentenceMatches = Array.from(remaining.substring(0, effectiveLimit).matchAll(/[.!?]\s/g));
+      if (sentenceMatches.length > 0) {
+        const lastMatch = sentenceMatches[sentenceMatches.length - 1];
+        if (lastMatch && lastMatch.index !== undefined) {
+          splitIndex = lastMatch.index + 1; // Include punctuation
         }
+      }
     }
 
     // Check spaces
     if (splitIndex === -1) {
-        checkIndex = remaining.lastIndexOf(' ', effectiveLimit);
-        if (checkIndex !== -1) splitIndex = checkIndex;
+      checkIndex = remaining.lastIndexOf(' ', effectiveLimit);
+      if (checkIndex !== -1) splitIndex = checkIndex;
     }
 
     // Force split if no good break point found
     if (splitIndex === -1) {
-        splitIndex = effectiveLimit;
+      splitIndex = effectiveLimit;
     }
 
     chunks.push(remaining.substring(0, splitIndex).trim());
@@ -814,28 +1114,28 @@ const pLimit = (concurrency: number) => {
 async function fetchUserTweets(username: string, limit: number, processedIds?: Set<string>): Promise<Tweet[]> {
   const client = await getTwitterScraper();
   if (!client) return [];
-  
+
   let retries = 3;
   while (retries > 0) {
     try {
       const tweets: Tweet[] = [];
       const generator = client.getTweets(username, limit);
       let consecutiveProcessedCount = 0;
-      
+
       for await (const t of generator) {
         const tweet = mapScraperTweetToLocalTweet(t);
         const tweetId = tweet.id_str || tweet.id;
-        
+
         // Early stopping logic: if we see 3 consecutive tweets we've already processed, stop.
         // This assumes timeline order (mostly true).
         if (processedIds && tweetId && processedIds.has(tweetId)) {
-            consecutiveProcessedCount++;
-            if (consecutiveProcessedCount >= 3) {
-                console.log(`[${username}] 🛑 Found 3 consecutive processed tweets. Stopping fetch early.`);
-                break;
-            }
+          consecutiveProcessedCount++;
+          if (consecutiveProcessedCount >= 3) {
+            console.log(`[${username}] 🛑 Found 3 consecutive processed tweets. Stopping fetch early.`);
+            break;
+          }
         } else {
-            consecutiveProcessedCount = 0;
+          consecutiveProcessedCount = 0;
         }
 
         tweets.push(tweet);
@@ -844,50 +1144,54 @@ async function fetchUserTweets(username: string, limit: number, processedIds?: S
       return tweets;
     } catch (e: any) {
       retries--;
-      const isRetryable = e.message?.includes('ServiceUnavailable') || e.message?.includes('Timeout') || e.message?.includes('429') || e.message?.includes('401');
-      
+      const isRetryable =
+        e.message?.includes('ServiceUnavailable') ||
+        e.message?.includes('Timeout') ||
+        e.message?.includes('429') ||
+        e.message?.includes('401');
+
       // Check for Twitter Internal Server Error (often returns 400 with specific body)
       if (e?.response?.status === 400 && JSON.stringify(e?.response?.data || {}).includes('InternalServerError')) {
-         console.warn(`⚠️ Twitter Internal Server Error (Transient) for ${username}.`);
-         // Treat as retryable
-         if (retries > 0) {
-            await new Promise(r => setTimeout(r, 5000));
-            continue;
-         }
+        console.warn(`⚠️ Twitter Internal Server Error (Transient) for ${username}.`);
+        // Treat as retryable
+        if (retries > 0) {
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
+        }
       }
 
       if (isRetryable) {
         console.warn(`⚠️ Error fetching tweets for ${username} (${e.message}).`);
-        
+
         // Attempt credential switch if we have backups
         if (await switchCredentials()) {
-            console.log(`🔄 Retrying with new credentials...`);
-            continue; // Retry loop with new credentials
+          console.log(`🔄 Retrying with new credentials...`);
+          continue; // Retry loop with new credentials
         }
 
         if (retries > 0) {
-            console.log(`Waiting 5s before retry...`);
-            await new Promise(r => setTimeout(r, 5000));
-            continue;
+          console.log(`Waiting 5s before retry...`);
+          await new Promise((r) => setTimeout(r, 5000));
+          continue;
         }
       }
-      
+
       console.warn(`Error fetching tweets for ${username}:`, e.message || e);
       return [];
     }
   }
-  
+
   console.log(`[${username}] ⚠️ Scraper returned 0 tweets (or failed silently) after retries.`);
   return [];
 }
 
-// ============================================================================ 
+// ============================================================================
 // Main Processing Logic
-// ============================================================================ 
+// ============================================================================
 
-// ============================================================================ 
+// ============================================================================
 // Main Processing Logic
-// ============================================================================ 
+// ============================================================================
 
 async function processTweets(
   agent: BskyAgent,
@@ -909,7 +1213,7 @@ async function processTweets(
   });
 
   const processedTweets = loadProcessedTweets(bskyIdentifier);
-  
+
   // Maintain a local map that updates in real-time for intra-batch replies
   const localProcessedMap: ProcessedTweetsMap = { ...processedTweets };
 
@@ -936,9 +1240,9 @@ async function processTweets(
     if (isRetweet) {
       console.log(`[${twitterUsername}] ⏩ Skipping retweet ${tweetId}.`);
       if (!dryRun) {
-          // Save as skipped so we don't check it again
-          saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, { skipped: true, text: tweet.text });
-          localProcessedMap[tweetId] = { skipped: true, text: tweet.text };
+        // Save as skipped so we don't check it again
+        saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, { skipped: true, text: tweet.text });
+        localProcessedMap[tweetId] = { skipped: true, text: tweet.text };
       }
       continue;
     }
@@ -967,52 +1271,58 @@ async function processTweets(
         // Parent missing from local batch/DB. Attempt to fetch it if it's a self-thread.
         // We assume it's a self-thread if we don't have it, but we'll verify author after fetch.
         console.log(`[${twitterUsername}] 🕵️ Parent ${replyStatusId} missing. Checking if backfillable...`);
-        
+
         let parentBackfilled = false;
         try {
-            const scraper = await getTwitterScraper();
-            if (scraper) {
-                const parentRaw = await scraper.getTweet(replyStatusId);
-                if (parentRaw) {
-                    const parentTweet = mapScraperTweetToLocalTweet(parentRaw);
-                    const parentAuthor = parentTweet.user?.screen_name;
-                    
-                    if (parentAuthor?.toLowerCase() === twitterUsername.toLowerCase()) {
-                        console.log(`[${twitterUsername}] 🔄 Parent is ours (@${parentAuthor}). Backfilling parent first...`);
-                        // Recursively process the parent
-                        await processTweets(agent, twitterUsername, bskyIdentifier, [parentTweet], dryRun);
-                        
-                        // Check if it was saved
-                        const savedParent = dbService.getTweet(replyStatusId, bskyIdentifier);
-                        if (savedParent && savedParent.status === 'migrated') {
-                            // Update local map
-                            localProcessedMap[replyStatusId] = {
-                                uri: savedParent.bsky_uri,
-                                cid: savedParent.bsky_cid,
-                                root: (savedParent.bsky_root_uri && savedParent.bsky_root_cid) ? { uri: savedParent.bsky_root_uri, cid: savedParent.bsky_root_cid } : undefined,
-                                tail: (savedParent.bsky_tail_uri && savedParent.bsky_tail_cid) ? { uri: savedParent.bsky_tail_uri, cid: savedParent.bsky_tail_cid } : undefined,
-                                migrated: true
-                            };
-                            replyParentInfo = localProcessedMap[replyStatusId] ?? null;
-                            parentBackfilled = true;
-                            console.log(`[${twitterUsername}] ✅ Parent backfilled. Resuming thread.`);
-                        }
-                    } else {
-                        console.log(`[${twitterUsername}] ⏩ Parent is by @${parentAuthor}. Skipping external reply.`);
-                    }
+          const scraper = await getTwitterScraper();
+          if (scraper) {
+            const parentRaw = await scraper.getTweet(replyStatusId);
+            if (parentRaw) {
+              const parentTweet = mapScraperTweetToLocalTweet(parentRaw);
+              const parentAuthor = parentTweet.user?.screen_name;
+
+              if (parentAuthor?.toLowerCase() === twitterUsername.toLowerCase()) {
+                console.log(`[${twitterUsername}] 🔄 Parent is ours (@${parentAuthor}). Backfilling parent first...`);
+                // Recursively process the parent
+                await processTweets(agent, twitterUsername, bskyIdentifier, [parentTweet], dryRun);
+
+                // Check if it was saved
+                const savedParent = dbService.getTweet(replyStatusId, bskyIdentifier);
+                if (savedParent && savedParent.status === 'migrated') {
+                  // Update local map
+                  localProcessedMap[replyStatusId] = {
+                    uri: savedParent.bsky_uri,
+                    cid: savedParent.bsky_cid,
+                    root:
+                      savedParent.bsky_root_uri && savedParent.bsky_root_cid
+                        ? { uri: savedParent.bsky_root_uri, cid: savedParent.bsky_root_cid }
+                        : undefined,
+                    tail:
+                      savedParent.bsky_tail_uri && savedParent.bsky_tail_cid
+                        ? { uri: savedParent.bsky_tail_uri, cid: savedParent.bsky_tail_cid }
+                        : undefined,
+                    migrated: true,
+                  };
+                  replyParentInfo = localProcessedMap[replyStatusId] ?? null;
+                  parentBackfilled = true;
+                  console.log(`[${twitterUsername}] ✅ Parent backfilled. Resuming thread.`);
                 }
+              } else {
+                console.log(`[${twitterUsername}] ⏩ Parent is by @${parentAuthor}. Skipping external reply.`);
+              }
             }
+          }
         } catch (e) {
-            console.warn(`[${twitterUsername}] ⚠️ Failed to fetch/backfill parent ${replyStatusId}:`, e);
+          console.warn(`[${twitterUsername}] ⚠️ Failed to fetch/backfill parent ${replyStatusId}:`, e);
         }
 
         if (!parentBackfilled) {
-            console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply (Parent not found or external).`);
-            if (!dryRun) {
-              saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, { skipped: true, text: tweetText });
-              localProcessedMap[tweetId] = { skipped: true, text: tweetText };
-            }
-            continue;
+          console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply (Parent not found or external).`);
+          if (!dryRun) {
+            saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, { skipped: true, text: tweetText });
+            localProcessedMap[tweetId] = { skipped: true, text: tweetText };
+          }
+          continue;
         }
       } else {
         console.log(`[${twitterUsername}] ⏩ Skipping external/unknown reply.`);
@@ -1025,14 +1335,14 @@ async function processTweets(
     }
 
     // Removed early dryRun continue to allow verifying logic
-    
+
     let text = tweetText
       .replace(/&amp;/g, '&')
       .replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>')
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'");
-    
+
     // 1. Link Expansion
     console.log(`[${twitterUsername}] 🔗 Expanding links...`);
     const urls = tweet.entities?.urls || [];
@@ -1047,14 +1357,26 @@ async function processTweets(
     const matches = text.match(tcoRegex) || [];
     for (const tco of matches) {
       // Avoid re-resolving if we already handled it via entities
-      if (urls.some(u => u.url === tco)) continue;
+      if (urls.some((u) => u.url === tco)) continue;
 
       console.log(`[${twitterUsername}] 🔍 Resolving fallback link: ${tco}`);
       const resolved = await expandUrl(tco);
       if (resolved !== tco) {
-          text = text.replace(tco, resolved);
-          // Add to urls array so it can be used for card embedding later
-          urls.push({ url: tco, expanded_url: resolved });
+        text = text.replace(tco, resolved);
+        // Add to urls array so it can be used for card embedding later
+        urls.push({ url: tco, expanded_url: resolved });
+      }
+    }
+
+    const isSponsoredCard = detectSponsoredCard(tweet);
+    if (isSponsoredCard) {
+      console.log(`[${twitterUsername}] 🧩 Sponsored/card payload detected. Extracting carousel media...`);
+      injectCardMedia(tweet);
+    } else if (tweet.permanentUrl) {
+      const syndication = await fetchSyndicationMedia(tweet.permanentUrl);
+      if (syndication.images.length > 0) {
+        console.log(`[${twitterUsername}] 🧩 Syndication carousel detected. Extracting media...`);
+        injectSyndicationMedia(tweet, syndication);
       }
     }
 
@@ -1072,7 +1394,10 @@ async function processTweets(
         mediaLinksToRemove.push(media.url);
         if (media.expanded_url) mediaLinksToRemove.push(media.expanded_url);
       }
-      
+      if (media.source === 'card' && media.media_url_https) {
+        mediaLinksToRemove.push(media.media_url_https);
+      }
+
       let aspectRatio: AspectRatio | undefined;
       if (media.sizes?.large) {
         aspectRatio = { width: media.sizes.large.w, height: media.sizes.large.h };
@@ -1088,23 +1413,25 @@ async function processTweets(
           console.log(`[${twitterUsername}] 📥 Downloading image (high quality): ${path.basename(highQualityUrl)}`);
           updateAppStatus({ message: `Downloading high quality image...` });
           const { buffer, mimeType } = await downloadMedia(highQualityUrl);
-          
+
           let blob: BlobRef;
           if (dryRun) {
-             console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would upload image (${(buffer.length/1024).toFixed(2)} KB)`);
-             blob = { ref: { toString: () => 'mock-blob' }, mimeType, size: buffer.length } as any;
+            console.log(
+              `[${twitterUsername}] 🧪 [DRY RUN] Would upload image (${(buffer.length / 1024).toFixed(2)} KB)`,
+            );
+            blob = { ref: { toString: () => 'mock-blob' }, mimeType, size: buffer.length } as any;
           } else {
-             console.log(`[${twitterUsername}] 📤 Uploading image to Bluesky...`);
-             updateAppStatus({ message: `Uploading image to Bluesky...` });
-             blob = await uploadToBluesky(agent, buffer, mimeType);
+            console.log(`[${twitterUsername}] 📤 Uploading image to Bluesky...`);
+            updateAppStatus({ message: `Uploading image to Bluesky...` });
+            blob = await uploadToBluesky(agent, buffer, mimeType);
           }
-          
+
           let altText = media.ext_alt_text;
           if (!altText) {
-             console.log(`[${twitterUsername}] 🤖 Generating alt text via Gemini...`);
-             // Use original tweet text for context, not the modified/cleaned one
-             altText = await generateAltText(buffer, mimeType, tweetText);
-             if (altText) console.log(`[${twitterUsername}] ✅ Alt text generated: ${altText.substring(0, 50)}...`);
+            console.log(`[${twitterUsername}] 🤖 Generating alt text via Gemini...`);
+            // Use original tweet text for context, not the modified/cleaned one
+            altText = await generateAltText(buffer, mimeType, tweetText);
+            if (altText) console.log(`[${twitterUsername}] ✅ Alt text generated: ${altText.substring(0, 50)}...`);
           }
 
           images.push({ alt: altText || 'Image from Twitter', image: blob, aspectRatio });
@@ -1125,12 +1452,13 @@ async function processTweets(
       } else if (media.type === 'video' || media.type === 'animated_gif') {
         const variants = media.video_info?.variants || [];
         const duration = media.video_info?.duration_millis || 0;
-        
-        if (duration > 180000) { // 3 minutes
-           console.warn(`[${twitterUsername}] ⚠️ Video too long (${(duration / 1000).toFixed(1)}s). Fallback to link.`);
-           const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
-           if (!text.includes(tweetUrl)) text += `\n\nVideo: ${tweetUrl}`;
-           continue;
+
+        if (duration > 180000) {
+          // 3 minutes
+          console.warn(`[${twitterUsername}] ⚠️ Video too long (${(duration / 1000).toFixed(1)}s). Fallback to link.`);
+          const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
+          if (!text.includes(tweetUrl)) text += `\n\nVideo: ${tweetUrl}`;
+          continue;
         }
 
         const mp4s = variants
@@ -1145,28 +1473,36 @@ async function processTweets(
               console.log(`[${twitterUsername}] 📥 Downloading video: ${videoUrl}`);
               updateAppStatus({ message: `Downloading video: ${path.basename(videoUrl)}` });
               const { buffer, mimeType } = await downloadMedia(videoUrl);
-              
+
               if (buffer.length <= 90 * 1024 * 1024) {
                 const filename = videoUrl.split('/').pop() || 'video.mp4';
                 if (dryRun) {
-                    console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would upload video: ${filename} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
-                    videoBlob = { ref: { toString: () => 'mock-video-blob' }, mimeType: 'video/mp4', size: buffer.length } as any;
+                  console.log(
+                    `[${twitterUsername}] 🧪 [DRY RUN] Would upload video: ${filename} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`,
+                  );
+                  videoBlob = {
+                    ref: { toString: () => 'mock-video-blob' },
+                    mimeType: 'video/mp4',
+                    size: buffer.length,
+                  } as any;
                 } else {
-                    updateAppStatus({ message: `Uploading video to Bluesky...` });
-                    videoBlob = await uploadVideoToBluesky(agent, buffer, filename);
+                  updateAppStatus({ message: `Uploading video to Bluesky...` });
+                  videoBlob = await uploadVideoToBluesky(agent, buffer, filename);
                 }
                 videoAspectRatio = aspectRatio;
                 console.log(`[${twitterUsername}] ✅ Video upload process complete.`);
                 break; // Prioritize first video
               }
-              
-              console.warn(`[${twitterUsername}] ⚠️ Video too large (${(buffer.length / 1024 / 1024).toFixed(2)}MB). Fallback to link.`);
+
+              console.warn(
+                `[${twitterUsername}] ⚠️ Video too large (${(buffer.length / 1024 / 1024).toFixed(2)}MB). Fallback to link.`,
+              );
               const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
               if (!text.includes(tweetUrl)) text += `\n\nVideo: ${tweetUrl}`;
             } catch (err) {
               const errMsg = (err as Error).message;
-              if (errMsg !== "VIDEO_FALLBACK_503") {
-                  console.error(`[${twitterUsername}] ❌ Failed video upload flow:`, errMsg);
+              if (errMsg !== 'VIDEO_FALLBACK_503') {
+                console.error(`[${twitterUsername}] ❌ Failed video upload flow:`, errMsg);
               }
               const tweetUrl = `https://twitter.com/${twitterUsername}/status/${tweetId}`;
               if (!text.includes(tweetUrl)) text += `\n\nVideo: ${tweetUrl}`;
@@ -1178,7 +1514,18 @@ async function processTweets(
 
     // Cleanup text
     for (const link of mediaLinksToRemove) text = text.split(link).join('').trim();
+    if (isSponsoredCard) {
+      const cardLinks = detectCarouselLinks(tweet);
+      const cardPrimaryLink = detectCardMedia(tweet).link;
+      const requestedLinks = [cardPrimaryLink, ...cardLinks].filter(Boolean) as string[];
+      requestedLinks.forEach((link) => {
+        if (!urls.some((u) => u.expanded_url === link || u.url === link)) {
+          urls.push({ url: link, expanded_url: link });
+        }
+      });
+    }
     text = text.replace(/\n\s*\n/g, '\n\n').trim();
+    text = addTextFallbacks(text);
 
     // 3. Quoting Logic
     let quoteEmbed: { $type: string; record: { uri: string; cid: string } } | null = null;
@@ -1194,15 +1541,16 @@ async function processTweets(
       } else {
         const quoteUrlEntity = urls.find((u) => u.expanded_url?.includes(quoteId));
         const qUrl = quoteUrlEntity?.expanded_url || `https://twitter.com/i/status/${quoteId}`;
-        
+
         // Check if it's a self-quote (same user)
-        const isSelfQuote = qUrl.toLowerCase().includes(`twitter.com/${twitterUsername.toLowerCase()}/`) || 
-                           qUrl.toLowerCase().includes(`x.com/${twitterUsername.toLowerCase()}/`);
-        
+        const isSelfQuote =
+          qUrl.toLowerCase().includes(`twitter.com/${twitterUsername.toLowerCase()}/`) ||
+          qUrl.toLowerCase().includes(`x.com/${twitterUsername.toLowerCase()}/`);
+
         if (!isSelfQuote) {
           externalQuoteUrl = qUrl;
           console.log(`[${twitterUsername}] 🔗 Quoted tweet is external: ${externalQuoteUrl}`);
-          
+
           // Try to capture screenshot for external QTs if we have space for images
           if (images.length < 4 && !videoBlob) {
             const ssResult = await captureTweetScreenshot(externalQuoteUrl);
@@ -1210,15 +1558,21 @@ async function processTweets(
               try {
                 let blob: BlobRef;
                 if (dryRun) {
-                    console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would upload screenshot for quote (${(ssResult.buffer.length/1024).toFixed(2)} KB)`);
-                    blob = { ref: { toString: () => 'mock-ss-blob' }, mimeType: 'image/png', size: ssResult.buffer.length } as any;
+                  console.log(
+                    `[${twitterUsername}] 🧪 [DRY RUN] Would upload screenshot for quote (${(ssResult.buffer.length / 1024).toFixed(2)} KB)`,
+                  );
+                  blob = {
+                    ref: { toString: () => 'mock-ss-blob' },
+                    mimeType: 'image/png',
+                    size: ssResult.buffer.length,
+                  } as any;
                 } else {
-                    blob = await uploadToBluesky(agent, ssResult.buffer, 'image/png');
+                  blob = await uploadToBluesky(agent, ssResult.buffer, 'image/png');
                 }
-                images.push({ 
-                    alt: `Quote Tweet: ${externalQuoteUrl}`, 
-                    image: blob,
-                    aspectRatio: { width: ssResult.width, height: ssResult.height }
+                images.push({
+                  alt: `Quote Tweet: ${externalQuoteUrl}`,
+                  image: blob,
+                  aspectRatio: { width: ssResult.width, height: ssResult.height },
                 });
               } catch (e) {
                 console.warn(`[${twitterUsername}] ⚠️ Failed to upload screenshot blob.`);
@@ -1229,45 +1583,54 @@ async function processTweets(
           console.log(`[${twitterUsername}] 🔁 Quoted tweet is a self-quote, skipping link.`);
         }
       }
-    } else if (images.length === 0 && !videoBlob) {
-        // If no media and no quote, check for external links to embed
-        // We prioritize the LAST link found as it's often the main content
-        const potentialLinks = urls
-            .map(u => u.expanded_url)
-            .filter(u => u && !u.includes('twitter.com') && !u.includes('x.com')) as string[];
-        
-        if (potentialLinks.length > 0) {
-            const linkToEmbed = potentialLinks[potentialLinks.length - 1];
-            if (linkToEmbed) {
-                // Optimization: If text is too long, but removing the link makes it fit, do it!
-                // The link will be present in the embed card anyway.
-                if (text.length > 300 && text.includes(linkToEmbed)) {
-                    const lengthWithoutLink = text.length - linkToEmbed.length;
-                    // Allow some buffer (e.g. whitespace cleanup might save 1-2 chars)
-                    if (lengthWithoutLink <= 300) {
-                        console.log(`[${twitterUsername}] 📏 Optimizing: Removing link ${linkToEmbed} from text to avoid threading (Card will embed it).`);
-                        text = text.replace(linkToEmbed, '').trim();
-                        // Clean up potential double punctuation/spaces left behind
-                        text = text.replace(/\s\.$/, '.').replace(/\s\s+/g, ' ');
-                    }
-                }
+    } else if ((images.length === 0 && !videoBlob) || isSponsoredCard) {
+      // If no media and no quote, check for external links to embed
+      // We prioritize the LAST link found as it's often the main content
+      const potentialLinks = urls
+        .map((u) => u.expanded_url)
+        .filter((u) => u && !u.includes('twitter.com') && !u.includes('x.com')) as string[];
 
-                console.log(`[${twitterUsername}] 🃏 Fetching link card for: ${linkToEmbed}`);
-                linkCard = await fetchEmbedUrlCard(agent, linkToEmbed);
+      if (potentialLinks.length > 0) {
+        const linkToEmbed = potentialLinks[potentialLinks.length - 1];
+        if (linkToEmbed) {
+          // Optimization: If text is too long, but removing the link makes it fit, do it!
+          // The link will be present in the embed card anyway.
+          if (text.length > 300 && text.includes(linkToEmbed)) {
+            const lengthWithoutLink = text.length - linkToEmbed.length;
+            // Allow some buffer (e.g. whitespace cleanup might save 1-2 chars)
+            if (lengthWithoutLink <= 300) {
+              console.log(
+                `[${twitterUsername}] 📏 Optimizing: Removing link ${linkToEmbed} from text to avoid threading (Card will embed it).`,
+              );
+              text = text.replace(linkToEmbed, '').trim();
+              // Clean up potential double punctuation/spaces left behind
+              text = text.replace(/\s\.$/, '.').replace(/\s\s+/g, ' ');
             }
+          }
+
+          console.log(`[${twitterUsername}] 🃏 Fetching link card for: ${linkToEmbed}`);
+          linkCard = await fetchEmbedUrlCard(agent, linkToEmbed);
         }
+      }
     }
 
     // Only append link for external quotes IF we couldn't natively embed it OR screenshot it
-    const hasScreenshot = images.some(img => img.alt.startsWith('Quote Tweet:'));
+    const hasScreenshot = images.some((img) => img.alt.startsWith('Quote Tweet:'));
     if (externalQuoteUrl && !quoteEmbed && !hasScreenshot && !text.includes(externalQuoteUrl)) {
       text += `\n\nQT: ${externalQuoteUrl}`;
+    }
+
+    if (isSponsoredCard) {
+      const hasCardImages = mediaEntities.some((media) => media.source === 'card');
+      if (hasCardImages) {
+        text = ensureSponsoredLinks(text, tweet);
+      }
     }
 
     // 4. Threading and Posting
     const chunks = splitText(text);
     console.log(`[${twitterUsername}] 📝 Splitting text into ${chunks.length} chunks.`);
-    
+
     let lastPostInfo: ProcessedTweetEntry | null = replyParentInfo;
 
     // We will save the first chunk as the "Root" of this tweet, and the last chunk as the "Tail".
@@ -1276,15 +1639,15 @@ async function processTweets(
 
     for (let i = 0; i < chunks.length; i++) {
       let chunk = chunks[i] as string;
-      
+
       // Add (i/n) if split
       if (chunks.length > 1) {
-          chunk += ` (${i + 1}/${chunks.length})`;
+        chunk += ` (${i + 1}/${chunks.length})`;
       }
 
       console.log(`[${twitterUsername}] 📤 Posting chunk ${i + 1}/${chunks.length}...`);
       updateAppStatus({ message: `Posting chunk ${i + 1}/${chunks.length}...` });
-      
+
       const rt = new RichText({ text: chunk });
       await rt.detectFacets(agent);
       const detectedLangs = detectLanguage(chunk);
@@ -1331,15 +1694,15 @@ async function processTweets(
       let rootRef: { uri: string; cid: string } | null = null;
 
       if (lastPostInfo?.uri && lastPostInfo?.cid) {
-          // If this is the start of a new tweet (i=0), check if parent has a tail
-          if (i === 0 && lastPostInfo.tail) {
-              parentRef = lastPostInfo.tail;
-          } else {
-              // Otherwise (intra-tweet or parent has no tail), use the main uri/cid (which is the previous post/chunk)
-              parentRef = { uri: lastPostInfo.uri, cid: lastPostInfo.cid };
-          }
-          
-          rootRef = lastPostInfo.root || { uri: lastPostInfo.uri, cid: lastPostInfo.cid };
+        // If this is the start of a new tweet (i=0), check if parent has a tail
+        if (i === 0 && lastPostInfo.tail) {
+          parentRef = lastPostInfo.tail;
+        } else {
+          // Otherwise (intra-tweet or parent has no tail), use the main uri/cid (which is the previous post/chunk)
+          parentRef = { uri: lastPostInfo.uri, cid: lastPostInfo.cid };
+        }
+
+        rootRef = lastPostInfo.root || { uri: lastPostInfo.uri, cid: lastPostInfo.cid };
       }
 
       if (parentRef && rootRef) {
@@ -1353,40 +1716,42 @@ async function processTweets(
         // Retry logic for network/socket errors
         let response: any;
         let retries = 3;
-        
+
         if (dryRun) {
-             console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would post chunk ${i + 1}/${chunks.length}`);
-             if (postRecord.embed) console.log(`   - With embed: ${postRecord.embed.$type}`);
-             if (postRecord.reply) console.log(`   - As reply to: ${postRecord.reply.parent.uri}`);
-             response = { uri: 'at://did:plc:mock/app.bsky.feed.post/mock', cid: 'mock-cid' };
+          console.log(`[${twitterUsername}] 🧪 [DRY RUN] Would post chunk ${i + 1}/${chunks.length}`);
+          if (postRecord.embed) console.log(`   - With embed: ${postRecord.embed.$type}`);
+          if (postRecord.reply) console.log(`   - As reply to: ${postRecord.reply.parent.uri}`);
+          response = { uri: 'at://did:plc:mock/app.bsky.feed.post/mock', cid: 'mock-cid' };
         } else {
-            while (retries > 0) {
-              try {
-                response = await agent.post(postRecord);
-                break;
-              } catch (err: any) {
-                retries--;
-                if (retries === 0) throw err;
-                console.warn(`[${twitterUsername}] ⚠️ Post failed (Socket/Network), retrying in 5s... (${retries} retries left)`);
-                await new Promise(r => setTimeout(r, 5000));
-              }
+          while (retries > 0) {
+            try {
+              response = await agent.post(postRecord);
+              break;
+            } catch (err: any) {
+              retries--;
+              if (retries === 0) throw err;
+              console.warn(
+                `[${twitterUsername}] ⚠️ Post failed (Socket/Network), retrying in 5s... (${retries} retries left)`,
+              );
+              await new Promise((r) => setTimeout(r, 5000));
             }
+          }
         }
-        
+
         const currentPostInfo = {
-            uri: response.uri,
-            cid: response.cid,
-            root: postRecord.reply ? postRecord.reply.root : { uri: response.uri, cid: response.cid },
-            // Text is just the current chunk text
-            text: chunk
+          uri: response.uri,
+          cid: response.cid,
+          root: postRecord.reply ? postRecord.reply.root : { uri: response.uri, cid: response.cid },
+          // Text is just the current chunk text
+          text: chunk,
         };
-        
+
         if (i === 0) firstChunkInfo = currentPostInfo;
         lastChunkInfo = currentPostInfo;
         lastPostInfo = currentPostInfo; // Update for next iteration
 
         console.log(`[${twitterUsername}] ✅ Chunk ${i + 1} posted successfully.`);
-        
+
         if (chunks.length > 1) {
           await new Promise((r) => setTimeout(r, 3000));
         }
@@ -1395,23 +1760,23 @@ async function processTweets(
         break;
       }
     }
-    
+
     // Save to DB and Map
     if (firstChunkInfo && lastChunkInfo) {
-        const entry: ProcessedTweetEntry = {
-            uri: firstChunkInfo.uri,
-            cid: firstChunkInfo.cid,
-            root: firstChunkInfo.root,
-            tail: { uri: lastChunkInfo.uri, cid: lastChunkInfo.cid }, // Save tail!
-            text: tweetText
-        };
-        
-        if (!dryRun) {
-            saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, entry);
-            localProcessedMap[tweetId] = entry; // Update local map for subsequent replies in this batch
-        }
+      const entry: ProcessedTweetEntry = {
+        uri: firstChunkInfo.uri,
+        cid: firstChunkInfo.cid,
+        root: firstChunkInfo.root,
+        tail: { uri: lastChunkInfo.uri, cid: lastChunkInfo.cid }, // Save tail!
+        text: tweetText,
+      };
+
+      if (!dryRun) {
+        saveProcessedTweet(twitterUsername, bskyIdentifier, tweetId, entry);
+        localProcessedMap[tweetId] = entry; // Update local map for subsequent replies in this batch
+      }
     }
-    
+
     // Add a random delay between 5s and 15s to be more human-like
     const wait = Math.floor(Math.random() * 10000) + 5000;
     console.log(`[${twitterUsername}] 😴 Pacing: Waiting ${wait / 1000}s before next tweet.`);
@@ -1431,7 +1796,9 @@ async function importHistory(
   requestId?: string,
 ): Promise<void> {
   const config = getConfig();
-  const mapping = config.mappings.find((m) => m.twitterUsernames.map(u => u.toLowerCase()).includes(twitterUsername.toLowerCase()));
+  const mapping = config.mappings.find((m) =>
+    m.twitterUsernames.map((u) => u.toLowerCase()).includes(twitterUsername.toLowerCase()),
+  );
   if (!mapping) {
     console.error(`No mapping found for twitter username: ${twitterUsername}`);
     return;
@@ -1439,20 +1806,20 @@ async function importHistory(
 
   let agent = await getAgent(mapping);
   if (!agent) {
-      if (dryRun) {
-          console.log("⚠️  Could not login to Bluesky, but proceeding with MOCK AGENT for Dry Run.");
-          // biome-ignore lint/suspicious/noExplicitAny: mock agent
-          agent = {
-              post: async (record: any) => ({ uri: 'at://did:plc:mock/app.bsky.feed.post/mock', cid: 'mock-cid' }),
-              uploadBlob: async (data: any) => ({ data: { blob: { ref: { toString: () => 'mock-blob' } } } }),
-              // Add other necessary methods if they are called outside of the already mocked dryRun blocks
-              // But since we mocked the calls inside processTweets for dryRun, we just need the object to exist.
-              session: { did: 'did:plc:mock' },
-              com: { atproto: { repo: { describeRepo: async () => ({ data: {} }) } } }
-          } as any;
-      } else {
-          return;
-      }
+    if (dryRun) {
+      console.log('⚠️  Could not login to Bluesky, but proceeding with MOCK AGENT for Dry Run.');
+      // biome-ignore lint/suspicious/noExplicitAny: mock agent
+      agent = {
+        post: async (record: any) => ({ uri: 'at://did:plc:mock/app.bsky.feed.post/mock', cid: 'mock-cid' }),
+        uploadBlob: async (data: any) => ({ data: { blob: { ref: { toString: () => 'mock-blob' } } } }),
+        // Add other necessary methods if they are called outside of the already mocked dryRun blocks
+        // But since we mocked the calls inside processTweets for dryRun, we just need the object to exist.
+        session: { did: 'did:plc:mock' },
+        com: { atproto: { repo: { describeRepo: async () => ({ data: {} }) } } },
+      } as any;
+    } else {
+      return;
+    }
   }
 
   console.log(`Starting full history import for ${twitterUsername} -> ${mapping.bskyIdentifier}...`);
@@ -1463,40 +1830,41 @@ async function importHistory(
 
   console.log(`Fetching tweets for ${twitterUsername}...`);
   updateAppStatus({ message: `Fetching tweets...` });
-  
+
   const client = await getTwitterScraper();
   if (client) {
-      try {
-          // Use getTweets which reliably fetches user timeline
-          // limit defaults to 15 in function signature, but for history import we might want more.
-          // However, the generator will fetch as much as we ask.
-          const fetchLimit = limit || 100;
-          const generator = client.getTweets(twitterUsername, fetchLimit);
-          
-          for await (const scraperTweet of generator) {
-              if (!ignoreCancellation) {
-                const stillPending = getPendingBackfills().some(b => b.id === mapping.id && (!requestId || b.requestId === requestId));
-                if (!stillPending) {
-                    console.log(`[${twitterUsername}] 🛑 Backfill cancelled.`);
-                    break;
-                }
+    try {
+      // Use getTweets which reliably fetches user timeline
+      // limit defaults to 15 in function signature, but for history import we might want more.
+      // However, the generator will fetch as much as we ask.
+      const fetchLimit = limit || 100;
+      const generator = client.getTweets(twitterUsername, fetchLimit);
 
-              }
-
-              const t = mapScraperTweetToLocalTweet(scraperTweet);
-              const tid = t.id_str || t.id;
-              if (!tid) continue;
-              
-              if (!processedTweets[tid] && !seenIds.has(tid)) {
-                  allFoundTweets.push(t);
-                  seenIds.add(tid);
-              }
-              
-              if (allFoundTweets.length >= fetchLimit) break;
+      for await (const scraperTweet of generator) {
+        if (!ignoreCancellation) {
+          const stillPending = getPendingBackfills().some(
+            (b) => b.id === mapping.id && (!requestId || b.requestId === requestId),
+          );
+          if (!stillPending) {
+            console.log(`[${twitterUsername}] 🛑 Backfill cancelled.`);
+            break;
           }
-      } catch(e) {
-          console.warn("Error during history fetch:", e);
+        }
+
+        const t = mapScraperTweetToLocalTweet(scraperTweet);
+        const tid = t.id_str || t.id;
+        if (!tid) continue;
+
+        if (!processedTweets[tid] && !seenIds.has(tid)) {
+          allFoundTweets.push(t);
+          seenIds.add(tid);
+        }
+
+        if (allFoundTweets.length >= fetchLimit) break;
       }
+    } catch (e) {
+      console.warn('Error during history fetch:', e);
+    }
   }
 
   console.log(`Fetch complete. Found ${allFoundTweets.length} new tweets to import.`);
@@ -1510,111 +1878,113 @@ async function importHistory(
 const activeTasks = new Map<string, Promise<void>>();
 
 async function runAccountTask(mapping: AccountMapping, backfillRequest?: PendingBackfill, dryRun = false) {
-    if (activeTasks.has(mapping.id)) return; // Already running
+  if (activeTasks.has(mapping.id)) return; // Already running
 
-    const task = (async () => {
-        try {
-            const agent = await getAgent(mapping);
-            if (!agent) return;
+  const task = (async () => {
+    try {
+      const agent = await getAgent(mapping);
+      if (!agent) return;
 
-            const backfillReq = backfillRequest ?? getPendingBackfills().find(b => b.id === mapping.id);
-            
-            if (backfillReq) {
-                const limit = backfillReq.limit || 15;
-                console.log(`[${mapping.bskyIdentifier}] Running backfill for ${mapping.twitterUsernames.length} accounts (limit ${limit})...`);
-                updateAppStatus({
-                    state: 'backfilling',
-                    currentAccount: mapping.twitterUsernames[0],
-                    message: `Starting backfill (limit ${limit})...`,
-                    backfillMappingId: mapping.id,
-                    backfillRequestId: backfillReq.requestId,
-                });
-                
-                for (const twitterUsername of mapping.twitterUsernames) {
-                    const stillPending = getPendingBackfills().some(
-                        (b) => b.id === mapping.id && b.requestId === backfillReq.requestId,
-                    );
-                    if (!stillPending) {
-                        console.log(`[${mapping.bskyIdentifier}] 🛑 Backfill request replaced; stopping.`);
-                        break;
-                    }
+      const backfillReq = backfillRequest ?? getPendingBackfills().find((b) => b.id === mapping.id);
 
-                    try {
-                        updateAppStatus({
-                            state: 'backfilling',
-                            currentAccount: twitterUsername,
-                            message: `Starting backfill (limit ${limit})...`,
-                            backfillMappingId: mapping.id,
-                            backfillRequestId: backfillReq.requestId,
-                        });
-                        await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId);
-                    } catch (err) {
-                        console.error(`❌ Error backfilling ${twitterUsername}:`, err);
-                    }
-                }
-                clearBackfill(mapping.id, backfillReq.requestId);
-                updateAppStatus({
-                    state: 'idle',
-                    message: `Backfill complete for ${mapping.bskyIdentifier}`,
-                    backfillMappingId: undefined,
-                    backfillRequestId: undefined,
-                });
-                console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
-            } else {
-                updateAppStatus({ backfillMappingId: undefined, backfillRequestId: undefined });
+      if (backfillReq) {
+        const limit = backfillReq.limit || 15;
+        console.log(
+          `[${mapping.bskyIdentifier}] Running backfill for ${mapping.twitterUsernames.length} accounts (limit ${limit})...`,
+        );
+        updateAppStatus({
+          state: 'backfilling',
+          currentAccount: mapping.twitterUsernames[0],
+          message: `Starting backfill (limit ${limit})...`,
+          backfillMappingId: mapping.id,
+          backfillRequestId: backfillReq.requestId,
+        });
 
-                // Pre-load processed IDs for optimization
-                const processedMap = loadProcessedTweets(mapping.bskyIdentifier);
-                const processedIds = new Set(Object.keys(processedMap));
+        for (const twitterUsername of mapping.twitterUsernames) {
+          const stillPending = getPendingBackfills().some(
+            (b) => b.id === mapping.id && b.requestId === backfillReq.requestId,
+          );
+          if (!stillPending) {
+            console.log(`[${mapping.bskyIdentifier}] 🛑 Backfill request replaced; stopping.`);
+            break;
+          }
 
-                for (const twitterUsername of mapping.twitterUsernames) {
-                    try {
-                        console.log(`[${twitterUsername}] 🏁 Starting check for new tweets...`);
-                        updateAppStatus({
-                            state: 'checking',
-                            currentAccount: twitterUsername,
-                            message: 'Fetching latest tweets...',
-                            backfillMappingId: undefined,
-                            backfillRequestId: undefined,
-                        });
-                        
-                        // Use fetchUserTweets with early stopping optimization
-                        // Increase limit slightly since we have early stopping now
-                        const tweets = await fetchUserTweets(twitterUsername, 50, processedIds);
-                        
-                        if (!tweets || tweets.length === 0) {
-                            console.log(`[${twitterUsername}] ℹ️ No tweets found (or fetch failed).`);
-                            continue;
-                        }
-                        
-                        console.log(`[${twitterUsername}] 📥 Fetched ${tweets.length} tweets.`);
-                        await processTweets(agent, twitterUsername, mapping.bskyIdentifier, tweets, dryRun);
-                    } catch (err) {
-                        console.error(`❌ Error checking ${twitterUsername}:`, err);
-                    }
-                }
-            }
-        } catch (err) {
-            console.error(`Error processing mapping ${mapping.bskyIdentifier}:`, err);
-        } finally {
-            activeTasks.delete(mapping.id);
+          try {
+            updateAppStatus({
+              state: 'backfilling',
+              currentAccount: twitterUsername,
+              message: `Starting backfill (limit ${limit})...`,
+              backfillMappingId: mapping.id,
+              backfillRequestId: backfillReq.requestId,
+            });
+            await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId);
+          } catch (err) {
+            console.error(`❌ Error backfilling ${twitterUsername}:`, err);
+          }
         }
-    })();
+        clearBackfill(mapping.id, backfillReq.requestId);
+        updateAppStatus({
+          state: 'idle',
+          message: `Backfill complete for ${mapping.bskyIdentifier}`,
+          backfillMappingId: undefined,
+          backfillRequestId: undefined,
+        });
+        console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
+      } else {
+        updateAppStatus({ backfillMappingId: undefined, backfillRequestId: undefined });
 
-    activeTasks.set(mapping.id, task);
-    return task; // Return task promise for await in main loop
+        // Pre-load processed IDs for optimization
+        const processedMap = loadProcessedTweets(mapping.bskyIdentifier);
+        const processedIds = new Set(Object.keys(processedMap));
+
+        for (const twitterUsername of mapping.twitterUsernames) {
+          try {
+            console.log(`[${twitterUsername}] 🏁 Starting check for new tweets...`);
+            updateAppStatus({
+              state: 'checking',
+              currentAccount: twitterUsername,
+              message: 'Fetching latest tweets...',
+              backfillMappingId: undefined,
+              backfillRequestId: undefined,
+            });
+
+            // Use fetchUserTweets with early stopping optimization
+            // Increase limit slightly since we have early stopping now
+            const tweets = await fetchUserTweets(twitterUsername, 50, processedIds);
+
+            if (!tweets || tweets.length === 0) {
+              console.log(`[${twitterUsername}] ℹ️ No tweets found (or fetch failed).`);
+              continue;
+            }
+
+            console.log(`[${twitterUsername}] 📥 Fetched ${tweets.length} tweets.`);
+            await processTweets(agent, twitterUsername, mapping.bskyIdentifier, tweets, dryRun);
+          } catch (err) {
+            console.error(`❌ Error checking ${twitterUsername}:`, err);
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`Error processing mapping ${mapping.bskyIdentifier}:`, err);
+    } finally {
+      activeTasks.delete(mapping.id);
+    }
+  })();
+
+  activeTasks.set(mapping.id, task);
+  return task; // Return task promise for await in main loop
 }
 
+import type { AccountMapping } from './config-manager.js';
 import {
-  startServer,
-  updateLastCheckTime,
-  getPendingBackfills,
   clearBackfill,
   getNextCheckTime,
+  getPendingBackfills,
+  startServer,
   updateAppStatus,
+  updateLastCheckTime,
 } from './server.js';
 import type { PendingBackfill } from './server.js';
-import { AccountMapping } from './config-manager.js';
 
 async function main(): Promise<void> {
   const program = new Command();
@@ -1655,7 +2025,9 @@ async function main(): Promise<void> {
       console.error('Twitter credentials not set. Cannot import history.');
       process.exit(1);
     }
-    const mapping = config.mappings.find(m => m.twitterUsernames.map(u => u.toLowerCase()).includes(options.username.toLowerCase()));
+    const mapping = config.mappings.find((m) =>
+      m.twitterUsernames.map((u) => u.toLowerCase()).includes(options.username.toLowerCase()),
+    );
     if (!mapping) {
       console.error(`No mapping found for ${options.username}`);
       process.exit(1);
@@ -1675,8 +2047,7 @@ async function main(): Promise<void> {
   // Concurrency limit for processing accounts
   const runLimit = pLimit(3);
 
-  const findMappingById = (mappings: AccountMapping[], id: string) =>
-    mappings.find((mapping) => mapping.id === id);
+  const findMappingById = (mappings: AccountMapping[], id: string) => mappings.find((mapping) => mapping.id === id);
 
   // Main loop
   while (true) {
@@ -1719,9 +2090,11 @@ async function main(): Promise<void> {
       for (const mapping of config.mappings) {
         if (!mapping.enabled) continue;
 
-        tasks.push(runLimit(async () => {
-          await runAccountTask(mapping, undefined, options.dryRun);
-        }));
+        tasks.push(
+          runLimit(async () => {
+            await runAccountTask(mapping, undefined, options.dryRun);
+          }),
+        );
       }
 
       if (tasks.length > 0) {
