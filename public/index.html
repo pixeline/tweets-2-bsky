@@ -93,7 +93,29 @@
         }
         
         .table > :not(caption) > * > * { padding: 1rem; }
-        
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            display: inline-block;
+            margin-right: 8px;
+            background: #10b981;
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+        }
+        .status-queued {
+            background: #f59e0b;
+            box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+        }
+        .status-active {
+            background: #10b981;
+            box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.15);
+        }
+        .status-backfilling {
+            background: #f97316;
+            box-shadow: 0 0 0 3px rgba(249, 115, 22, 0.18);
+        }
+
         .tweet-preview {
             max-width: 300px;
             white-space: nowrap;
@@ -213,8 +235,8 @@
 
             useEffect(() => {
                 if (view !== 'dashboard' || !token) return;
-                const statusTimer = setInterval(fetchStatus, 5000);
-                const activityTimer = setInterval(fetchActivity, 10000);
+                const statusTimer = setInterval(fetchStatus, 2000);
+                const activityTimer = setInterval(fetchActivity, 7000);
                 return () => {
                     clearInterval(statusTimer);
                     clearInterval(activityTimer);
@@ -327,7 +349,13 @@
                 }
             };
 
-            const runBackfill = async (id) => {
+            const runBackfill = async (id, label = 'Backfill') => {
+                const hasQueue = status.pendingBackfills && status.pendingBackfills.length > 0;
+                const isActiveBackfill = status.currentStatus?.state === 'backfilling';
+                if (hasQueue || isActiveBackfill) {
+                    const confirmMsg = `${label} is already running or queued. This will add a new request and replace any existing one for this account. Continue?`;
+                    if (!confirm(confirmMsg)) return;
+                }
                 const limit = prompt(`How many tweets to backfill per account?`, "15");
                 if (limit === null) return;
                 try {
@@ -349,6 +377,12 @@
             };
 
             const resetAndBackfill = async (id) => {
+                const hasQueue = status.pendingBackfills && status.pendingBackfills.length > 0;
+                const isActiveBackfill = status.currentStatus?.state === 'backfilling';
+                if (hasQueue || isActiveBackfill) {
+                    const confirmMsg = 'Backfill is already running or queued. This will add a new request and replace any existing one for this account. Continue?';
+                    if (!confirm(confirmMsg)) return;
+                }
                 const limit = prompt(`Reset cache and backfill how many tweets?`, "15");
                 if (limit === null) return;
                 try {
@@ -484,6 +518,9 @@
             }
 
             const isBackfillQueued = (id) => status.pendingBackfills?.some(b => (b.id || b) === id);
+            const backfillEntry = (id) => status.pendingBackfills?.find(b => (b.id || b) === id);
+            const activeBackfillId = status.currentStatus?.backfillMappingId;
+            const isBackfillActive = (id) => status.currentStatus?.state === 'backfilling' && activeBackfillId === id;
             
             // Check if configs are set to collapse by default
             const hasTwitterConfig = twitterConfig.authToken && twitterConfig.ct0;
@@ -601,8 +638,14 @@
                                                                 <td className="small text-muted fw-medium">{m.bskyIdentifier}</td>
                                                                 <td>
                                                                     <div className="d-flex align-items-center">
-                                                                        <span className={`status-dot ${isBackfillQueued(m.id) ? 'status-queued' : 'status-active'}`}></span>
-                                                                        <span className="badge bg-success bg-opacity-10 text-success border border-success border-opacity-10">{isBackfillQueued(m.id) ? 'Backfilling' : 'Active'}</span>
+                                                                        <span className={`status-dot ${isBackfillActive(m.id) ? 'status-backfilling' : (isBackfillQueued(m.id) ? 'status-queued' : 'status-active')}`}></span>
+                                                                        {isBackfillActive(m.id) ? (
+                                                                            <span className="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-10">Backfilling</span>
+                                                                        ) : isBackfillQueued(m.id) ? (
+                                                                            <span className="badge bg-warning bg-opacity-10 text-warning border border-warning border-opacity-10">Queued #{backfillEntry(m.id)?.position || ''}</span>
+                                                                        ) : (
+                                                                            <span className="badge bg-success bg-opacity-10 text-success border border-success border-opacity-10">Active</span>
+                                                                        )}
                                                                     </div>
                                                                 </td>
                                                                 <td className="text-end pe-4">
@@ -614,7 +657,7 @@
                                                                             {isAdmin && (
                                                                             <>
                                                                                 <li><button className="dropdown-item" onClick={() => setEditingMapping(m)}>Edit</button></li>
-                                                                                <li><button className="dropdown-item" onClick={() => runBackfill(m.id)}>Backfill History</button></li>
+                                                                                <li><button className="dropdown-item" onClick={() => runBackfill(m.id, 'Backfill')}>Backfill History</button></li>
                                                                                 <li><button className="dropdown-item text-warning" onClick={() => resetAndBackfill(m.id)}>Reset Cache & Backfill</button></li>
                                                                                 <li><button className="dropdown-item text-danger fw-bold" onClick={() => deleteAllPosts(m.id)}>Danger: Delete All Posts</button></li>
                                                                                 <li><hr className="dropdown-divider"/></li>

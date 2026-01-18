@@ -18,11 +18,15 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 // In-memory state for triggers and scheduling
 let lastCheckTime = Date.now();
 let nextCheckTime = Date.now() + (getConfig().checkIntervalMinutes || 5) * 60 * 1000;
-interface PendingBackfill {
+export interface PendingBackfill {
   id: string;
   limit?: number;
+  queuedAt: number;
+  sequence: number;
+  requestId: string;
 }
 let pendingBackfills: PendingBackfill[] = [];
+let backfillSequence = 0;
 
 interface AppStatus {
   state: 'idle' | 'checking' | 'backfilling' | 'pacing' | 'processing';
@@ -30,6 +34,8 @@ interface AppStatus {
   processedCount?: number;
   totalCount?: number;
   message?: string;
+  backfillMappingId?: string;
+  backfillRequestId?: string;
   lastUpdate: number;
 }
 
@@ -285,7 +291,13 @@ app.get('/api/status', authenticateToken, (_req, res) => {
     nextCheckTime,
     nextCheckMinutes: Math.ceil(nextRunMs / 60000),
     checkIntervalMinutes: config.checkIntervalMinutes,
-    pendingBackfills,
+    pendingBackfills: pendingBackfills
+      .slice()
+      .sort((a, b) => a.sequence - b.sequence)
+      .map((backfill, index) => ({
+        ...backfill,
+        position: index + 1,
+      })),
     currentStatus: currentAppStatus,
   });
 });
@@ -307,12 +319,25 @@ app.post('/api/backfill/:id', authenticateToken, requireAdmin, (req, res) => {
     return;
   }
 
-  if (!pendingBackfills.find((b) => b.id === id)) {
-    pendingBackfills.push({ id, limit: limit ? Number(limit) : undefined });
-  }
+  const queuedAt = Date.now();
+  const sequence = backfillSequence++;
+  const requestId = Math.random().toString(36).slice(2);
+  pendingBackfills = pendingBackfills.filter((b) => b.id !== id);
+  pendingBackfills.push({
+    id,
+    limit: limit ? Number(limit) : undefined,
+    queuedAt,
+    sequence,
+    requestId,
+  });
+  pendingBackfills.sort((a, b) => a.sequence - b.sequence);
 
   // Do not force a global run; the scheduler loop will pick up the pending backfill in ~5s
-  res.json({ success: true, message: `Backfill queued for @${mapping.twitterUsernames.join(', ')}` });
+  res.json({
+    success: true,
+    message: `Backfill queued for @${mapping.twitterUsernames.join(', ')}`,
+    requestId,
+  });
 });
 
 app.delete('/api/backfill/:id', authenticateToken, (req, res) => {
@@ -323,6 +348,12 @@ app.delete('/api/backfill/:id', authenticateToken, (req, res) => {
 
 app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res) => {
   pendingBackfills = [];
+  updateAppStatus({
+    state: 'idle',
+    message: 'All backfills cleared',
+    backfillMappingId: undefined,
+    backfillRequestId: undefined,
+  });
   res.json({ success: true, message: 'All backfills cleared' });
 });
 
@@ -392,14 +423,18 @@ export function updateAppStatus(status: Partial<AppStatus>) {
 }
 
 export function getPendingBackfills(): PendingBackfill[] {
-  return [...pendingBackfills];
+  return [...pendingBackfills].sort((a, b) => a.sequence - b.sequence);
 }
 
 export function getNextCheckTime(): number {
   return nextCheckTime;
 }
 
-export function clearBackfill(id: string) {
+export function clearBackfill(id: string, requestId?: string) {
+  if (requestId) {
+    pendingBackfills = pendingBackfills.filter((bid) => !(bid.id === id && bid.requestId === requestId));
+    return;
+  }
   pendingBackfills = pendingBackfills.filter((bid) => bid.id !== id);
 }
 

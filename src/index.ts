@@ -1422,7 +1422,14 @@ async function processTweets(
 
 import { getAgent } from './bsky.js';
 
-async function importHistory(twitterUsername: string, bskyIdentifier: string, limit = 15, dryRun = false, ignoreCancellation = false): Promise<void> {
+async function importHistory(
+  twitterUsername: string,
+  bskyIdentifier: string,
+  limit = 15,
+  dryRun = false,
+  ignoreCancellation = false,
+  requestId?: string,
+): Promise<void> {
   const config = getConfig();
   const mapping = config.mappings.find((m) => m.twitterUsernames.map(u => u.toLowerCase()).includes(twitterUsername.toLowerCase()));
   if (!mapping) {
@@ -1468,11 +1475,12 @@ async function importHistory(twitterUsername: string, bskyIdentifier: string, li
           
           for await (const scraperTweet of generator) {
               if (!ignoreCancellation) {
-                  const stillPending = getPendingBackfills().some(b => b.id === mapping.id);
-                  if (!stillPending) {
-                      console.log(`[${twitterUsername}] 🛑 Backfill cancelled.`);
-                      break;
-                  }
+                const stillPending = getPendingBackfills().some(b => b.id === mapping.id && (!requestId || b.requestId === requestId));
+                if (!stillPending) {
+                    console.log(`[${twitterUsername}] 🛑 Backfill cancelled.`);
+                    break;
+                }
+
               }
 
               const t = mapScraperTweetToLocalTweet(scraperTweet);
@@ -1501,7 +1509,7 @@ async function importHistory(twitterUsername: string, bskyIdentifier: string, li
 // Task management
 const activeTasks = new Map<string, Promise<void>>();
 
-async function runAccountTask(mapping: AccountMapping, forceBackfill = false, dryRun = false) {
+async function runAccountTask(mapping: AccountMapping, backfillRequest?: PendingBackfill, dryRun = false) {
     if (activeTasks.has(mapping.id)) return; // Already running
 
     const task = (async () => {
@@ -1509,23 +1517,52 @@ async function runAccountTask(mapping: AccountMapping, forceBackfill = false, dr
             const agent = await getAgent(mapping);
             if (!agent) return;
 
-            const backfillReq = getPendingBackfills().find(b => b.id === mapping.id);
+            const backfillReq = backfillRequest ?? getPendingBackfills().find(b => b.id === mapping.id);
             
-            if (forceBackfill || backfillReq) {
-                const limit = backfillReq?.limit || 15;
+            if (backfillReq) {
+                const limit = backfillReq.limit || 15;
                 console.log(`[${mapping.bskyIdentifier}] Running backfill for ${mapping.twitterUsernames.length} accounts (limit ${limit})...`);
+                updateAppStatus({
+                    state: 'backfilling',
+                    currentAccount: mapping.twitterUsernames[0],
+                    message: `Starting backfill (limit ${limit})...`,
+                    backfillMappingId: mapping.id,
+                    backfillRequestId: backfillReq.requestId,
+                });
                 
                 for (const twitterUsername of mapping.twitterUsernames) {
+                    const stillPending = getPendingBackfills().some(
+                        (b) => b.id === mapping.id && b.requestId === backfillReq.requestId,
+                    );
+                    if (!stillPending) {
+                        console.log(`[${mapping.bskyIdentifier}] 🛑 Backfill request replaced; stopping.`);
+                        break;
+                    }
+
                     try {
-                        updateAppStatus({ state: 'backfilling', currentAccount: twitterUsername, message: `Starting backfill (limit ${limit})...` });
-                        await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun);
+                        updateAppStatus({
+                            state: 'backfilling',
+                            currentAccount: twitterUsername,
+                            message: `Starting backfill (limit ${limit})...`,
+                            backfillMappingId: mapping.id,
+                            backfillRequestId: backfillReq.requestId,
+                        });
+                        await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId);
                     } catch (err) {
                         console.error(`❌ Error backfilling ${twitterUsername}:`, err);
                     }
                 }
-                clearBackfill(mapping.id);
+                clearBackfill(mapping.id, backfillReq.requestId);
+                updateAppStatus({
+                    state: 'idle',
+                    message: `Backfill complete for ${mapping.bskyIdentifier}`,
+                    backfillMappingId: undefined,
+                    backfillRequestId: undefined,
+                });
                 console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
             } else {
+                updateAppStatus({ backfillMappingId: undefined, backfillRequestId: undefined });
+
                 // Pre-load processed IDs for optimization
                 const processedMap = loadProcessedTweets(mapping.bskyIdentifier);
                 const processedIds = new Set(Object.keys(processedMap));
@@ -1533,7 +1570,13 @@ async function runAccountTask(mapping: AccountMapping, forceBackfill = false, dr
                 for (const twitterUsername of mapping.twitterUsernames) {
                     try {
                         console.log(`[${twitterUsername}] 🏁 Starting check for new tweets...`);
-                        updateAppStatus({ state: 'checking', currentAccount: twitterUsername, message: 'Fetching latest tweets...' });
+                        updateAppStatus({
+                            state: 'checking',
+                            currentAccount: twitterUsername,
+                            message: 'Fetching latest tweets...',
+                            backfillMappingId: undefined,
+                            backfillRequestId: undefined,
+                        });
                         
                         // Use fetchUserTweets with early stopping optimization
                         // Increase limit slightly since we have early stopping now
@@ -1570,6 +1613,7 @@ import {
   getNextCheckTime,
   updateAppStatus,
 } from './server.js';
+import type { PendingBackfill } from './server.js';
 import { AccountMapping } from './config-manager.js';
 
 async function main(): Promise<void> {
@@ -1631,44 +1675,65 @@ async function main(): Promise<void> {
   // Concurrency limit for processing accounts
   const runLimit = pLimit(3);
 
+  const findMappingById = (mappings: AccountMapping[], id: string) =>
+    mappings.find((mapping) => mapping.id === id);
+
   // Main loop
   while (true) {
     const now = Date.now();
     const config = getConfig(); // Reload config to get new mappings/settings
     const nextTime = getNextCheckTime();
-    
+
     // Check if it's time for a scheduled run OR if we have pending backfills
     const isScheduledRun = now >= nextTime;
     const pendingBackfills = getPendingBackfills();
-    
+
     if (isScheduledRun) {
-        console.log(`[${new Date().toISOString()}] ⏰ Scheduled check triggered.`);
-        updateLastCheckTime();
+      console.log(`[${new Date().toISOString()}] ⏰ Scheduled check triggered.`);
+      updateLastCheckTime();
     }
 
     const tasks: Promise<void>[] = [];
 
-    for (const mapping of config.mappings) {
-        if (!mapping.enabled) continue;
-        
-        const hasPendingBackfill = pendingBackfills.some(b => b.id === mapping.id);
-        
-        // Run if scheduled OR backfill requested
-        if (isScheduledRun || hasPendingBackfill) {
-            // Queue task with concurrency limit
-            tasks.push(runLimit(async () => {
-                await runAccountTask(mapping, hasPendingBackfill, options.dryRun);
-            }));
+    if (pendingBackfills.length > 0) {
+      const [nextBackfill, ...rest] = pendingBackfills;
+      if (nextBackfill) {
+        const mapping = findMappingById(config.mappings, nextBackfill.id);
+        if (mapping && mapping.enabled) {
+          console.log(`[Scheduler] 🚧 Backfill priority: ${mapping.bskyIdentifier}`);
+          await runAccountTask(mapping, nextBackfill, options.dryRun);
+        } else {
+          clearBackfill(nextBackfill.id, nextBackfill.requestId);
         }
-    }
+      }
+      if (pendingBackfills.length === 0 && getPendingBackfills().length === 0) {
+        updateAppStatus({
+          state: 'idle',
+          message: 'Backfill queue empty',
+          backfillMappingId: undefined,
+          backfillRequestId: undefined,
+        });
+      }
+      nextCheckTime = Date.now() + (config.checkIntervalMinutes || 5) * 60 * 1000;
+    } else if (isScheduledRun) {
+      for (const mapping of config.mappings) {
+        if (!mapping.enabled) continue;
 
-    if (tasks.length > 0) {
+        tasks.push(runLimit(async () => {
+          await runAccountTask(mapping, undefined, options.dryRun);
+        }));
+      }
+
+      if (tasks.length > 0) {
         await Promise.all(tasks);
         console.log(`[Scheduler] ✅ All tasks for this cycle complete.`);
+      }
+
+      updateAppStatus({ state: 'idle', message: 'Scheduled checks complete' });
     }
-    
+
     // Sleep for 5 seconds
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 }
 
