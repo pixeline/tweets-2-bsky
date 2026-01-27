@@ -545,6 +545,59 @@ function addTextFallbacks(text: string): string {
   return text.replace(/\s+$/g, '').trim();
 }
 
+function getTweetText(tweet: Tweet): string {
+  return tweet.full_text || tweet.text || '';
+}
+
+function normalizeContextText(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function addTweetsToMap(tweetMap: Map<string, Tweet>, tweets: Tweet[]): void {
+  for (const tweet of tweets) {
+    const tweetId = tweet.id_str || tweet.id;
+    if (!tweetId) continue;
+    tweetMap.set(String(tweetId), tweet);
+  }
+}
+
+function buildThreadContext(tweet: Tweet, tweetMap: Map<string, Tweet>, maxHops = 8): string {
+  const parts: string[] = [];
+  const visited = new Set<string>();
+  let current: Tweet | undefined = tweet;
+
+  for (let hops = 0; hops < maxHops; hops++) {
+    const parentId = current?.in_reply_to_status_id_str || current?.in_reply_to_status_id;
+    if (!parentId) break;
+    const parentKey = String(parentId);
+    if (visited.has(parentKey)) break;
+    visited.add(parentKey);
+
+    const parentTweet = tweetMap.get(parentKey);
+    if (!parentTweet) break;
+
+    const parentText = normalizeContextText(getTweetText(parentTweet));
+    if (parentText) parts.push(parentText);
+
+    current = parentTweet;
+  }
+
+  if (parts.length === 0) return '';
+  return parts.reverse().join(' | ');
+}
+
+function buildAltTextContext(tweet: Tweet, tweetText: string, tweetMap: Map<string, Tweet>): string {
+  const threadContext = buildThreadContext(tweet, tweetMap);
+  const currentText = normalizeContextText(tweetText);
+
+  if (threadContext && currentText) {
+    return `Thread above: ${threadContext}. Current tweet: ${currentText}`;
+  }
+
+  if (threadContext) return `Thread above: ${threadContext}.`;
+  return currentText;
+}
+
 async function fetchSyndicationMedia(tweetUrl: string): Promise<{ images: string[] }> {
   try {
     const normalized = tweetUrl.replace('twitter.com', 'x.com');
@@ -1252,6 +1305,7 @@ async function processTweets(
   tweets: Tweet[],
   dryRun = false,
   sharedProcessedMap?: ProcessedTweetsMap,
+  sharedTweetMap?: Map<string, Tweet>,
 ): Promise<void> {
   // Filter tweets to ensure they're actually from this user
   const filteredTweets = tweets.filter((t) => {
@@ -1264,6 +1318,9 @@ async function processTweets(
     }
     return true;
   });
+
+  const tweetMap = sharedTweetMap ?? new Map<string, Tweet>();
+  addTweetsToMap(tweetMap, filteredTweets);
 
   // Maintain a local map that updates in real-time for intra-batch replies
   const localProcessedMap: ProcessedTweetsMap =
@@ -1355,8 +1412,17 @@ async function processTweets(
 
               if (parentAuthor?.toLowerCase() === twitterUsername.toLowerCase()) {
                 console.log(`[${twitterUsername}] 🔄 Parent is ours (@${parentAuthor}). Backfilling parent first...`);
+                addTweetsToMap(tweetMap, [parentTweet]);
                 // Recursively process the parent
-                await processTweets(agent, twitterUsername, bskyIdentifier, [parentTweet], dryRun, localProcessedMap);
+                await processTweets(
+                  agent,
+                  twitterUsername,
+                  bskyIdentifier,
+                  [parentTweet],
+                  dryRun,
+                  localProcessedMap,
+                  tweetMap,
+                );
 
                 // Check if it was saved
                 const savedParent = dbService.getTweet(replyStatusId, bskyIdentifier);
@@ -1407,6 +1473,8 @@ async function processTweets(
     }
 
     // Removed early dryRun continue to allow verifying logic
+
+    const altTextContext = buildAltTextContext(tweet, tweetText, tweetMap);
 
     let text = tweetText
       .replace(/&amp;/g, '&')
@@ -1502,7 +1570,7 @@ async function processTweets(
           if (!altText) {
             console.log(`[${twitterUsername}] 🤖 Generating alt text via Gemini...`);
             // Use original tweet text for context, not the modified/cleaned one
-            altText = await generateAltText(buffer, mimeType, tweetText);
+            altText = await generateAltText(buffer, mimeType, altTextContext);
             if (altText) console.log(`[${twitterUsername}] ✅ Alt text generated: ${altText.substring(0, 50)}...`);
           }
 

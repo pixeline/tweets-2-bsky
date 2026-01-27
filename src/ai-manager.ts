@@ -81,10 +81,10 @@ function buildAltTextPrompt(contextText: string): string {
       : normalized;
 
   return [
-    'Write alt text (1-2 sentences).',
+    'Write one alt text description (1-2 sentences).',
     'Describe only what is visible.',
-    'Use context to identify people/places/objects if relevant.',
-    'Include key names for search.',
+    'Use context to identify people/places/objects if relevant for search.',
+    'Return only the alt text with no labels, quotes, or options.',
     'No hashtags or emojis.',
     `Context: "${trimmed}"`,
   ].join(' ');
