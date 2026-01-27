@@ -43,13 +43,14 @@ export async function generateAltText(
   }
 
   try {
+    const prompt = buildAltTextPrompt(contextText);
     switch (provider) {
       case 'gemini':
         // apiKey is guaranteed by check above
-        return await callGemini(apiKey!, model || 'models/gemini-2.5-flash', buffer, mimeType, contextText);
+        return await callGemini(apiKey!, model || 'models/gemini-2.5-flash', buffer, mimeType, prompt);
       case 'openai':
       case 'custom':
-        return await callOpenAICompatible(apiKey, model || 'gpt-4o', baseUrl, buffer, mimeType, contextText);
+        return await callOpenAICompatible(apiKey, model || 'gpt-4o', baseUrl, buffer, mimeType, prompt);
       case 'anthropic':
         // apiKey is guaranteed by check above
         return await callAnthropic(
@@ -58,7 +59,7 @@ export async function generateAltText(
           baseUrl,
           buffer,
           mimeType,
-          contextText,
+          prompt,
         );
       default:
         console.warn(`[AI] ⚠️ Unknown provider: ${provider}`);
@@ -70,19 +71,34 @@ export async function generateAltText(
   }
 }
 
+const ALT_TEXT_CONTEXT_MAX_CHARS = 400;
+
+function buildAltTextPrompt(contextText: string): string {
+  const normalized = contextText.replace(/\s+/g, ' ').trim();
+  const trimmed =
+    normalized.length > ALT_TEXT_CONTEXT_MAX_CHARS
+      ? `${normalized.slice(0, ALT_TEXT_CONTEXT_MAX_CHARS).trim()}...`
+      : normalized;
+
+  return [
+    'Write alt text (1-2 sentences).',
+    'Describe only what is visible.',
+    'Use context to identify people/places/objects if relevant.',
+    'Include key names for search.',
+    'No hashtags or emojis.',
+    `Context: "${trimmed}"`,
+  ].join(' ');
+}
+
 async function callGemini(
   apiKey: string,
   modelName: string,
   buffer: Buffer,
   mimeType: string,
-  contextText: string,
+  prompt: string,
 ): Promise<string | undefined> {
   const genAI = new GoogleGenerativeAI(apiKey);
   const model = genAI.getGenerativeModel({ model: modelName });
-
-  const prompt = `Describe this image for alt text. Be concise but descriptive. 
-    Context from the tweet text: "${contextText}". 
-    Use the context to identify specific people, objects, or context mentioned, but describe what is visually present in the image.`;
 
   const result = await model.generateContent([
     prompt,
@@ -103,7 +119,7 @@ async function callOpenAICompatible(
   baseUrl: string | undefined,
   buffer: Buffer,
   mimeType: string,
-  contextText: string,
+  prompt: string,
 ): Promise<string | undefined> {
   const url = baseUrl
     ? `${baseUrl.replace(/\/+$/, '')}/chat/completions`
@@ -119,7 +135,7 @@ async function callOpenAICompatible(
         content: [
           {
             type: 'text',
-            text: `Describe this image for alt text. Be concise but descriptive. Context from the tweet text: "${contextText}".`,
+            text: prompt,
           },
           {
             type: 'image_url',
@@ -158,7 +174,7 @@ async function callAnthropic(
   baseUrl: string | undefined,
   buffer: Buffer,
   mimeType: string,
-  contextText: string,
+  prompt: string,
 ): Promise<string | undefined> {
   const url = baseUrl ? `${baseUrl.replace(/\/+$/, '')}/v1/messages` : 'https://api.anthropic.com/v1/messages';
 
@@ -181,7 +197,7 @@ async function callAnthropic(
           },
           {
             type: 'text',
-            text: `Describe this image for alt text. Be concise but descriptive. Context from the tweet text: "${contextText}".`,
+            text: prompt,
           },
         ],
       },
