@@ -106,8 +106,11 @@ function normalizeAltTextOutput(output: string | undefined): string | undefined 
   cleaned = cleaned.replace(/^["'“”]+|["'“”]+$/g, '').trim();
   cleaned = cleaned.replace(/^(alt\s*text|description)\s*[:\-]\s*/i, '').trim();
 
-  const lines = cleaned.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length > 0) cleaned = lines[0];
+  const lines = cleaned
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line): line is string => Boolean(line));
+  if (lines.length > 0) cleaned = lines[0] ?? '';
 
   cleaned = cleaned.replace(/^option\s*\d+\s*[:\-]\s*/i, '').trim();
   cleaned = cleaned.replace(/^[\-\*\d\.\)]+\s*/g, '').trim();
