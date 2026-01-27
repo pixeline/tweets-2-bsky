@@ -1199,6 +1199,7 @@ async function processTweets(
   bskyIdentifier: string,
   tweets: Tweet[],
   dryRun = false,
+  sharedProcessedMap?: ProcessedTweetsMap,
 ): Promise<void> {
   // Filter tweets to ensure they're actually from this user
   const filteredTweets = tweets.filter((t) => {
@@ -1212,10 +1213,9 @@ async function processTweets(
     return true;
   });
 
-  const processedTweets = loadProcessedTweets(bskyIdentifier);
-
   // Maintain a local map that updates in real-time for intra-batch replies
-  const localProcessedMap: ProcessedTweetsMap = { ...processedTweets };
+  const localProcessedMap: ProcessedTweetsMap =
+    sharedProcessedMap ?? { ...loadProcessedTweets(bskyIdentifier) };
 
   const toProcess = filteredTweets.filter((t) => !localProcessedMap[t.id_str || t.id || '']);
 
@@ -1234,6 +1234,26 @@ async function processTweets(
     if (!tweetId) continue;
 
     if (localProcessedMap[tweetId]) continue;
+
+    // Fallback to DB in case a nested backfill already saved this tweet.
+    const dbRecord = dbService.getTweet(tweetId, bskyIdentifier);
+    if (dbRecord) {
+      localProcessedMap[tweetId] = {
+        uri: dbRecord.bsky_uri,
+        cid: dbRecord.bsky_cid,
+        root:
+          dbRecord.bsky_root_uri && dbRecord.bsky_root_cid
+            ? { uri: dbRecord.bsky_root_uri, cid: dbRecord.bsky_root_cid }
+            : undefined,
+        tail:
+          dbRecord.bsky_tail_uri && dbRecord.bsky_tail_cid
+            ? { uri: dbRecord.bsky_tail_uri, cid: dbRecord.bsky_tail_cid }
+            : undefined,
+        migrated: dbRecord.status === 'migrated',
+        skipped: dbRecord.status === 'skipped',
+      };
+      continue;
+    }
 
     const isRetweet = tweet.isRetweet || tweet.retweeted_status_id_str || tweet.text?.startsWith('RT @');
 
@@ -1284,7 +1304,7 @@ async function processTweets(
               if (parentAuthor?.toLowerCase() === twitterUsername.toLowerCase()) {
                 console.log(`[${twitterUsername}] 🔄 Parent is ours (@${parentAuthor}). Backfilling parent first...`);
                 // Recursively process the parent
-                await processTweets(agent, twitterUsername, bskyIdentifier, [parentTweet], dryRun);
+                await processTweets(agent, twitterUsername, bskyIdentifier, [parentTweet], dryRun, localProcessedMap);
 
                 // Check if it was saved
                 const savedParent = dbService.getTweet(replyStatusId, bskyIdentifier);
