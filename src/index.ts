@@ -2041,18 +2041,26 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
 
       if (backfillReq) {
         const limit = backfillReq.limit || 15;
+        const accountCount = mapping.twitterUsernames.length;
+        const estimatedTotalTweets = accountCount * limit;
         console.log(
           `[${mapping.bskyIdentifier}] Running backfill for ${mapping.twitterUsernames.length} accounts (limit ${limit})...`,
         );
         updateAppStatus({
           state: 'backfilling',
           currentAccount: mapping.twitterUsernames[0],
-          message: `Starting backfill (limit ${limit})...`,
+          processedCount: 0,
+          totalCount: accountCount,
+          message: `Backfill queued for ${accountCount} account(s), up to ${estimatedTotalTweets} tweets`,
           backfillMappingId: mapping.id,
           backfillRequestId: backfillReq.requestId,
         });
 
-        for (const twitterUsername of mapping.twitterUsernames) {
+        for (let i = 0; i < mapping.twitterUsernames.length; i += 1) {
+          const twitterUsername = mapping.twitterUsernames[i];
+          if (!twitterUsername) {
+            continue;
+          }
           const stillPending = explicitBackfill
             ? true
             : getPendingBackfills().some((b) => b.id === mapping.id && b.requestId === backfillReq.requestId);
@@ -2065,11 +2073,22 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
             updateAppStatus({
               state: 'backfilling',
               currentAccount: twitterUsername,
-              message: `Starting backfill (limit ${limit})...`,
+              processedCount: i,
+              totalCount: accountCount,
+              message: `Backfill ${i + 1}/${accountCount}: @${twitterUsername} (limit ${limit})`,
               backfillMappingId: mapping.id,
               backfillRequestId: backfillReq.requestId,
             });
             await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId);
+            updateAppStatus({
+              state: 'backfilling',
+              currentAccount: twitterUsername,
+              processedCount: i + 1,
+              totalCount: accountCount,
+              message: `Completed ${i + 1}/${accountCount} for ${mapping.bskyIdentifier}`,
+              backfillMappingId: mapping.id,
+              backfillRequestId: backfillReq.requestId,
+            });
           } catch (err) {
             console.error(`❌ Error backfilling ${twitterUsername}:`, err);
           }
@@ -2077,6 +2096,8 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
         clearBackfill(mapping.id, backfillReq.requestId);
         updateAppStatus({
           state: 'idle',
+          processedCount: accountCount,
+          totalCount: accountCount,
           message: `Backfill complete for ${mapping.bskyIdentifier}`,
           backfillMappingId: undefined,
           backfillRequestId: undefined,
@@ -2263,6 +2284,7 @@ async function main(): Promise<void> {
 
   // Concurrency limit for processing accounts
   const runLimit = pLimit(3);
+  let deferredScheduledRun = false;
 
   // Main loop
   while (true) {
@@ -2270,38 +2292,63 @@ async function main(): Promise<void> {
     const config = getConfig(); // Reload config to get new mappings/settings
     const nextTime = getNextCheckTime();
 
-    // Check if it's time for a scheduled run OR if we have pending backfills
-    const isScheduledRun = now >= nextTime;
+    const isScheduledRunDue = now >= nextTime;
     const pendingBackfills = getPendingBackfills();
+    const shouldRunScheduledCycle = isScheduledRunDue || (deferredScheduledRun && pendingBackfills.length === 0);
 
-    if (isScheduledRun) {
-      console.log(`[${new Date().toISOString()}] ⏰ Scheduled check triggered.`);
-      updateLastCheckTime();
+    if (isScheduledRunDue && pendingBackfills.length > 0) {
+      deferredScheduledRun = true;
     }
 
-    const tasks: Promise<void>[] = [];
-
     if (pendingBackfills.length > 0) {
-      const [nextBackfill, ...rest] = pendingBackfills;
+      const estimatedPendingTweets = pendingBackfills.reduce((total, backfill) => {
+        const mapping = findMappingById(config.mappings, backfill.id);
+        const accountCount = mapping ? Math.max(1, mapping.twitterUsernames.length) : 1;
+        const limit = backfill.limit || 15;
+        return total + accountCount * limit;
+      }, 0);
+
+      updateAppStatus({
+        state: 'backfilling',
+        message: `Backfill queue priority: ${pendingBackfills.length} job(s), ~${estimatedPendingTweets} tweets pending`,
+      });
+
+      const [nextBackfill] = pendingBackfills;
       if (nextBackfill) {
         const mapping = findMappingById(config.mappings, nextBackfill.id);
         if (mapping && mapping.enabled) {
-          console.log(`[Scheduler] 🚧 Backfill priority: ${mapping.bskyIdentifier}`);
+          const limit = nextBackfill.limit || 15;
+          console.log(
+            `[Scheduler] 🚧 Backfill priority 1/${pendingBackfills.length}: ${mapping.bskyIdentifier} (limit ${limit})`,
+          );
           await runAccountTask(mapping, nextBackfill, options.dryRun);
         } else {
           clearBackfill(nextBackfill.id, nextBackfill.requestId);
         }
       }
-      if (pendingBackfills.length === 0 && getPendingBackfills().length === 0) {
+
+      const remainingBackfills = getPendingBackfills();
+      if (remainingBackfills.length === 0) {
         updateAppStatus({
           state: 'idle',
-          message: 'Backfill queue empty',
+          message: deferredScheduledRun || isScheduledRunDue ? 'Backfill queue complete. Scheduled checks next.' : 'Backfill queue empty',
           backfillMappingId: undefined,
           backfillRequestId: undefined,
         });
       }
+
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    } else if (shouldRunScheduledCycle) {
+      console.log(
+        deferredScheduledRun && !isScheduledRunDue
+          ? `[${new Date().toISOString()}] ⏰ Running deferred scheduled checks after backfill queue.`
+          : `[${new Date().toISOString()}] ⏰ Scheduled check triggered.`,
+      );
+
+      deferredScheduledRun = false;
       updateLastCheckTime();
-    } else if (isScheduledRun) {
+
+      const tasks: Promise<void>[] = [];
       for (const mapping of config.mappings) {
         if (!mapping.enabled) continue;
 
@@ -2315,6 +2362,8 @@ async function main(): Promise<void> {
       if (tasks.length > 0) {
         await Promise.all(tasks);
         console.log(`[Scheduler] ✅ All tasks for this cycle complete.`);
+      } else {
+        console.log('[Scheduler] ℹ️ No enabled mappings found for scheduled cycle.');
       }
 
       updateAppStatus({ state: 'idle', message: 'Scheduled checks complete' });

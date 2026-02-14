@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execSync, spawn } from 'node:child_process';
 import axios from 'axios';
 import bcrypt from 'bcryptjs';
 import cors from 'cors';
@@ -17,13 +18,18 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
-const WEB_DIST_DIR = path.join(__dirname, '..', 'web', 'dist');
-const LEGACY_PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const APP_ROOT_DIR = path.join(__dirname, '..');
+const WEB_DIST_DIR = path.join(APP_ROOT_DIR, 'web', 'dist');
+const LEGACY_PUBLIC_DIR = path.join(APP_ROOT_DIR, 'public');
+const PACKAGE_JSON_PATH = path.join(APP_ROOT_DIR, 'package.json');
+const UPDATE_SCRIPT_PATH = path.join(APP_ROOT_DIR, 'update.sh');
+const UPDATE_LOG_DIR = path.join(APP_ROOT_DIR, 'data');
 const staticAssetsDir = fs.existsSync(path.join(WEB_DIST_DIR, 'index.html')) ? WEB_DIST_DIR : LEGACY_PUBLIC_DIR;
 const BSKY_APPVIEW_URL = process.env.BSKY_APPVIEW_URL || 'https://public.api.bsky.app';
 const POST_VIEW_CACHE_TTL_MS = 60_000;
 const PROFILE_CACHE_TTL_MS = 5 * 60_000;
 const RESERVED_UNGROUPED_KEY = 'ungrouped';
+const SERVER_STARTED_AT = Date.now();
 
 interface CacheEntry<T> {
   value: T;
@@ -86,6 +92,36 @@ interface LocalPostSearchResult {
   postUrl?: string;
   twitterUrl?: string;
   score: number;
+}
+
+interface RuntimeVersionInfo {
+  version: string;
+  commit?: string;
+  branch?: string;
+  startedAt: number;
+}
+
+interface UpdateJobState {
+  running: boolean;
+  pid?: number;
+  startedAt?: number;
+  startedBy?: string;
+  finishedAt?: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  logFile?: string;
+}
+
+interface UpdateStatusPayload {
+  running: boolean;
+  pid?: number;
+  startedAt?: number;
+  startedBy?: string;
+  finishedAt?: number;
+  exitCode?: number | null;
+  signal?: NodeJS.Signals | null;
+  logFile?: string;
+  logTail: string[];
 }
 
 const postViewCache = new Map<string, CacheEntry<any>>();
@@ -157,6 +193,61 @@ function ensureGroupExists(config: AppConfig, name?: string, emoji?: string) {
       name: existingGroupName,
       emoji: normalizedEmoji,
     };
+  }
+}
+
+function safeExec(command: string, cwd = APP_ROOT_DIR): string | undefined {
+  try {
+    return execSync(command, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+function getRuntimeVersionInfo(): RuntimeVersionInfo {
+  let version = 'unknown';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, 'utf8'));
+    if (typeof pkg?.version === 'string' && pkg.version.trim().length > 0) {
+      version = pkg.version.trim();
+    }
+  } catch {
+    // Ignore parse/read failures and keep fallback.
+  }
+
+  return {
+    version,
+    commit: safeExec('git rev-parse --short HEAD'),
+    branch: safeExec('git rev-parse --abbrev-ref HEAD'),
+    startedAt: SERVER_STARTED_AT,
+  };
+}
+
+function isProcessAlive(pid?: number): boolean {
+  if (!pid || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readLogTail(logFile?: string, maxLines = 30): string[] {
+  if (!logFile || !fs.existsSync(logFile)) {
+    return [];
+  }
+
+  try {
+    const raw = fs.readFileSync(logFile, 'utf8');
+    const lines = raw.split(/\r?\n/).filter((line) => line.length > 0);
+    return lines.slice(-maxLines);
+  } catch {
+    return [];
   }
 }
 
@@ -388,6 +479,10 @@ let currentAppStatus: AppStatus = {
   lastUpdate: Date.now(),
 };
 
+let updateJobState: UpdateJobState = {
+  running: false,
+};
+
 app.use(cors());
 app.use(express.json());
 
@@ -414,6 +509,101 @@ const requireAdmin = (req: any, res: any, next: any) => {
   }
   next();
 };
+
+function reconcileUpdateJobState() {
+  if (!updateJobState.running) {
+    return;
+  }
+
+  if (isProcessAlive(updateJobState.pid)) {
+    return;
+  }
+
+  updateJobState = {
+    ...updateJobState,
+    running: false,
+    finishedAt: updateJobState.finishedAt || Date.now(),
+    exitCode: updateJobState.exitCode ?? null,
+    signal: updateJobState.signal ?? null,
+  };
+}
+
+function getUpdateStatusPayload(): UpdateStatusPayload {
+  reconcileUpdateJobState();
+  return {
+    ...updateJobState,
+    logTail: readLogTail(updateJobState.logFile),
+  };
+}
+
+function startUpdateJob(startedBy: string): { ok: true; state: UpdateStatusPayload } | { ok: false; message: string } {
+  reconcileUpdateJobState();
+
+  if (updateJobState.running) {
+    return { ok: false, message: 'Update already running.' };
+  }
+
+  if (!fs.existsSync(UPDATE_SCRIPT_PATH)) {
+    return { ok: false, message: 'update.sh not found in app root.' };
+  }
+
+  fs.mkdirSync(UPDATE_LOG_DIR, { recursive: true });
+  const logFile = path.join(UPDATE_LOG_DIR, `update-${Date.now()}.log`);
+  const logFd = fs.openSync(logFile, 'a');
+  fs.writeSync(logFd, `[${new Date().toISOString()}] Update requested by ${startedBy}\n`);
+
+  try {
+    const child = spawn('bash', [UPDATE_SCRIPT_PATH], {
+      cwd: APP_ROOT_DIR,
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env: process.env,
+    });
+
+    updateJobState = {
+      running: true,
+      pid: child.pid,
+      startedAt: Date.now(),
+      startedBy,
+      logFile,
+      finishedAt: undefined,
+      exitCode: undefined,
+      signal: undefined,
+    };
+
+    child.on('error', (error) => {
+      fs.appendFileSync(logFile, `[${new Date().toISOString()}] Failed to launch updater: ${error.message}\n`);
+      updateJobState = {
+        ...updateJobState,
+        running: false,
+        finishedAt: Date.now(),
+        exitCode: 1,
+      };
+    });
+
+    child.on('exit', (code, signal) => {
+      const success = code === 0;
+      fs.appendFileSync(
+        logFile,
+        `[${new Date().toISOString()}] Updater exited (${success ? 'success' : 'failure'}) code=${code ?? 'null'} signal=${signal ?? 'null'}\n`,
+      );
+      updateJobState = {
+        ...updateJobState,
+        running: false,
+        finishedAt: Date.now(),
+        exitCode: code ?? null,
+        signal: signal ?? null,
+      };
+    });
+
+    child.unref();
+    return { ok: true, state: getUpdateStatusPayload() };
+  } catch (error) {
+    return { ok: false, message: `Failed to start update process: ${(error as Error).message}` };
+  } finally {
+    fs.closeSync(logFd);
+  }
+}
 
 // --- Auth Routes ---
 
@@ -803,6 +993,32 @@ app.get('/api/status', authenticateToken, (_req, res) => {
         position: index + 1,
       })),
     currentStatus: currentAppStatus,
+  });
+});
+
+app.get('/api/version', authenticateToken, (_req, res) => {
+  res.json(getRuntimeVersionInfo());
+});
+
+app.get('/api/update-status', authenticateToken, requireAdmin, (_req, res) => {
+  res.json(getUpdateStatusPayload());
+});
+
+app.post('/api/update', authenticateToken, requireAdmin, (req: any, res) => {
+  const startedBy = typeof req.user?.email === 'string' && req.user.email.length > 0 ? req.user.email : 'admin';
+  const result = startUpdateJob(startedBy);
+  if (!result.ok) {
+    const message = result.message;
+    const statusCode = message === 'Update already running.' ? 409 : 500;
+    res.status(statusCode).json({ error: message });
+    return;
+  }
+
+  res.json({
+    success: true,
+    message: 'Update started. Service may restart automatically.',
+    status: result.state,
+    version: getRuntimeVersionInfo(),
   });
 });
 

@@ -20,6 +20,7 @@ import {
   Play,
   Plus,
   Quote,
+  RefreshCw,
   Repeat2,
   Save,
   Settings2,
@@ -202,6 +203,25 @@ interface StatusResponse {
 interface AuthUser {
   email: string;
   isAdmin: boolean;
+}
+
+interface RuntimeVersionInfo {
+  version: string;
+  commit?: string;
+  branch?: string;
+  startedAt: number;
+}
+
+interface UpdateStatusInfo {
+  running: boolean;
+  pid?: number;
+  startedAt?: number;
+  startedBy?: string;
+  finishedAt?: number;
+  exitCode?: number | null;
+  signal?: string | null;
+  logFile?: string;
+  logTail?: string[];
 }
 
 interface Notice {
@@ -545,6 +565,8 @@ function App() {
   const [aiConfig, setAiConfig] = useState<AIConfig>({ provider: 'gemini', apiKey: '', model: '', baseUrl: '' });
   const [recentActivity, setRecentActivity] = useState<ActivityLog[]>([]);
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [runtimeVersion, setRuntimeVersion] = useState<RuntimeVersionInfo | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusInfo | null>(null);
   const [countdown, setCountdown] = useState('--');
   const [activeTab, setActiveTab] = useState<DashboardTab>(() => {
     const fromPath = getTabFromPath(window.location.pathname);
@@ -600,6 +622,7 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
 
   const [isBusy, setIsBusy] = useState(false);
+  const [isUpdateBusy, setIsUpdateBusy] = useState(false);
   const [authError, setAuthError] = useState('');
 
   const noticeTimerRef = useRef<number | null>(null);
@@ -628,6 +651,8 @@ function App() {
     setEnrichedPosts([]);
     setProfilesByActor({});
     setStatus(null);
+    setRuntimeVersion(null);
+    setUpdateStatus(null);
     setRecentActivity([]);
     setEditingMapping(null);
     setNewTwitterUsers([]);
@@ -644,6 +669,7 @@ function App() {
     setIsSearchingLocalPosts(false);
     setGroupDraftsByKey({});
     setIsGroupActionBusy(false);
+    setIsUpdateBusy(false);
     postsSearchRequestRef.current = 0;
     setAuthView('login');
   }, []);
@@ -711,6 +737,32 @@ function App() {
     }
   }, [authHeaders, handleAuthFailure]);
 
+  const fetchRuntimeVersion = useCallback(async () => {
+    if (!authHeaders) {
+      return;
+    }
+
+    try {
+      const response = await axios.get<RuntimeVersionInfo>('/api/version', { headers: authHeaders });
+      setRuntimeVersion(response.data);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to fetch app version.');
+    }
+  }, [authHeaders, handleAuthFailure]);
+
+  const fetchUpdateStatus = useCallback(async () => {
+    if (!authHeaders || !isAdmin) {
+      return;
+    }
+
+    try {
+      const response = await axios.get<UpdateStatusInfo>('/api/update-status', { headers: authHeaders });
+      setUpdateStatus(response.data);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to fetch update status.');
+    }
+  }, [authHeaders, handleAuthFailure, isAdmin]);
+
   const fetchProfiles = useCallback(
     async (actors: string[]) => {
       if (!authHeaders) {
@@ -755,11 +807,14 @@ function App() {
       setMe(profile);
       setMappings(mappingData);
       setGroups(groupData);
+      const versionResponse = await axios.get<RuntimeVersionInfo>('/api/version', { headers: authHeaders });
+      setRuntimeVersion(versionResponse.data);
 
       if (profile.isAdmin) {
-        const [twitterResponse, aiResponse] = await Promise.all([
+        const [twitterResponse, aiResponse, updateStatusResponse] = await Promise.all([
           axios.get<TwitterConfig>('/api/twitter-config', { headers: authHeaders }),
           axios.get<AIConfig>('/api/ai-config', { headers: authHeaders }),
+          axios.get<UpdateStatusInfo>('/api/update-status', { headers: authHeaders }),
         ]);
 
         setTwitterConfig({
@@ -775,6 +830,9 @@ function App() {
           model: aiResponse.data.model || '',
           baseUrl: aiResponse.data.baseUrl || '',
         });
+        setUpdateStatus(updateStatusResponse.data);
+      } else {
+        setUpdateStatus(null);
       }
 
       await Promise.all([fetchStatus(), fetchRecentActivity(), fetchEnrichedPosts()]);
@@ -875,6 +933,23 @@ function App() {
       window.clearInterval(postsInterval);
     };
   }, [token, fetchEnrichedPosts, fetchRecentActivity, fetchStatus]);
+
+  useEffect(() => {
+    if (!token) {
+      return;
+    }
+
+    const versionInterval = window.setInterval(() => {
+      void fetchRuntimeVersion();
+      if (isAdmin) {
+        void fetchUpdateStatus();
+      }
+    }, 15000);
+
+    return () => {
+      window.clearInterval(versionInterval);
+    };
+  }, [token, isAdmin, fetchRuntimeVersion, fetchUpdateStatus]);
 
   useEffect(() => {
     if (!status?.nextCheckTime) {
@@ -1290,6 +1365,17 @@ function App() {
 
   const themeLabel =
     themeMode === 'system' ? `Theme: system (${resolvedTheme})` : `Theme: ${themeMode}`;
+  const runtimeVersionLabel = runtimeVersion
+    ? `v${runtimeVersion.version}${runtimeVersion.commit ? ` (${runtimeVersion.commit})` : ''}`
+    : 'v--';
+  const runtimeBranchLabel = runtimeVersion?.branch ? `branch ${runtimeVersion.branch}` : null;
+  const updateStateLabel = updateStatus?.running
+    ? 'Update in progress'
+    : updateStatus?.finishedAt
+      ? updateStatus.exitCode === 0
+        ? 'Last update succeeded'
+        : 'Last update failed'
+      : 'No update run recorded';
 
   const handleLogin = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1906,6 +1992,30 @@ function App() {
     }
   };
 
+  const handleRunUpdate = async () => {
+    if (!authHeaders || !isAdmin) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      'Run ./update.sh now? The service may restart automatically after update completes.',
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsUpdateBusy(true);
+    try {
+      const response = await axios.post<{ message?: string }>('/api/update', {}, { headers: authHeaders });
+      showNotice('info', response.data?.message || 'Update started. Service may restart soon.');
+      await Promise.all([fetchRuntimeVersion(), fetchUpdateStatus()]);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to start update.');
+    } finally {
+      setIsUpdateBusy(false);
+    }
+  };
+
   if (!token) {
     return (
       <main className="flex min-h-screen items-center justify-center p-4">
@@ -1970,6 +2080,10 @@ function App() {
               <p className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Clock3 className="h-4 w-4" />
                 Next run in <span className="font-mono text-foreground">{countdown}</span>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Version <span className="font-mono text-foreground">{runtimeVersionLabel}</span>
+                {runtimeBranchLabel ? <span className="ml-2">{runtimeBranchLabel}</span> : null}
               </p>
             </div>
 
@@ -3044,11 +3158,49 @@ function App() {
                 </CardTitle>
                 <CardDescription>Configured sections stay collapsed so adding accounts is one click.</CardDescription>
               </CardHeader>
-              <CardContent className="pt-0">
-                <Button className="w-full sm:w-auto" onClick={openAddAccountSheet}>
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add Account
-                </Button>
+              <CardContent className="space-y-4 pt-0">
+                <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-sm font-semibold">Running Version</p>
+                      <p className="font-mono text-sm text-foreground">{runtimeVersionLabel}</p>
+                      {runtimeBranchLabel ? (
+                        <p className="text-xs text-muted-foreground">{runtimeBranchLabel}</p>
+                      ) : null}
+                      <p className="text-xs text-muted-foreground">{updateStateLabel}</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        variant="outline"
+                        onClick={() => {
+                          void handleRunUpdate();
+                        }}
+                        disabled={isUpdateBusy || updateStatus?.running}
+                      >
+                        {isUpdateBusy || updateStatus?.running ? (
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        ) : (
+                          <RefreshCw className="mr-2 h-4 w-4" />
+                        )}
+                        {updateStatus?.running ? 'Updating...' : 'Update'}
+                      </Button>
+                      <Button className="w-full sm:w-auto" onClick={openAddAccountSheet}>
+                        <Plus className="mr-2 h-4 w-4" />
+                        Add Account
+                      </Button>
+                    </div>
+                  </div>
+                  {updateStatus?.logTail && updateStatus.logTail.length > 0 ? (
+                    <details className="mt-3">
+                      <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                        Update log
+                      </summary>
+                      <pre className="mt-2 max-h-44 overflow-auto rounded-md bg-background p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                        {updateStatus.logTail.join('\n')}
+                      </pre>
+                    </details>
+                  ) : null}
+                </div>
               </CardContent>
             </Card>
 
