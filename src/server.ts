@@ -1928,6 +1928,11 @@ app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
     return;
   }
 
+  if (!Array.isArray(mapping.twitterUsernames) || mapping.twitterUsernames.length === 0) {
+    res.status(400).json({ error: 'Mapping has no Twitter source accounts configured.' });
+    return;
+  }
+
   const parsedLimit = Number(limit);
   const safeLimit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : undefined;
   const queuedAt = Date.now();
