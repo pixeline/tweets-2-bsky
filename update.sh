@@ -382,34 +382,42 @@ restart_runtime() {
 
     if [[ "$has_app" -eq 1 && "$has_legacy" -eq 1 ]]; then
       echo "ℹ️  Found both PM2 processes ($APP_NAME and $LEGACY_APP_NAME). Consolidating to $APP_NAME..."
-      pm2 restart "$APP_NAME" --update-env >/dev/null 2>&1 || {
-        pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
-        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env >/dev/null 2>&1
+      echo "[pm2] Restarting $APP_NAME with updated environment"
+      pm2 restart "$APP_NAME" --update-env || {
+        echo "[pm2] Restart failed. Recreating $APP_NAME"
+        pm2 delete "$APP_NAME" || true
+        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env
       }
-      pm2 delete "$LEGACY_APP_NAME" >/dev/null 2>&1 || true
-      pm2 save >/dev/null 2>&1 || true
+      echo "[pm2] Removing duplicate legacy process $LEGACY_APP_NAME"
+      pm2 delete "$LEGACY_APP_NAME" || true
+      echo "[pm2] Saving PM2 process list"
+      pm2 save || true
       echo "✅ Restarted PM2 process: $APP_NAME"
       return 0
     fi
 
     if [[ "$has_app" -eq 1 ]]; then
-      pm2 restart "$APP_NAME" --update-env >/dev/null 2>&1 || {
+      echo "[pm2] Restarting $APP_NAME with updated environment"
+      pm2 restart "$APP_NAME" --update-env || {
         echo "⚠️  PM2 restart failed for $APP_NAME. Recreating process..."
-        pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
-        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env >/dev/null 2>&1
+        pm2 delete "$APP_NAME" || true
+        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env
       }
-      pm2 save >/dev/null 2>&1 || true
+      echo "[pm2] Saving PM2 process list"
+      pm2 save || true
       echo "✅ Restarted PM2 process: $APP_NAME"
       return 0
     fi
 
     if [[ "$has_legacy" -eq 1 ]]; then
-      pm2 restart "$LEGACY_APP_NAME" --update-env >/dev/null 2>&1 || {
+      echo "[pm2] Restarting legacy process $LEGACY_APP_NAME with updated environment"
+      pm2 restart "$LEGACY_APP_NAME" --update-env || {
         echo "⚠️  PM2 restart failed for $LEGACY_APP_NAME. Recreating it..."
-        pm2 delete "$LEGACY_APP_NAME" >/dev/null 2>&1 || true
-        pm2 start dist/index.js --name "$LEGACY_APP_NAME" --cwd "$SCRIPT_DIR" --update-env >/dev/null 2>&1
+        pm2 delete "$LEGACY_APP_NAME" || true
+        pm2 start dist/index.js --name "$LEGACY_APP_NAME" --cwd "$SCRIPT_DIR" --update-env
       }
-      pm2 save >/dev/null 2>&1 || true
+      echo "[pm2] Saving PM2 process list"
+      pm2 save || true
       echo "✅ Restarted PM2 process: $LEGACY_APP_NAME"
       return 0
     fi

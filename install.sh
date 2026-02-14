@@ -299,18 +299,23 @@ stop_pm2_if_running() {
 
   local stopped=0
 
+  echo "[pm2] Inspecting existing PM2 processes..."
+
   if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-    pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+    echo "[pm2] Deleting existing process: $APP_NAME"
+    pm2 delete "$APP_NAME" || true
     stopped=1
   fi
 
   if pm2 describe "$LEGACY_APP_NAME" >/dev/null 2>&1; then
-    pm2 delete "$LEGACY_APP_NAME" >/dev/null 2>&1 || true
+    echo "[pm2] Deleting legacy process: $LEGACY_APP_NAME"
+    pm2 delete "$LEGACY_APP_NAME" || true
     stopped=1
   fi
 
   if [[ "$stopped" -eq 1 ]]; then
-    pm2 save >/dev/null 2>&1 || true
+    echo "[pm2] Saving PM2 process list"
+    pm2 save || true
     return 0
   fi
 
@@ -340,16 +345,20 @@ start_with_pm2() {
   echo "Starting with PM2"
 
   if pm2 describe "$LEGACY_APP_NAME" >/dev/null 2>&1; then
-    pm2 delete "$LEGACY_APP_NAME" >/dev/null 2>&1 || true
+    echo "[pm2] Removing legacy process before start: $LEGACY_APP_NAME"
+    pm2 delete "$LEGACY_APP_NAME" || true
   fi
 
   if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-    pm2 restart "$APP_NAME" --update-env >/dev/null 2>&1
+    echo "[pm2] Restarting existing process with updated env: $APP_NAME"
+    pm2 restart "$APP_NAME" --update-env
   else
-    pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env >/dev/null 2>&1
+    echo "[pm2] Starting new process: $APP_NAME (cwd=$SCRIPT_DIR, script=dist/index.js)"
+    pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env
   fi
 
-  pm2 save >/dev/null 2>&1 || true
+  echo "[pm2] Saving PM2 process list"
+  pm2 save || true
 }
 
 start_background() {
