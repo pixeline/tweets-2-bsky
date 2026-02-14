@@ -143,6 +143,7 @@ const importConfig = (inputFile: string) => {
   const nextConfig: AppConfig = {
     ...currentConfig,
     mappings: parsed.mappings,
+    groups: Array.isArray(parsed.groups) ? parsed.groups : currentConfig.groups,
     twitter: parsed.twitter || currentConfig.twitter,
     ai: parsed.ai || currentConfig.ai,
     checkIntervalMinutes: parsed.checkIntervalMinutes || currentConfig.checkIntervalMinutes,

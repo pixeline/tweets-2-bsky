@@ -54,6 +54,11 @@ interface AccountMapping {
   groupEmoji?: string;
 }
 
+interface AccountGroup {
+  name: string;
+  emoji?: string;
+}
+
 interface TwitterConfig {
   authToken: string;
   ct0: string;
@@ -207,6 +212,7 @@ const defaultMappingForm = (): MappingFormState => ({
 
 const DEFAULT_GROUP_NAME = 'Ungrouped';
 const DEFAULT_GROUP_EMOJI = '📁';
+const DEFAULT_GROUP_KEY = 'ungrouped';
 
 const selectClassName =
   'flex h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
@@ -266,11 +272,22 @@ function normalizeGroupEmoji(value?: string): string {
   return trimmed || DEFAULT_GROUP_EMOJI;
 }
 
+function getGroupKey(groupName?: string): string {
+  return normalizeGroupName(groupName).toLowerCase();
+}
+
+function getGroupMeta(groupName?: string, groupEmoji?: string) {
+  const name = normalizeGroupName(groupName);
+  const emoji = normalizeGroupEmoji(groupEmoji);
+  return {
+    key: getGroupKey(name),
+    name,
+    emoji,
+  };
+}
+
 function getMappingGroupMeta(mapping?: Pick<AccountMapping, 'groupName' | 'groupEmoji'>) {
-  const name = normalizeGroupName(mapping?.groupName);
-  const emoji = normalizeGroupEmoji(mapping?.groupEmoji);
-  const key = `${name.toLowerCase()}::${emoji}`;
-  return { key, name, emoji };
+  return getGroupMeta(mapping?.groupName, mapping?.groupEmoji);
 }
 
 function getTwitterPostUrl(twitterUsername?: string, twitterId?: string): string | undefined {
@@ -377,6 +394,7 @@ function App() {
   const [resolvedTheme, setResolvedTheme] = useState<'light' | 'dark'>('light');
 
   const [mappings, setMappings] = useState<AccountMapping[]>([]);
+  const [groups, setGroups] = useState<AccountGroup[]>([]);
   const [enrichedPosts, setEnrichedPosts] = useState<EnrichedPost[]>([]);
   const [profilesByActor, setProfilesByActor] = useState<Record<string, BskyProfileView>>({});
   const [twitterConfig, setTwitterConfig] = useState<TwitterConfig>({ authToken: '', ct0: '' });
@@ -406,6 +424,8 @@ function App() {
   const [editForm, setEditForm] = useState<MappingFormState>(defaultMappingForm);
   const [editTwitterUsers, setEditTwitterUsers] = useState<string[]>([]);
   const [editTwitterInput, setEditTwitterInput] = useState('');
+  const [newGroupName, setNewGroupName] = useState('');
+  const [newGroupEmoji, setNewGroupEmoji] = useState(DEFAULT_GROUP_EMOJI);
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Record<string, boolean>>(() => {
     const raw = localStorage.getItem('accounts-collapsed-groups');
     if (!raw) return {};
@@ -444,6 +464,7 @@ function App() {
     setToken(null);
     setMe(null);
     setMappings([]);
+    setGroups([]);
     setEnrichedPosts([]);
     setProfilesByActor({});
     setStatus(null);
@@ -451,6 +472,8 @@ function App() {
     setEditingMapping(null);
     setNewTwitterUsers([]);
     setEditTwitterUsers([]);
+    setNewGroupName('');
+    setNewGroupEmoji(DEFAULT_GROUP_EMOJI);
     setAuthView('login');
   }, []);
 
@@ -504,6 +527,19 @@ function App() {
     }
   }, [authHeaders, handleAuthFailure]);
 
+  const fetchGroups = useCallback(async () => {
+    if (!authHeaders) {
+      return;
+    }
+
+    try {
+      const response = await axios.get<AccountGroup[]>('/api/groups', { headers: authHeaders });
+      setGroups(Array.isArray(response.data) ? response.data : []);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to fetch account groups.');
+    }
+  }, [authHeaders, handleAuthFailure]);
+
   const fetchProfiles = useCallback(
     async (actors: string[]) => {
       if (!authHeaders) {
@@ -536,15 +572,18 @@ function App() {
     }
 
     try {
-      const [meResponse, mappingsResponse] = await Promise.all([
+      const [meResponse, mappingsResponse, groupsResponse] = await Promise.all([
         axios.get<AuthUser>('/api/me', { headers: authHeaders }),
         axios.get<AccountMapping[]>('/api/mappings', { headers: authHeaders }),
+        axios.get<AccountGroup[]>('/api/groups', { headers: authHeaders }),
       ]);
 
       const profile = meResponse.data;
       const mappingData = mappingsResponse.data;
+      const groupData = Array.isArray(groupsResponse.data) ? groupsResponse.data : [];
       setMe(profile);
       setMappings(mappingData);
+      setGroups(groupData);
 
       if (profile.isAdmin) {
         const [twitterResponse, aiResponse] = await Promise.all([
@@ -733,11 +772,16 @@ function App() {
   }, [mappings]);
   const groupOptions = useMemo(() => {
     const options = new Map<string, { key: string; name: string; emoji: string }>();
+    for (const group of groups) {
+      const meta = getGroupMeta(group.name, group.emoji);
+      if (meta.key === DEFAULT_GROUP_KEY) {
+        continue;
+      }
+      options.set(meta.key, meta);
+    }
     for (const mapping of mappings) {
       const group = getMappingGroupMeta(mapping);
-      if (!options.has(group.key)) {
-        options.set(group.key, group);
-      }
+      options.set(group.key, options.get(group.key) || group);
     }
     return [...options.values()].sort((a, b) => {
       const aUngrouped = a.name === DEFAULT_GROUP_NAME;
@@ -746,9 +790,16 @@ function App() {
       if (!aUngrouped && bUngrouped) return -1;
       return a.name.localeCompare(b.name);
     });
-  }, [mappings]);
+  }, [groups, mappings]);
+  const groupOptionsByKey = useMemo(() => new Map(groupOptions.map((group) => [group.key, group])), [groupOptions]);
   const groupedMappings = useMemo(() => {
     const groups = new Map<string, { key: string; name: string; emoji: string; mappings: AccountMapping[] }>();
+    for (const option of groupOptions) {
+      groups.set(option.key, {
+        ...option,
+        mappings: [],
+      });
+    }
     for (const mapping of mappings) {
       const group = getMappingGroupMeta(mapping);
       const existing = groups.get(group.key);
@@ -775,7 +826,7 @@ function App() {
           ),
         ),
       }));
-  }, [mappings]);
+  }, [groupOptions, mappings]);
   const resolveMappingForPost = useCallback(
     (post: EnrichedPost) =>
       mappingsByBskyIdentifier.get(normalizeTwitterUsername(post.bskyIdentifier)) ||
@@ -1040,6 +1091,78 @@ function App() {
       ...previous,
       [groupKey]: !previous[groupKey],
     }));
+  };
+
+  const handleCreateGroup = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!authHeaders) {
+      return;
+    }
+
+    const name = newGroupName.trim();
+    const emoji = newGroupEmoji.trim() || DEFAULT_GROUP_EMOJI;
+    if (!name) {
+      showNotice('error', 'Enter a group name first.');
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      await axios.post('/api/groups', { name, emoji }, { headers: authHeaders });
+      setNewGroupName('');
+      setNewGroupEmoji(DEFAULT_GROUP_EMOJI);
+      await fetchGroups();
+      showNotice('success', `Group "${name}" created.`);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to create group.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleAssignMappingGroup = async (mapping: AccountMapping, groupKey: string) => {
+    if (!authHeaders) {
+      return;
+    }
+
+    const selectedGroup = groupOptionsByKey.get(groupKey);
+    const nextGroupName = selectedGroup?.name || '';
+    const nextGroupEmoji = selectedGroup?.emoji || '';
+
+    try {
+      await axios.put(
+        `/api/mappings/${mapping.id}`,
+        {
+          groupName: nextGroupName,
+          groupEmoji: nextGroupEmoji,
+        },
+        { headers: authHeaders },
+      );
+
+      setMappings((previous) =>
+        previous.map((entry) =>
+          entry.id === mapping.id
+            ? {
+                ...entry,
+                groupName: nextGroupName || undefined,
+                groupEmoji: nextGroupEmoji || undefined,
+              }
+            : entry,
+        ),
+      );
+
+      if (nextGroupName) {
+        setGroups((previous) => {
+          const key = getGroupKey(nextGroupName);
+          if (previous.some((group) => getGroupKey(group.name) === key)) {
+            return previous;
+          }
+          return [...previous, { name: nextGroupName, ...(nextGroupEmoji ? { emoji: nextGroupEmoji } : {}) }];
+        });
+      }
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to move account to folder.');
+    }
   };
 
   const handleAddMapping = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -1508,8 +1631,42 @@ function App() {
                 <Badge variant="outline">{mappings.length} configured</Badge>
               </div>
             </CardHeader>
-            <CardContent className="pt-0">
-              {mappings.length === 0 ? (
+            <CardContent className="space-y-4 pt-0">
+              <form
+                className="rounded-lg border border-border/70 bg-muted/30 p-3"
+                onSubmit={(event) => {
+                  void handleCreateGroup(event);
+                }}
+              >
+                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Create Folder</p>
+                <div className="flex flex-wrap items-end gap-2">
+                  <div className="min-w-[180px] flex-1 space-y-1">
+                    <Label htmlFor="accounts-group-name">Folder name</Label>
+                    <Input
+                      id="accounts-group-name"
+                      value={newGroupName}
+                      onChange={(event) => setNewGroupName(event.target.value)}
+                      placeholder="Gaming, News, Sports..."
+                    />
+                  </div>
+                  <div className="w-20 space-y-1">
+                    <Label htmlFor="accounts-group-emoji">Emoji</Label>
+                    <Input
+                      id="accounts-group-emoji"
+                      value={newGroupEmoji}
+                      onChange={(event) => setNewGroupEmoji(event.target.value)}
+                      placeholder="📁"
+                      maxLength={8}
+                    />
+                  </div>
+                  <Button type="submit" size="sm" disabled={isBusy || newGroupName.trim().length === 0}>
+                    <Plus className="mr-2 h-4 w-4" />
+                    Create
+                  </Button>
+                </div>
+              </form>
+
+              {groupedMappings.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border/70 p-6 text-center text-sm text-muted-foreground">
                   No mappings yet. Add one from the settings panel.
                 </div>
@@ -1550,126 +1707,151 @@ function App() {
                           )}
                         >
                           <div className="min-h-0 overflow-hidden">
-                            <div className="overflow-x-auto">
-                            <table className="min-w-full text-left text-sm">
-                              <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
-                                <tr>
-                                  <th className="px-2 py-3">Owner</th>
-                                  <th className="px-2 py-3">Twitter Sources</th>
-                                  <th className="px-2 py-3">Bluesky Target</th>
-                                  <th className="px-2 py-3">Status</th>
-                                  <th className="px-2 py-3 text-right">Actions</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {group.mappings.map((mapping) => {
-                                  const queued = isBackfillQueued(mapping.id);
-                                  const active = isBackfillActive(mapping.id);
-                                  const queuePosition = getBackfillEntry(mapping.id)?.position;
-                                  const profile = getProfileForActor(mapping.bskyIdentifier);
-                                  const profileHandle = profile?.handle || mapping.bskyIdentifier;
-                                  const profileName = profile?.displayName || profileHandle;
-
-                                  return (
-                                    <tr key={mapping.id} className="interactive-row border-b border-border/60 last:border-0">
-                                      <td className="px-2 py-3 align-top">
-                                        <div className="flex items-center gap-2 font-medium">
-                                          <UserRound className="h-4 w-4 text-muted-foreground" />
-                                          {mapping.owner || 'System'}
-                                        </div>
-                                      </td>
-                                      <td className="px-2 py-3 align-top">
-                                        <div className="flex flex-wrap gap-2">
-                                          {mapping.twitterUsernames.map((username) => (
-                                            <Badge key={username} variant="secondary">
-                                              @{username}
-                                            </Badge>
-                                          ))}
-                                        </div>
-                                      </td>
-                                      <td className="px-2 py-3 align-top">
-                                        <div className="flex items-center gap-2">
-                                          {profile?.avatar ? (
-                                            <img
-                                              className="h-8 w-8 rounded-full border border-border/70 object-cover"
-                                              src={profile.avatar}
-                                              alt={profileName}
-                                              loading="lazy"
-                                            />
-                                          ) : (
-                                            <div className="flex h-8 w-8 items-center justify-center rounded-full border border-border/70 bg-muted text-muted-foreground">
-                                              <UserRound className="h-4 w-4" />
-                                            </div>
-                                          )}
-                                          <div className="min-w-0">
-                                            <p className="truncate text-sm font-medium">{profileName}</p>
-                                            <p className="truncate font-mono text-xs text-muted-foreground">{profileHandle}</p>
-                                          </div>
-                                        </div>
-                                      </td>
-                                      <td className="px-2 py-3 align-top">
-                                        {active ? (
-                                          <Badge variant="warning">Backfilling</Badge>
-                                        ) : queued ? (
-                                          <Badge variant="warning">Queued {queuePosition ? `#${queuePosition}` : ''}</Badge>
-                                        ) : (
-                                          <Badge variant="success">Active</Badge>
-                                        )}
-                                      </td>
-                                      <td className="px-2 py-3 align-top">
-                                        <div className="flex flex-wrap justify-end gap-1">
-                                          {isAdmin ? (
-                                            <>
-                                              <Button variant="outline" size="sm" onClick={() => startEditMapping(mapping)}>
-                                                Edit
-                                              </Button>
-                                              <Button
-                                                variant="outline"
-                                                size="sm"
-                                                onClick={() => {
-                                                  void requestBackfill(mapping.id, 'normal');
-                                                }}
-                                              >
-                                                Backfill
-                                              </Button>
-                                              <Button
-                                                variant="subtle"
-                                                size="sm"
-                                                onClick={() => {
-                                                  void requestBackfill(mapping.id, 'reset');
-                                                }}
-                                              >
-                                                Reset + Backfill
-                                              </Button>
-                                              <Button
-                                                variant="destructive"
-                                                size="sm"
-                                                onClick={() => {
-                                                  void handleDeleteAllPosts(mapping.id);
-                                                }}
-                                              >
-                                                Delete Posts
-                                              </Button>
-                                            </>
-                                          ) : null}
-                                          <Button
-                                            variant="ghost"
-                                            size="sm"
-                                            onClick={() => {
-                                              void handleDeleteMapping(mapping.id);
-                                            }}
-                                          >
-                                            <Trash2 className="mr-1 h-4 w-4" />
-                                            Remove
-                                          </Button>
-                                        </div>
-                                      </td>
+                            {group.mappings.length === 0 ? (
+                              <div className="border-t border-border/60 p-4 text-sm text-muted-foreground">
+                                No accounts in this folder yet.
+                              </div>
+                            ) : (
+                              <div className="overflow-x-auto">
+                                <table className="min-w-full text-left text-sm">
+                                  <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
+                                    <tr>
+                                      <th className="px-2 py-3">Owner</th>
+                                      <th className="px-2 py-3">Twitter Sources</th>
+                                      <th className="px-2 py-3">Bluesky Target</th>
+                                      <th className="px-2 py-3">Status</th>
+                                      <th className="px-2 py-3 text-right">Actions</th>
                                     </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                            </div>
+                                  </thead>
+                                  <tbody>
+                                    {group.mappings.map((mapping) => {
+                                      const queued = isBackfillQueued(mapping.id);
+                                      const active = isBackfillActive(mapping.id);
+                                      const queuePosition = getBackfillEntry(mapping.id)?.position;
+                                      const profile = getProfileForActor(mapping.bskyIdentifier);
+                                      const profileHandle = profile?.handle || mapping.bskyIdentifier;
+                                      const profileName = profile?.displayName || profileHandle;
+                                      const mappingGroup = getMappingGroupMeta(mapping);
+
+                                      return (
+                                        <tr key={mapping.id} className="interactive-row border-b border-border/60 last:border-0">
+                                          <td className="px-2 py-3 align-top">
+                                            <div className="flex items-center gap-2 font-medium">
+                                              <UserRound className="h-4 w-4 text-muted-foreground" />
+                                              {mapping.owner || 'System'}
+                                            </div>
+                                          </td>
+                                          <td className="px-2 py-3 align-top">
+                                            <div className="flex flex-wrap gap-2">
+                                              {mapping.twitterUsernames.map((username) => (
+                                                <Badge key={username} variant="secondary">
+                                                  @{username}
+                                                </Badge>
+                                              ))}
+                                            </div>
+                                          </td>
+                                          <td className="px-2 py-3 align-top">
+                                            <div className="flex items-center gap-2">
+                                              {profile?.avatar ? (
+                                                <img
+                                                  className="h-8 w-8 rounded-full border border-border/70 object-cover"
+                                                  src={profile.avatar}
+                                                  alt={profileName}
+                                                  loading="lazy"
+                                                />
+                                              ) : (
+                                                <div className="flex h-8 w-8 items-center justify-center rounded-full border border-border/70 bg-muted text-muted-foreground">
+                                                  <UserRound className="h-4 w-4" />
+                                                </div>
+                                              )}
+                                              <div className="min-w-0">
+                                                <p className="truncate text-sm font-medium">{profileName}</p>
+                                                <p className="truncate font-mono text-xs text-muted-foreground">{profileHandle}</p>
+                                              </div>
+                                            </div>
+                                          </td>
+                                          <td className="px-2 py-3 align-top">
+                                            {active ? (
+                                              <Badge variant="warning">Backfilling</Badge>
+                                            ) : queued ? (
+                                              <Badge variant="warning">Queued {queuePosition ? `#${queuePosition}` : ''}</Badge>
+                                            ) : (
+                                              <Badge variant="success">Active</Badge>
+                                            )}
+                                          </td>
+                                          <td className="px-2 py-3 align-top">
+                                            <div className="flex flex-wrap justify-end gap-1">
+                                              <select
+                                                className={cn(selectClassName, 'h-9 w-44 px-2 py-1 text-xs')}
+                                                value={mappingGroup.key}
+                                                onChange={(event) => {
+                                                  void handleAssignMappingGroup(mapping, event.target.value);
+                                                }}
+                                              >
+                                                <option value={DEFAULT_GROUP_KEY}>
+                                                  {DEFAULT_GROUP_EMOJI} {DEFAULT_GROUP_NAME}
+                                                </option>
+                                                {groupOptions
+                                                  .filter((option) => option.key !== DEFAULT_GROUP_KEY)
+                                                  .map((option) => (
+                                                    <option key={`group-move-${mapping.id}-${option.key}`} value={option.key}>
+                                                      {option.emoji} {option.name}
+                                                    </option>
+                                                  ))}
+                                              </select>
+                                              {isAdmin ? (
+                                                <>
+                                                  <Button variant="outline" size="sm" onClick={() => startEditMapping(mapping)}>
+                                                    Edit
+                                                  </Button>
+                                                  <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    onClick={() => {
+                                                      void requestBackfill(mapping.id, 'normal');
+                                                    }}
+                                                  >
+                                                    Backfill
+                                                  </Button>
+                                                  <Button
+                                                    variant="subtle"
+                                                    size="sm"
+                                                    onClick={() => {
+                                                      void requestBackfill(mapping.id, 'reset');
+                                                    }}
+                                                  >
+                                                    Reset + Backfill
+                                                  </Button>
+                                                  <Button
+                                                    variant="destructive"
+                                                    size="sm"
+                                                    onClick={() => {
+                                                      void handleDeleteAllPosts(mapping.id);
+                                                    }}
+                                                  >
+                                                    Delete Posts
+                                                  </Button>
+                                                </>
+                                              ) : null}
+                                              <Button
+                                                variant="ghost"
+                                                size="sm"
+                                                onClick={() => {
+                                                  void handleDeleteMapping(mapping.id);
+                                                }}
+                                              >
+                                                <Trash2 className="mr-1 h-4 w-4" />
+                                                Remove
+                                              </Button>
+                                            </div>
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>

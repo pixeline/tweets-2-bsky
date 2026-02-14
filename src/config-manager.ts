@@ -38,9 +38,15 @@ export interface AccountMapping {
   groupEmoji?: string;
 }
 
+export interface AccountGroup {
+  name: string;
+  emoji?: string;
+}
+
 export interface AppConfig {
   twitter: TwitterConfig;
   mappings: AccountMapping[];
+  groups: AccountGroup[];
   users: WebUser[];
   checkIntervalMinutes: number;
   geminiApiKey?: string;
@@ -52,6 +58,7 @@ export function getConfig(): AppConfig {
     return {
       twitter: { authToken: '', ct0: '' },
       mappings: [],
+      groups: [],
       users: [],
       checkIntervalMinutes: 5,
     };
@@ -59,12 +66,14 @@ export function getConfig(): AppConfig {
   try {
     const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
     if (!config.users) config.users = [];
+    if (!Array.isArray(config.groups)) config.groups = [];
     return config;
   } catch (err) {
     console.error('Error reading config:', err);
     return {
       twitter: { authToken: '', ct0: '' },
       mappings: [],
+      groups: [],
       users: [],
       checkIntervalMinutes: 5,
     };
@@ -79,6 +88,27 @@ export function saveConfig(config: AppConfig): void {
     const { twitterUsername, ...rest } = m;
     return rest;
   });
+
+  const groups = Array.isArray(configToSave.groups) ? configToSave.groups : [];
+  const seenGroupNames = new Set<string>();
+  configToSave.groups = groups
+    .map((group: any) => ({
+      name: typeof group?.name === 'string' ? group.name.trim() : '',
+      emoji: typeof group?.emoji === 'string' ? group.emoji.trim() : '',
+    }))
+    .filter((group: any) => group.name.length > 0)
+    .filter((group: any) => {
+      const key = group.name.toLowerCase();
+      if (seenGroupNames.has(key)) {
+        return false;
+      }
+      seenGroupNames.add(key);
+      return true;
+    })
+    .map((group: any) => ({
+      name: group.name,
+      ...(group.emoji ? { emoji: group.emoji } : {}),
+    }));
 
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(configToSave, null, 2));
 }

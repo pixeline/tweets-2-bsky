@@ -7,7 +7,7 @@ import cors from 'cors';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { deleteAllPosts } from './bsky.js';
-import { getConfig, saveConfig } from './config-manager.js';
+import { getConfig, saveConfig, type AppConfig } from './config-manager.js';
 import { dbService } from './db.js';
 import type { ProcessedTweet } from './db.js';
 
@@ -104,6 +104,42 @@ function buildTwitterPostUrl(username: string, twitterId: string): string | unde
 
 function normalizeActor(actor: string): string {
   return actor.trim().replace(/^@/, '').toLowerCase();
+}
+
+function normalizeGroupName(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeGroupEmoji(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function ensureGroupExists(config: AppConfig, name?: string, emoji?: string) {
+  const normalizedName = normalizeGroupName(name);
+  if (!normalizedName) return;
+
+  if (!Array.isArray(config.groups)) {
+    config.groups = [];
+  }
+
+  const existingIndex = config.groups.findIndex((group) => normalizeGroupName(group.name).toLowerCase() === normalizedName.toLowerCase());
+  const normalizedEmoji = normalizeGroupEmoji(emoji);
+
+  if (existingIndex === -1) {
+    config.groups.push({
+      name: normalizedName,
+      ...(normalizedEmoji ? { emoji: normalizedEmoji } : {}),
+    });
+    return;
+  }
+
+  if (normalizedEmoji) {
+    const existingGroupName = normalizeGroupName(config.groups[existingIndex]?.name) || normalizedName;
+    config.groups[existingIndex] = {
+      name: existingGroupName,
+      emoji: normalizedEmoji,
+    };
+  }
 }
 
 function extractMediaFromEmbed(embed: any): EnrichedPostMedia[] {
@@ -406,6 +442,28 @@ app.get('/api/mappings', authenticateToken, (_req, res) => {
   res.json(config.mappings);
 });
 
+app.get('/api/groups', authenticateToken, (_req, res) => {
+  const config = getConfig();
+  res.json(Array.isArray(config.groups) ? config.groups : []);
+});
+
+app.post('/api/groups', authenticateToken, (req, res) => {
+  const config = getConfig();
+  const normalizedName = normalizeGroupName(req.body?.name);
+  const normalizedEmoji = normalizeGroupEmoji(req.body?.emoji);
+
+  if (!normalizedName) {
+    res.status(400).json({ error: 'Group name is required.' });
+    return;
+  }
+
+  ensureGroupExists(config, normalizedName, normalizedEmoji);
+  saveConfig(config);
+
+  const group = config.groups.find((entry) => normalizeGroupName(entry.name).toLowerCase() === normalizedName.toLowerCase());
+  res.json(group || { name: normalizedName, ...(normalizedEmoji ? { emoji: normalizedEmoji } : {}) });
+});
+
 app.post('/api/mappings', authenticateToken, (req, res) => {
   const { twitterUsernames, bskyIdentifier, bskyPassword, bskyServiceUrl, owner, groupName, groupEmoji } = req.body;
   const config = getConfig();
@@ -421,8 +479,8 @@ app.post('/api/mappings', authenticateToken, (req, res) => {
       .filter((u) => u.length > 0);
   }
 
-  const normalizedGroupName = typeof groupName === 'string' ? groupName.trim() : '';
-  const normalizedGroupEmoji = typeof groupEmoji === 'string' ? groupEmoji.trim() : '';
+  const normalizedGroupName = normalizeGroupName(groupName);
+  const normalizedGroupEmoji = normalizeGroupEmoji(groupEmoji);
 
   const newMapping = {
     id: Math.random().toString(36).substring(7),
@@ -436,6 +494,7 @@ app.post('/api/mappings', authenticateToken, (req, res) => {
     groupEmoji: normalizedGroupEmoji || undefined,
   };
 
+  ensureGroupExists(config, normalizedGroupName, normalizedGroupEmoji);
   config.mappings.push(newMapping);
   saveConfig(config);
   res.json(newMapping);
@@ -468,13 +527,13 @@ app.put('/api/mappings/:id', authenticateToken, (req, res) => {
 
   let nextGroupName = existingMapping.groupName;
   if (groupName !== undefined) {
-    const normalizedGroupName = typeof groupName === 'string' ? groupName.trim() : '';
+    const normalizedGroupName = normalizeGroupName(groupName);
     nextGroupName = normalizedGroupName || undefined;
   }
 
   let nextGroupEmoji = existingMapping.groupEmoji;
   if (groupEmoji !== undefined) {
-    const normalizedGroupEmoji = typeof groupEmoji === 'string' ? groupEmoji.trim() : '';
+    const normalizedGroupEmoji = normalizeGroupEmoji(groupEmoji);
     nextGroupEmoji = normalizedGroupEmoji || undefined;
   }
 
@@ -490,6 +549,7 @@ app.put('/api/mappings/:id', authenticateToken, (req, res) => {
     groupEmoji: nextGroupEmoji,
   };
 
+  ensureGroupExists(config, nextGroupName, nextGroupEmoji);
   config.mappings[index] = updatedMapping;
   saveConfig(config);
   res.json(updatedMapping);
@@ -697,6 +757,7 @@ app.post('/api/config/import', authenticateToken, requireAdmin, (req, res) => {
     const newConfig = {
         ...currentConfig,
         mappings: importData.mappings,
+        groups: Array.isArray(importData.groups) ? importData.groups : currentConfig.groups,
         twitter: importData.twitter || currentConfig.twitter,
         ai: importData.ai || currentConfig.ai,
         checkIntervalMinutes: importData.checkIntervalMinutes || currentConfig.checkIntervalMinutes
