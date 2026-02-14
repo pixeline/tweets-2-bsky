@@ -768,6 +768,48 @@ function App() {
   const hasCurrentEmail = Boolean(me?.email && me.email.trim().length > 0);
   const authHeaders = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
 
+  useEffect(() => {
+    const requestInterceptor = axios.interceptors.request.use((config) => {
+      console.debug('[tweets-2-bsky:web] api-request', {
+        method: config.method?.toUpperCase(),
+        url: config.url,
+        params: config.params,
+        hasData: config.data !== undefined,
+        timestamp: new Date().toISOString(),
+      });
+      return config;
+    });
+
+    const responseInterceptor = axios.interceptors.response.use(
+      (response) => {
+        console.debug('[tweets-2-bsky:web] api-response', {
+          method: response.config.method?.toUpperCase(),
+          url: response.config.url,
+          status: response.status,
+          timestamp: new Date().toISOString(),
+        });
+        return response;
+      },
+      (error) => {
+        if (axios.isAxiosError(error)) {
+          console.debug('[tweets-2-bsky:web] api-error', {
+            method: error.config?.method?.toUpperCase(),
+            url: error.config?.url,
+            status: error.response?.status,
+            message: error.message,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return Promise.reject(error);
+      },
+    );
+
+    return () => {
+      axios.interceptors.request.eject(requestInterceptor);
+      axios.interceptors.response.eject(responseInterceptor);
+    };
+  }, []);
+
   const showNotice = useCallback((tone: Notice['tone'], message: string) => {
     setNotice({ tone, message });
     if (noticeTimerRef.current) {
