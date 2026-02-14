@@ -1303,10 +1303,6 @@ async function fetchUserTweets(username: string, limit: number, processedIds?: S
 // Main Processing Logic
 // ============================================================================
 
-// ============================================================================
-// Main Processing Logic
-// ============================================================================
-
 async function processTweets(
   agent: BskyAgent,
   twitterUsername: string,
