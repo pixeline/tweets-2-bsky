@@ -2027,20 +2027,80 @@ async function importHistory(
 
 // Task management
 const activeTasks = new Map<string, Promise<void>>();
+const DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS = 2 * 60 * 1000;
+
+const resolveBackfillAccountTimeoutMs = (): number => {
+  const raw = Number(process.env.BACKFILL_ACCOUNT_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= 15_000) {
+    return raw;
+  }
+  return DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS;
+};
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
 
 async function runAccountTask(mapping: AccountMapping, backfillRequest?: PendingBackfill, dryRun = false) {
   if (activeTasks.has(mapping.id)) return; // Already running
 
   const task = (async () => {
     try {
-      const agent = await getAgent(mapping);
-      if (!agent) return;
-
       const backfillReq = backfillRequest ?? getPendingBackfills().find((b) => b.id === mapping.id);
+
+      if (mapping.twitterUsernames.length === 0) {
+        console.warn(`[${mapping.bskyIdentifier}] ⚠️ No Twitter usernames configured. Skipping mapping.`);
+        if (backfillReq) {
+          clearBackfill(mapping.id, backfillReq.requestId);
+          updateAppStatus({
+            state: 'idle',
+            currentAccount: undefined,
+            processedCount: 0,
+            totalCount: 0,
+            message: `Backfill skipped for ${mapping.bskyIdentifier}: no source accounts configured`,
+            backfillMappingId: undefined,
+            backfillRequestId: undefined,
+          });
+        }
+        return;
+      }
+
+      const agent = await getAgent(mapping);
+      if (!agent) {
+        if (backfillReq) {
+          console.warn(`[${mapping.bskyIdentifier}] ⚠️ Backfill aborted: unable to authenticate Bluesky account.`);
+          clearBackfill(mapping.id, backfillReq.requestId);
+          updateAppStatus({
+            state: 'idle',
+            currentAccount: undefined,
+            processedCount: 0,
+            totalCount: mapping.twitterUsernames.length,
+            message: `Backfill skipped for ${mapping.bskyIdentifier}: Bluesky login failed`,
+            backfillMappingId: undefined,
+            backfillRequestId: undefined,
+          });
+        }
+        return;
+      }
+
       const explicitBackfill = Boolean(backfillRequest);
 
       if (backfillReq) {
         const limit = backfillReq.limit || 15;
+        const backfillAccountTimeoutMs = resolveBackfillAccountTimeoutMs();
         const accountCount = mapping.twitterUsernames.length;
         const estimatedTotalTweets = accountCount * limit;
         console.log(
@@ -2079,7 +2139,11 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
               backfillMappingId: mapping.id,
               backfillRequestId: backfillReq.requestId,
             });
-            await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId);
+            await withTimeout(
+              importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId),
+              backfillAccountTimeoutMs,
+              `[${twitterUsername}] Backfill timed out after ${Math.round(backfillAccountTimeoutMs / 1000)}s`,
+            );
             updateAppStatus({
               state: 'backfilling',
               currentAccount: twitterUsername,
