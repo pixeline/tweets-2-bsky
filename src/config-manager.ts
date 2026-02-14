@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,9 +15,26 @@ export interface TwitterConfig {
   backupCt0?: string;
 }
 
+export interface UserPermissions {
+  viewAllMappings: boolean;
+  manageOwnMappings: boolean;
+  manageAllMappings: boolean;
+  manageGroups: boolean;
+  queueBackfills: boolean;
+  runNow: boolean;
+}
+
+export type UserRole = 'admin' | 'user';
+
 export interface WebUser {
-  email: string;
+  id: string;
+  username?: string;
+  email?: string;
   passwordHash: string;
+  role: UserRole;
+  permissions: UserPermissions;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AIConfig {
@@ -36,6 +54,7 @@ export interface AccountMapping {
   owner?: string;
   groupName?: string;
   groupEmoji?: string;
+  createdByUserId?: string;
 }
 
 export interface AccountGroup {
@@ -53,71 +72,365 @@ export interface AppConfig {
   ai?: AIConfig;
 }
 
-export function getConfig(): AppConfig {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    return {
-      twitter: { authToken: '', ct0: '' },
-      mappings: [],
-      groups: [],
-      users: [],
-      checkIntervalMinutes: 5,
-    };
-  }
-  try {
-    const config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-    if (!config.users) config.users = [];
-    if (!Array.isArray(config.groups)) config.groups = [];
-    return config;
-  } catch (err) {
-    console.error('Error reading config:', err);
-    return {
-      twitter: { authToken: '', ct0: '' },
-      mappings: [],
-      groups: [],
-      users: [],
-      checkIntervalMinutes: 5,
-    };
-  }
-}
-export function saveConfig(config: AppConfig): void {
-  // biome-ignore lint/suspicious/noExplicitAny: cleanup before save
-  const configToSave = { ...config } as any;
+const DEFAULT_TWITTER_CONFIG: TwitterConfig = {
+  authToken: '',
+  ct0: '',
+};
 
-  // Remove legacy field from saved file
-  configToSave.mappings = configToSave.mappings.map((m: any) => {
-    const { twitterUsername, ...rest } = m;
-    return rest;
+export const DEFAULT_USER_PERMISSIONS: UserPermissions = {
+  viewAllMappings: false,
+  manageOwnMappings: true,
+  manageAllMappings: false,
+  manageGroups: false,
+  queueBackfills: true,
+  runNow: true,
+};
+
+export const ADMIN_USER_PERMISSIONS: UserPermissions = {
+  viewAllMappings: true,
+  manageOwnMappings: true,
+  manageAllMappings: true,
+  manageGroups: true,
+  queueBackfills: true,
+  runNow: true,
+};
+
+const DEFAULT_CONFIG: AppConfig = {
+  twitter: DEFAULT_TWITTER_CONFIG,
+  mappings: [],
+  groups: [],
+  users: [],
+  checkIntervalMinutes: 5,
+};
+
+const normalizeString = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const normalizeEmail = (value: unknown): string | undefined => {
+  const normalized = normalizeString(value);
+  return normalized ? normalized.toLowerCase() : undefined;
+};
+
+const normalizeUsername = (value: unknown): string | undefined => {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized.replace(/^@/, '').toLowerCase();
+};
+
+const normalizeRole = (value: unknown): UserRole | undefined => {
+  if (value === 'admin' || value === 'user') {
+    return value;
+  }
+  return undefined;
+};
+
+const normalizeBoolean = (value: unknown, fallback: boolean): boolean => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  return fallback;
+};
+
+const normalizeUserPermissions = (value: unknown, role: UserRole): UserPermissions => {
+  if (role === 'admin') {
+    return { ...ADMIN_USER_PERMISSIONS };
+  }
+
+  const defaults = { ...DEFAULT_USER_PERMISSIONS };
+  if (!value || typeof value !== 'object') {
+    return defaults;
+  }
+
+  const record = value as Record<string, unknown>;
+  return {
+    viewAllMappings: normalizeBoolean(record.viewAllMappings, defaults.viewAllMappings),
+    manageOwnMappings: normalizeBoolean(record.manageOwnMappings, defaults.manageOwnMappings),
+    manageAllMappings: normalizeBoolean(record.manageAllMappings, defaults.manageAllMappings),
+    manageGroups: normalizeBoolean(record.manageGroups, defaults.manageGroups),
+    queueBackfills: normalizeBoolean(record.queueBackfills, defaults.queueBackfills),
+    runNow: normalizeBoolean(record.runNow, defaults.runNow),
+  };
+};
+
+export function getDefaultUserPermissions(role: UserRole): UserPermissions {
+  return role === 'admin' ? { ...ADMIN_USER_PERMISSIONS } : { ...DEFAULT_USER_PERMISSIONS };
+}
+
+const normalizeUser = (rawUser: unknown, index: number, fallbackNowIso: string): WebUser | null => {
+  if (!rawUser || typeof rawUser !== 'object') {
+    return null;
+  }
+
+  const record = rawUser as Record<string, unknown>;
+  const passwordHash = normalizeString(record.passwordHash);
+  if (!passwordHash) {
+    return null;
+  }
+
+  const role = normalizeRole(record.role) ?? (index === 0 ? 'admin' : 'user');
+  const createdAt = normalizeString(record.createdAt) ?? fallbackNowIso;
+  const updatedAt = normalizeString(record.updatedAt) ?? createdAt;
+
+  return {
+    id: normalizeString(record.id) ?? randomUUID(),
+    username: normalizeUsername(record.username),
+    email: normalizeEmail(record.email),
+    passwordHash,
+    role,
+    permissions: normalizeUserPermissions(record.permissions, role),
+    createdAt,
+    updatedAt,
+  };
+};
+
+const normalizeTwitterUsernames = (value: unknown, legacyValue: unknown): string[] => {
+  const seen = new Set<string>();
+  const usernames: string[] = [];
+
+  const addUsername = (candidate: unknown) => {
+    const normalized = normalizeUsername(candidate);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    usernames.push(normalized);
+  };
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      addUsername(item);
+    }
+  } else if (typeof value === 'string') {
+    for (const item of value.split(',')) {
+      addUsername(item);
+    }
+  }
+
+  if (usernames.length === 0) {
+    addUsername(legacyValue);
+  }
+
+  return usernames;
+};
+
+const normalizeGroup = (group: unknown): AccountGroup | null => {
+  if (!group || typeof group !== 'object') {
+    return null;
+  }
+  const record = group as Record<string, unknown>;
+  const name = normalizeString(record.name);
+  if (!name) {
+    return null;
+  }
+  const emoji = normalizeString(record.emoji);
+  return {
+    name,
+    ...(emoji ? { emoji } : {}),
+  };
+};
+
+const findAdminUserId = (users: WebUser[]): string | undefined => users.find((user) => user.role === 'admin')?.id;
+
+const matchOwnerToUserId = (owner: string | undefined, users: WebUser[]): string | undefined => {
+  if (!owner) {
+    return undefined;
+  }
+
+  const normalizedOwner = owner.trim().toLowerCase();
+  if (!normalizedOwner) {
+    return undefined;
+  }
+
+  return users.find((user) => {
+    const username = user.username?.toLowerCase();
+    const email = user.email?.toLowerCase();
+    const emailLocalPart = email?.split('@')[0];
+    return normalizedOwner === username || normalizedOwner === email || normalizedOwner === emailLocalPart;
+  })?.id;
+};
+
+const normalizeMapping = (rawMapping: unknown, users: WebUser[], adminUserId?: string): AccountMapping | null => {
+  if (!rawMapping || typeof rawMapping !== 'object') {
+    return null;
+  }
+
+  const record = rawMapping as Record<string, unknown>;
+  const bskyIdentifier = normalizeString(record.bskyIdentifier);
+  if (!bskyIdentifier) {
+    return null;
+  }
+
+  const owner = normalizeString(record.owner);
+  const usernames = normalizeTwitterUsernames(record.twitterUsernames, record.twitterUsername);
+  const explicitCreator = normalizeString(record.createdByUserId) ?? normalizeString(record.ownerUserId);
+  const explicitCreatorExists = explicitCreator && users.some((user) => user.id === explicitCreator);
+
+  return {
+    id: normalizeString(record.id) ?? randomUUID(),
+    twitterUsernames: usernames,
+    bskyIdentifier: bskyIdentifier.toLowerCase(),
+    bskyPassword: normalizeString(record.bskyPassword) ?? '',
+    bskyServiceUrl: normalizeString(record.bskyServiceUrl) ?? 'https://bsky.social',
+    enabled: normalizeBoolean(record.enabled, true),
+    owner,
+    groupName: normalizeString(record.groupName),
+    groupEmoji: normalizeString(record.groupEmoji),
+    createdByUserId:
+      (explicitCreatorExists ? explicitCreator : undefined) ?? matchOwnerToUserId(owner, users) ?? adminUserId,
+  };
+};
+
+const normalizeUsers = (rawUsers: unknown): WebUser[] => {
+  if (!Array.isArray(rawUsers)) {
+    return [];
+  }
+
+  const fallbackNowIso = new Date().toISOString();
+  const normalized = rawUsers
+    .map((user, index) => normalizeUser(user, index, fallbackNowIso))
+    .filter((user): user is WebUser => user !== null);
+
+  const usedIds = new Set<string>();
+  for (const user of normalized) {
+    if (usedIds.has(user.id)) {
+      user.id = randomUUID();
+    }
+    usedIds.add(user.id);
+  }
+
+  const firstUser = normalized[0];
+  if (firstUser && !normalized.some((user) => user.role === 'admin')) {
+    firstUser.role = 'admin';
+    firstUser.permissions = { ...ADMIN_USER_PERMISSIONS };
+    firstUser.updatedAt = new Date().toISOString();
+  }
+
+  for (const user of normalized) {
+    if (user.role === 'admin') {
+      user.permissions = { ...ADMIN_USER_PERMISSIONS };
+    }
+  }
+
+  return normalized;
+};
+
+const normalizeAiConfig = (rawAi: unknown): AIConfig | undefined => {
+  if (!rawAi || typeof rawAi !== 'object') {
+    return undefined;
+  }
+  const record = rawAi as Record<string, unknown>;
+  const provider = record.provider;
+  if (provider !== 'gemini' && provider !== 'openai' && provider !== 'anthropic' && provider !== 'custom') {
+    return undefined;
+  }
+
+  const apiKey = normalizeString(record.apiKey);
+  const model = normalizeString(record.model);
+  const baseUrl = normalizeString(record.baseUrl);
+  return {
+    provider,
+    ...(apiKey ? { apiKey } : {}),
+    ...(model ? { model } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+  };
+};
+
+const normalizeConfigShape = (rawConfig: unknown): AppConfig => {
+  if (!rawConfig || typeof rawConfig !== 'object') {
+    return { ...DEFAULT_CONFIG };
+  }
+
+  const record = rawConfig as Record<string, unknown>;
+  const rawTwitter =
+    record.twitter && typeof record.twitter === 'object' ? (record.twitter as Record<string, unknown>) : {};
+  const users = normalizeUsers(record.users);
+  const adminUserId = findAdminUserId(users);
+
+  const mappings = Array.isArray(record.mappings)
+    ? record.mappings
+        .map((mapping) => normalizeMapping(mapping, users, adminUserId))
+        .filter((mapping): mapping is AccountMapping => mapping !== null)
+    : [];
+
+  const groups = Array.isArray(record.groups)
+    ? record.groups.map(normalizeGroup).filter((group): group is AccountGroup => group !== null)
+    : [];
+
+  const seenGroups = new Set<string>();
+  const dedupedGroups = groups.filter((group) => {
+    const key = group.name.toLowerCase();
+    if (seenGroups.has(key)) {
+      return false;
+    }
+    seenGroups.add(key);
+    return true;
   });
 
-  const groups = Array.isArray(configToSave.groups) ? configToSave.groups : [];
-  const seenGroupNames = new Set<string>();
-  configToSave.groups = groups
-    .map((group: any) => ({
-      name: typeof group?.name === 'string' ? group.name.trim() : '',
-      emoji: typeof group?.emoji === 'string' ? group.emoji.trim() : '',
-    }))
-    .filter((group: any) => group.name.length > 0)
-    .filter((group: any) => {
-      const key = group.name.toLowerCase();
-      if (seenGroupNames.has(key)) {
-        return false;
-      }
-      seenGroupNames.add(key);
-      return true;
-    })
-    .map((group: any) => ({
-      name: group.name,
-      ...(group.emoji ? { emoji: group.emoji } : {}),
-    }));
+  const checkIntervalCandidate = Number(record.checkIntervalMinutes);
+  const checkIntervalMinutes =
+    Number.isFinite(checkIntervalCandidate) && checkIntervalCandidate >= 1 ? Math.round(checkIntervalCandidate) : 5;
 
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(configToSave, null, 2));
+  const geminiApiKey = normalizeString(record.geminiApiKey);
+  const ai = normalizeAiConfig(record.ai);
+
+  return {
+    twitter: {
+      authToken: normalizeString(rawTwitter.authToken) ?? '',
+      ct0: normalizeString(rawTwitter.ct0) ?? '',
+      backupAuthToken: normalizeString(rawTwitter.backupAuthToken),
+      backupCt0: normalizeString(rawTwitter.backupCt0),
+    },
+    mappings,
+    groups: dedupedGroups,
+    users,
+    checkIntervalMinutes,
+    ...(geminiApiKey ? { geminiApiKey } : {}),
+    ...(ai ? { ai } : {}),
+  };
+};
+
+const writeConfigFile = (config: AppConfig) => {
+  fs.writeFileSync(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
+};
+
+export function getConfig(): AppConfig {
+  if (!fs.existsSync(CONFIG_FILE)) {
+    return { ...DEFAULT_CONFIG };
+  }
+
+  try {
+    const rawText = fs.readFileSync(CONFIG_FILE, 'utf8');
+    const rawConfig = JSON.parse(rawText);
+    const normalizedConfig = normalizeConfigShape(rawConfig);
+
+    if (JSON.stringify(rawConfig) !== JSON.stringify(normalizedConfig)) {
+      writeConfigFile(normalizedConfig);
+    }
+
+    return normalizedConfig;
+  } catch (err) {
+    console.error('Error reading config:', err);
+    return { ...DEFAULT_CONFIG };
+  }
+}
+
+export function saveConfig(config: AppConfig): void {
+  const normalizedConfig = normalizeConfigShape(config);
+  writeConfigFile(normalizedConfig);
 }
 
 export function addMapping(mapping: Omit<AccountMapping, 'id' | 'enabled'>): void {
   const config = getConfig();
   const newMapping: AccountMapping = {
     ...mapping,
-    id: Math.random().toString(36).substring(7),
+    id: randomUUID(),
     enabled: true,
   };
   config.mappings.push(newMapping);

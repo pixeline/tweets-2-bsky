@@ -1,14 +1,25 @@
+import { execSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execSync, spawn } from 'node:child_process';
 import axios from 'axios';
 import bcrypt from 'bcryptjs';
 import cors from 'cors';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import { deleteAllPosts } from './bsky.js';
-import { getConfig, saveConfig, type AppConfig } from './config-manager.js';
+import {
+  ADMIN_USER_PERMISSIONS,
+  type AccountMapping,
+  type AppConfig,
+  type UserPermissions,
+  type UserRole,
+  type WebUser,
+  getConfig,
+  getDefaultUserPermissions,
+  saveConfig,
+} from './config-manager.js';
 import { dbService } from './db.js';
 import type { ProcessedTweet } from './db.js';
 
@@ -17,6 +28,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+const HOST = (process.env.HOST || process.env.BIND_HOST || '0.0.0.0').trim() || '0.0.0.0';
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
 const APP_ROOT_DIR = path.join(__dirname, '..');
 const WEB_DIST_DIR = path.join(APP_ROOT_DIR, 'web', 'dist');
@@ -30,6 +42,7 @@ const POST_VIEW_CACHE_TTL_MS = 60_000;
 const PROFILE_CACHE_TTL_MS = 5 * 60_000;
 const RESERVED_UNGROUPED_KEY = 'ungrouped';
 const SERVER_STARTED_AT = Date.now();
+const PASSWORD_MIN_LENGTH = 8;
 
 interface CacheEntry<T> {
   value: T;
@@ -176,7 +189,9 @@ function ensureGroupExists(config: AppConfig, name?: string, emoji?: string) {
     config.groups = [];
   }
 
-  const existingIndex = config.groups.findIndex((group) => getNormalizedGroupKey(group.name) === getNormalizedGroupKey(normalizedName));
+  const existingIndex = config.groups.findIndex(
+    (group) => getNormalizedGroupKey(group.name) === getNormalizedGroupKey(normalizedName),
+  );
   const normalizedEmoji = normalizeGroupEmoji(emoji);
 
   if (existingIndex === -1) {
@@ -434,8 +449,7 @@ function buildEnrichedPost(activity: ProcessedTweet, postView: any): EnrichedPos
     facets: Array.isArray(record.facets) ? record.facets : [],
     author: {
       did: typeof author.did === 'string' ? author.did : undefined,
-      handle:
-        typeof author.handle === 'string' && author.handle.length > 0 ? author.handle : activity.bsky_identifier,
+      handle: typeof author.handle === 'string' && author.handle.length > 0 ? author.handle : activity.bsky_identifier,
       displayName: typeof author.displayName === 'string' ? author.displayName : undefined,
       avatar: typeof author.avatar === 'string' ? author.avatar : undefined,
     },
@@ -488,24 +502,449 @@ app.use(express.json());
 
 app.use(express.static(staticAssetsDir));
 
-// Middleware to protect routes
+interface AuthenticatedUser {
+  id: string;
+  username?: string;
+  email?: string;
+  isAdmin: boolean;
+  permissions: UserPermissions;
+}
+
+interface MappingResponse extends Omit<AccountMapping, 'bskyPassword'> {
+  createdByLabel?: string;
+  createdByUser?: {
+    id: string;
+    username?: string;
+    email?: string;
+    role: UserRole;
+  };
+}
+
+interface UserSummaryResponse {
+  id: string;
+  username?: string;
+  email?: string;
+  role: UserRole;
+  isAdmin: boolean;
+  permissions: UserPermissions;
+  createdAt: string;
+  updatedAt: string;
+  mappingCount: number;
+  activeMappingCount: number;
+  mappings: MappingResponse[];
+}
+
+const normalizeEmail = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : undefined;
+};
+
+const normalizeUsername = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim().replace(/^@/, '').toLowerCase();
+  return normalized.length > 0 ? normalized : undefined;
+};
+
+const normalizeOptionalString = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : undefined;
+};
+
+const normalizeBoolean = (value: unknown, fallback: boolean): boolean => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  return fallback;
+};
+
+const EMAIL_LIKE_PATTERN = /\b[^\s@]+@[^\s@]+\.[^\s@]+\b/i;
+
+const getUserPublicLabel = (user: Pick<WebUser, 'id' | 'username'>): string =>
+  user.username || `user-${user.id.slice(0, 8)}`;
+
+const getUserDisplayLabel = (user: Pick<WebUser, 'id' | 'username' | 'email'>): string =>
+  user.username || user.email || `user-${user.id.slice(0, 8)}`;
+
+const getActorLabel = (actor: AuthenticatedUser): string => actor.username || actor.email || `user-${actor.id.slice(0, 8)}`;
+
+const getActorPublicLabel = (actor: AuthenticatedUser): string => actor.username || `user-${actor.id.slice(0, 8)}`;
+
+const sanitizeLabelForRequester = (label: string | undefined, requester: AuthenticatedUser): string | undefined => {
+  if (!label) {
+    return undefined;
+  }
+  if (requester.isAdmin) {
+    return label;
+  }
+  return EMAIL_LIKE_PATTERN.test(label) ? 'private-user' : label;
+};
+
+const createUserLookupById = (config: AppConfig): Map<string, WebUser> =>
+  new Map(config.users.map((user) => [user.id, user]));
+
+const toAuthenticatedUser = (user: WebUser): AuthenticatedUser => ({
+  id: user.id,
+  username: user.username,
+  email: user.email,
+  isAdmin: user.role === 'admin',
+  permissions:
+    user.role === 'admin'
+      ? { ...ADMIN_USER_PERMISSIONS }
+      : {
+          ...getDefaultUserPermissions('user'),
+          ...user.permissions,
+        },
+});
+
+const serializeAuthenticatedUser = (user: AuthenticatedUser) => ({
+  id: user.id,
+  username: user.username,
+  email: user.email,
+  isAdmin: user.isAdmin,
+  permissions: user.permissions,
+});
+
+const issueTokenForUser = (user: WebUser): string =>
+  jwt.sign(
+    {
+      userId: user.id,
+      email: user.email,
+      username: user.username,
+    },
+    JWT_SECRET,
+    { expiresIn: '24h' },
+  );
+
+const findUserByIdentifier = (config: AppConfig, identifier: string): WebUser | undefined => {
+  const normalizedEmail = normalizeEmail(identifier);
+  if (normalizedEmail) {
+    const foundByEmail = config.users.find((user) => normalizeEmail(user.email) === normalizedEmail);
+    if (foundByEmail) {
+      return foundByEmail;
+    }
+  }
+
+  const normalizedUsername = normalizeUsername(identifier);
+  if (!normalizedUsername) {
+    return undefined;
+  }
+  return config.users.find((user) => normalizeUsername(user.username) === normalizedUsername);
+};
+
+const findUserFromTokenPayload = (config: AppConfig, payload: Record<string, unknown>): WebUser | undefined => {
+  const tokenUserId = normalizeOptionalString(payload.userId) ?? normalizeOptionalString(payload.id);
+  if (tokenUserId) {
+    const byId = config.users.find((user) => user.id === tokenUserId);
+    if (byId) {
+      return byId;
+    }
+  }
+
+  const tokenEmail = normalizeEmail(payload.email);
+  if (tokenEmail) {
+    const byEmail = config.users.find((user) => normalizeEmail(user.email) === tokenEmail);
+    if (byEmail) {
+      return byEmail;
+    }
+  }
+
+  const tokenUsername = normalizeUsername(payload.username);
+  if (tokenUsername) {
+    const byUsername = config.users.find((user) => normalizeUsername(user.username) === tokenUsername);
+    if (byUsername) {
+      return byUsername;
+    }
+  }
+
+  return undefined;
+};
+
+const isActorAdmin = (user: AuthenticatedUser): boolean => user.isAdmin;
+
+const canViewAllMappings = (user: AuthenticatedUser): boolean =>
+  isActorAdmin(user) || user.permissions.viewAllMappings || user.permissions.manageAllMappings;
+
+const canManageAllMappings = (user: AuthenticatedUser): boolean =>
+  isActorAdmin(user) || user.permissions.manageAllMappings;
+
+const canManageOwnMappings = (user: AuthenticatedUser): boolean =>
+  isActorAdmin(user) || user.permissions.manageOwnMappings;
+
+const canManageGroups = (user: AuthenticatedUser): boolean => isActorAdmin(user) || user.permissions.manageGroups;
+
+const canQueueBackfills = (user: AuthenticatedUser): boolean => isActorAdmin(user) || user.permissions.queueBackfills;
+
+const canRunNow = (user: AuthenticatedUser): boolean => isActorAdmin(user) || user.permissions.runNow;
+
+const canManageMapping = (user: AuthenticatedUser, mapping: AccountMapping): boolean => {
+  if (canManageAllMappings(user)) {
+    return true;
+  }
+  if (!canManageOwnMappings(user)) {
+    return false;
+  }
+  return mapping.createdByUserId === user.id;
+};
+
+const getVisibleMappings = (config: AppConfig, user: AuthenticatedUser): AccountMapping[] => {
+  if (canViewAllMappings(user)) {
+    return config.mappings;
+  }
+
+  return config.mappings.filter((mapping) => mapping.createdByUserId === user.id);
+};
+
+const getVisibleMappingIdSet = (config: AppConfig, user: AuthenticatedUser): Set<string> =>
+  new Set(getVisibleMappings(config, user).map((mapping) => mapping.id));
+
+const getVisibleMappingIdentitySets = (config: AppConfig, user: AuthenticatedUser) => {
+  const visible = getVisibleMappings(config, user);
+  const twitterUsernames = new Set<string>();
+  const bskyIdentifiers = new Set<string>();
+
+  for (const mapping of visible) {
+    for (const username of mapping.twitterUsernames) {
+      twitterUsernames.add(normalizeActor(username));
+    }
+    bskyIdentifiers.add(normalizeActor(mapping.bskyIdentifier));
+  }
+
+  return {
+    twitterUsernames,
+    bskyIdentifiers,
+  };
+};
+
+const sanitizeMapping = (
+  mapping: AccountMapping,
+  usersById: Map<string, WebUser>,
+  requester: AuthenticatedUser,
+): MappingResponse => {
+  const { bskyPassword: _password, ...rest } = mapping;
+  const createdBy = mapping.createdByUserId ? usersById.get(mapping.createdByUserId) : undefined;
+  const ownerLabel = sanitizeLabelForRequester(mapping.owner, requester);
+
+  const response: MappingResponse = {
+    ...rest,
+    owner: ownerLabel,
+    createdByLabel: createdBy
+      ? requester.isAdmin
+        ? getUserDisplayLabel(createdBy)
+        : getUserPublicLabel(createdBy)
+      : ownerLabel,
+  };
+
+  if (requester.isAdmin && createdBy) {
+    response.createdByUser = {
+      id: createdBy.id,
+      username: createdBy.username,
+      email: createdBy.email,
+      role: createdBy.role,
+    };
+  }
+
+  return response;
+};
+
+const parseTwitterUsernames = (value: unknown): string[] => {
+  const seen = new Set<string>();
+  const usernames: string[] = [];
+  const add = (candidate: unknown) => {
+    if (typeof candidate !== 'string') {
+      return;
+    }
+    const normalized = normalizeActor(candidate);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    usernames.push(normalized);
+  };
+
+  if (Array.isArray(value)) {
+    for (const candidate of value) {
+      add(candidate);
+    }
+  } else if (typeof value === 'string') {
+    for (const candidate of value.split(',')) {
+      add(candidate);
+    }
+  }
+
+  return usernames;
+};
+
+const getAccessibleGroups = (config: AppConfig, user: AuthenticatedUser) => {
+  const allGroups = Array.isArray(config.groups)
+    ? config.groups.filter((group) => getNormalizedGroupKey(group.name) !== RESERVED_UNGROUPED_KEY)
+    : [];
+
+  if (canViewAllMappings(user)) {
+    return allGroups;
+  }
+
+  const visibleMappings = getVisibleMappings(config, user);
+  const allowedKeys = new Set<string>();
+  for (const mapping of visibleMappings) {
+    const key = getNormalizedGroupKey(mapping.groupName);
+    if (key && key !== RESERVED_UNGROUPED_KEY) {
+      allowedKeys.add(key);
+    }
+  }
+
+  const merged = new Map<string, { name: string; emoji?: string }>();
+  for (const group of allGroups) {
+    const key = getNormalizedGroupKey(group.name);
+    if (!allowedKeys.has(key)) {
+      continue;
+    }
+    merged.set(key, group);
+  }
+
+  for (const mapping of visibleMappings) {
+    const groupName = normalizeGroupName(mapping.groupName);
+    if (!groupName || getNormalizedGroupKey(groupName) === RESERVED_UNGROUPED_KEY) {
+      continue;
+    }
+    const key = getNormalizedGroupKey(groupName);
+    if (!merged.has(key)) {
+      merged.set(key, {
+        name: groupName,
+        ...(mapping.groupEmoji ? { emoji: mapping.groupEmoji } : {}),
+      });
+    }
+  }
+
+  return [...merged.values()];
+};
+
+const parsePermissionsInput = (rawPermissions: unknown, role: UserRole): UserPermissions => {
+  if (role === 'admin') {
+    return { ...ADMIN_USER_PERMISSIONS };
+  }
+
+  const defaults = getDefaultUserPermissions(role);
+  if (!rawPermissions || typeof rawPermissions !== 'object') {
+    return defaults;
+  }
+
+  const record = rawPermissions as Record<string, unknown>;
+  return {
+    viewAllMappings: normalizeBoolean(record.viewAllMappings, defaults.viewAllMappings),
+    manageOwnMappings: normalizeBoolean(record.manageOwnMappings, defaults.manageOwnMappings),
+    manageAllMappings: normalizeBoolean(record.manageAllMappings, defaults.manageAllMappings),
+    manageGroups: normalizeBoolean(record.manageGroups, defaults.manageGroups),
+    queueBackfills: normalizeBoolean(record.queueBackfills, defaults.queueBackfills),
+    runNow: normalizeBoolean(record.runNow, defaults.runNow),
+  };
+};
+
+const validatePassword = (password: unknown): string | undefined => {
+  if (typeof password !== 'string' || password.length < PASSWORD_MIN_LENGTH) {
+    return `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`;
+  }
+  return undefined;
+};
+
+const buildUserSummary = (config: AppConfig, requester: AuthenticatedUser): UserSummaryResponse[] => {
+  const usersById = createUserLookupById(config);
+  return config.users
+    .map((user) => {
+      const ownedMappings = config.mappings.filter((mapping) => mapping.createdByUserId === user.id);
+      const activeMappings = ownedMappings.filter((mapping) => mapping.enabled);
+      return {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        isAdmin: user.role === 'admin',
+        permissions: user.permissions,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+        mappingCount: ownedMappings.length,
+        activeMappingCount: activeMappings.length,
+        mappings: ownedMappings.map((mapping) => sanitizeMapping(mapping, usersById, requester)),
+      };
+    })
+    .sort((a, b) => {
+      if (a.isAdmin && !b.isAdmin) {
+        return -1;
+      }
+      if (!a.isAdmin && b.isAdmin) {
+        return 1;
+      }
+
+      const aLabel = (a.username || a.email || '').toLowerCase();
+      const bLabel = (b.username || b.email || '').toLowerCase();
+      return aLabel.localeCompare(bLabel);
+    });
+};
+
+const ensureUniqueIdentity = (
+  config: AppConfig,
+  userId: string | undefined,
+  username?: string,
+  email?: string,
+): string | null => {
+  if (username) {
+    const usernameTaken = config.users.some(
+      (user) => user.id !== userId && normalizeUsername(user.username) === username,
+    );
+    if (usernameTaken) {
+      return 'Username already exists.';
+    }
+  }
+  if (email) {
+    const emailTaken = config.users.some((user) => user.id !== userId && normalizeEmail(user.email) === email);
+    if (emailTaken) {
+      return 'Email already exists.';
+    }
+  }
+  return null;
+};
+
 const authenticateToken = (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(' ')[1];
 
-  if (!token) return res.sendStatus(401);
+  if (!token) {
+    res.sendStatus(401);
+    return;
+  }
 
-  jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-    if (err) return res.sendStatus(403);
-    req.user = user;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded || typeof decoded !== 'object') {
+      res.sendStatus(403);
+      return;
+    }
+
+    const config = getConfig();
+    const user = findUserFromTokenPayload(config, decoded as Record<string, unknown>);
+    if (!user) {
+      res.sendStatus(401);
+      return;
+    }
+
+    req.user = toAuthenticatedUser(user);
     next();
-  });
+  } catch {
+    res.sendStatus(403);
+  }
 };
 
-// Middleware to require admin access
 const requireAdmin = (req: any, res: any, next: any) => {
-  if (!req.user.isAdmin) {
-    return res.status(403).json({ error: 'Admin access required' });
+  if (!req.user?.isAdmin) {
+    res.status(403).json({ error: 'Admin access required' });
+    return;
   }
   next();
 };
@@ -607,58 +1046,382 @@ function startUpdateJob(startedBy: string): { ok: true; state: UpdateStatusPaylo
 
 // --- Auth Routes ---
 
-app.post('/api/register', async (req, res) => {
-  const { email, password } = req.body;
+app.get('/api/auth/bootstrap-status', (_req, res) => {
   const config = getConfig();
+  res.json({ bootstrapOpen: config.users.length === 0 });
+});
 
-  if (config.users.find((u) => u.email === email)) {
-    res.status(400).json({ error: 'User already exists' });
+app.post('/api/register', async (req, res) => {
+  const config = getConfig();
+  if (config.users.length > 0) {
+    res.status(403).json({ error: 'Registration is disabled. Ask an admin to create your account.' });
     return;
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
-  config.users.push({ email, passwordHash });
+  const email = normalizeEmail(req.body?.email);
+  const username = normalizeUsername(req.body?.username);
+  const password = req.body?.password;
+
+  if (!email && !username) {
+    res.status(400).json({ error: 'Username or email is required.' });
+    return;
+  }
+
+  const passwordError = validatePassword(password);
+  if (passwordError) {
+    res.status(400).json({ error: passwordError });
+    return;
+  }
+
+  const uniqueIdentityError = ensureUniqueIdentity(config, undefined, username, email);
+  if (uniqueIdentityError) {
+    res.status(400).json({ error: uniqueIdentityError });
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const newUser: WebUser = {
+    id: randomUUID(),
+    username,
+    email,
+    passwordHash: await bcrypt.hash(password, 10),
+    role: 'admin',
+    permissions: { ...ADMIN_USER_PERMISSIONS },
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+
+  config.users.push(newUser);
+
+  if (config.mappings.length > 0) {
+    config.mappings = config.mappings.map((mapping) => ({
+      ...mapping,
+      createdByUserId: mapping.createdByUserId || newUser.id,
+      owner: mapping.owner || getUserPublicLabel(newUser),
+    }));
+  }
+
   saveConfig(config);
 
   res.json({ success: true });
 });
 
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
+  const password = req.body?.password;
+  const identifier = normalizeOptionalString(req.body?.identifier) ?? normalizeOptionalString(req.body?.email);
+  if (!identifier || typeof password !== 'string') {
+    res.status(400).json({ error: 'Username/email and password are required.' });
+    return;
+  }
+
   const config = getConfig();
-  const user = config.users.find((u) => u.email === email);
+  const user = findUserByIdentifier(config, identifier);
 
   if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
     res.status(401).json({ error: 'Invalid credentials' });
     return;
   }
 
-  const userIndex = config.users.findIndex((u) => u.email === email);
-  const isAdmin = userIndex === 0;
-  const token = jwt.sign({ email: user.email, isAdmin }, JWT_SECRET, { expiresIn: '24h' });
-  res.json({ token, isAdmin });
+  const token = issueTokenForUser(user);
+  res.json({ token, isAdmin: user.role === 'admin' });
 });
 
 app.get('/api/me', authenticateToken, (req: any, res) => {
-  res.json({ email: req.user.email, isAdmin: req.user.isAdmin });
+  res.json(serializeAuthenticatedUser(req.user));
+});
+
+app.post('/api/me/change-email', authenticateToken, async (req: any, res) => {
+  const config = getConfig();
+  const userIndex = config.users.findIndex((user) => user.id === req.user.id);
+  const user = config.users[userIndex];
+  if (userIndex === -1 || !user) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  const currentEmail = normalizeEmail(req.body?.currentEmail);
+  const newEmail = normalizeEmail(req.body?.newEmail);
+  const password = req.body?.password;
+  if (!newEmail) {
+    res.status(400).json({ error: 'A new email is required.' });
+    return;
+  }
+  if (typeof password !== 'string') {
+    res.status(400).json({ error: 'Password is required.' });
+    return;
+  }
+
+  const existingEmail = normalizeEmail(user.email);
+  if (existingEmail && currentEmail !== existingEmail) {
+    res.status(400).json({ error: 'Current email does not match.' });
+    return;
+  }
+
+  if (!(await bcrypt.compare(password, user.passwordHash))) {
+    res.status(401).json({ error: 'Password verification failed.' });
+    return;
+  }
+
+  const uniqueIdentityError = ensureUniqueIdentity(config, user.id, normalizeUsername(user.username), newEmail);
+  if (uniqueIdentityError) {
+    res.status(400).json({ error: uniqueIdentityError });
+    return;
+  }
+
+  const updatedUser: WebUser = {
+    ...user,
+    email: newEmail,
+    updatedAt: new Date().toISOString(),
+  };
+  config.users[userIndex] = updatedUser;
+  saveConfig(config);
+
+  const token = issueTokenForUser(updatedUser);
+  res.json({
+    success: true,
+    token,
+    me: serializeAuthenticatedUser(toAuthenticatedUser(updatedUser)),
+  });
+});
+
+app.post('/api/me/change-password', authenticateToken, async (req: any, res) => {
+  const config = getConfig();
+  const userIndex = config.users.findIndex((user) => user.id === req.user.id);
+  const user = config.users[userIndex];
+  if (userIndex === -1 || !user) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  const currentPassword = req.body?.currentPassword;
+  const newPassword = req.body?.newPassword;
+  if (typeof currentPassword !== 'string') {
+    res.status(400).json({ error: 'Current password is required.' });
+    return;
+  }
+
+  const passwordError = validatePassword(newPassword);
+  if (passwordError) {
+    res.status(400).json({ error: passwordError });
+    return;
+  }
+
+  if (!(await bcrypt.compare(currentPassword, user.passwordHash))) {
+    res.status(401).json({ error: 'Current password is incorrect.' });
+    return;
+  }
+
+  config.users[userIndex] = {
+    ...user,
+    passwordHash: await bcrypt.hash(newPassword, 10),
+    updatedAt: new Date().toISOString(),
+  };
+  saveConfig(config);
+  res.json({ success: true });
+});
+
+app.get('/api/admin/users', authenticateToken, requireAdmin, (req: any, res) => {
+  const config = getConfig();
+  res.json(buildUserSummary(config, req.user));
+});
+
+app.post('/api/admin/users', authenticateToken, requireAdmin, async (req: any, res) => {
+  const config = getConfig();
+  const username = normalizeUsername(req.body?.username);
+  const email = normalizeEmail(req.body?.email);
+  const password = req.body?.password;
+  const role: UserRole = req.body?.isAdmin ? 'admin' : 'user';
+  const permissions = parsePermissionsInput(req.body?.permissions, role);
+
+  if (!username && !email) {
+    res.status(400).json({ error: 'Username or email is required.' });
+    return;
+  }
+
+  const passwordError = validatePassword(password);
+  if (passwordError) {
+    res.status(400).json({ error: passwordError });
+    return;
+  }
+
+  const uniqueIdentityError = ensureUniqueIdentity(config, undefined, username, email);
+  if (uniqueIdentityError) {
+    res.status(400).json({ error: uniqueIdentityError });
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const newUser: WebUser = {
+    id: randomUUID(),
+    username,
+    email,
+    passwordHash: await bcrypt.hash(password, 10),
+    role,
+    permissions,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+  };
+
+  config.users.push(newUser);
+  saveConfig(config);
+
+  const summary = buildUserSummary(config, req.user).find((user) => user.id === newUser.id);
+  res.json(summary || null);
+});
+
+app.put('/api/admin/users/:id', authenticateToken, requireAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const config = getConfig();
+  const userIndex = config.users.findIndex((user) => user.id === id);
+  const user = config.users[userIndex];
+  if (userIndex === -1 || !user) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  const requestedRole: UserRole =
+    req.body?.isAdmin === true ? 'admin' : req.body?.isAdmin === false ? 'user' : user.role;
+
+  if (user.id === req.user.id && requestedRole !== 'admin') {
+    res.status(400).json({ error: 'You cannot remove your own admin access.' });
+    return;
+  }
+
+  if (user.role === 'admin' && requestedRole !== 'admin') {
+    const adminCount = config.users.filter((entry) => entry.role === 'admin').length;
+    if (adminCount <= 1) {
+      res.status(400).json({ error: 'At least one admin must remain.' });
+      return;
+    }
+  }
+
+  const username =
+    req.body?.username !== undefined ? normalizeUsername(req.body?.username) : normalizeUsername(user.username);
+  const email = req.body?.email !== undefined ? normalizeEmail(req.body?.email) : normalizeEmail(user.email);
+
+  if (!username && !email) {
+    res.status(400).json({ error: 'User must keep at least a username or email.' });
+    return;
+  }
+
+  const uniqueIdentityError = ensureUniqueIdentity(config, user.id, username, email);
+  if (uniqueIdentityError) {
+    res.status(400).json({ error: uniqueIdentityError });
+    return;
+  }
+
+  const permissions =
+    req.body?.permissions !== undefined || req.body?.isAdmin !== undefined
+      ? parsePermissionsInput(req.body?.permissions, requestedRole)
+      : requestedRole === 'admin'
+        ? { ...ADMIN_USER_PERMISSIONS }
+        : user.permissions;
+
+  config.users[userIndex] = {
+    ...user,
+    username,
+    email,
+    role: requestedRole,
+    permissions,
+    updatedAt: new Date().toISOString(),
+  };
+
+  saveConfig(config);
+  const summary = buildUserSummary(config, req.user).find((entry) => entry.id === id);
+  res.json(summary || null);
+});
+
+app.post('/api/admin/users/:id/reset-password', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const config = getConfig();
+  const userIndex = config.users.findIndex((user) => user.id === id);
+  const user = config.users[userIndex];
+  if (userIndex === -1 || !user) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  const newPassword = req.body?.newPassword;
+  const passwordError = validatePassword(newPassword);
+  if (passwordError) {
+    res.status(400).json({ error: passwordError });
+    return;
+  }
+
+  config.users[userIndex] = {
+    ...user,
+    passwordHash: await bcrypt.hash(newPassword, 10),
+    updatedAt: new Date().toISOString(),
+  };
+  saveConfig(config);
+  res.json({ success: true });
+});
+
+app.delete('/api/admin/users/:id', authenticateToken, requireAdmin, (req: any, res) => {
+  const { id } = req.params;
+  const config = getConfig();
+  const userIndex = config.users.findIndex((user) => user.id === id);
+  const user = config.users[userIndex];
+
+  if (userIndex === -1 || !user) {
+    res.status(404).json({ error: 'User not found.' });
+    return;
+  }
+
+  if (user.id === req.user.id) {
+    res.status(400).json({ error: 'You cannot delete your own account.' });
+    return;
+  }
+
+  if (user.role === 'admin') {
+    const adminCount = config.users.filter((entry) => entry.role === 'admin').length;
+    if (adminCount <= 1) {
+      res.status(400).json({ error: 'At least one admin must remain.' });
+      return;
+    }
+  }
+
+  const ownedMappings = config.mappings.filter((mapping) => mapping.createdByUserId === user.id);
+  const ownedMappingIds = new Set(ownedMappings.map((mapping) => mapping.id));
+  config.mappings = config.mappings.map((mapping) =>
+    mapping.createdByUserId === user.id
+      ? {
+          ...mapping,
+          enabled: false,
+        }
+      : mapping,
+  );
+
+  config.users.splice(userIndex, 1);
+  pendingBackfills = pendingBackfills.filter((backfill) => !ownedMappingIds.has(backfill.id));
+  saveConfig(config);
+
+  res.json({
+    success: true,
+    disabledMappings: ownedMappings.length,
+  });
 });
 
 // --- Mapping Routes ---
 
-app.get('/api/mappings', authenticateToken, (_req, res) => {
+app.get('/api/mappings', authenticateToken, (req: any, res) => {
   const config = getConfig();
-  res.json(config.mappings);
+  const usersById = createUserLookupById(config);
+  const visibleMappings = getVisibleMappings(config, req.user);
+  res.json(visibleMappings.map((mapping) => sanitizeMapping(mapping, usersById, req.user)));
 });
 
-app.get('/api/groups', authenticateToken, (_req, res) => {
+app.get('/api/groups', authenticateToken, (req: any, res) => {
   const config = getConfig();
-  const groups = Array.isArray(config.groups)
-    ? config.groups.filter((group) => getNormalizedGroupKey(group.name) !== RESERVED_UNGROUPED_KEY)
-    : [];
-  res.json(groups);
+  res.json(getAccessibleGroups(config, req.user));
 });
 
-app.post('/api/groups', authenticateToken, (req, res) => {
+app.post('/api/groups', authenticateToken, (req: any, res) => {
+  if (!canManageGroups(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to manage groups.' });
+    return;
+  }
+
   const config = getConfig();
   const normalizedName = normalizeGroupName(req.body?.name);
   const normalizedEmoji = normalizeGroupEmoji(req.body?.emoji);
@@ -676,11 +1439,18 @@ app.post('/api/groups', authenticateToken, (req, res) => {
   ensureGroupExists(config, normalizedName, normalizedEmoji);
   saveConfig(config);
 
-  const group = config.groups.find((entry) => getNormalizedGroupKey(entry.name) === getNormalizedGroupKey(normalizedName));
+  const group = config.groups.find(
+    (entry) => getNormalizedGroupKey(entry.name) === getNormalizedGroupKey(normalizedName),
+  );
   res.json(group || { name: normalizedName, ...(normalizedEmoji ? { emoji: normalizedEmoji } : {}) });
 });
 
-app.put('/api/groups/:groupKey', authenticateToken, (req, res) => {
+app.put('/api/groups/:groupKey', authenticateToken, (req: any, res) => {
+  if (!canManageGroups(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to manage groups.' });
+    return;
+  }
+
   const currentGroupKey = getNormalizedGroupKey(req.params.groupKey);
   if (!currentGroupKey || currentGroupKey === RESERVED_UNGROUPED_KEY) {
     res.status(400).json({ error: 'Invalid group key.' });
@@ -753,7 +1523,12 @@ app.put('/api/groups/:groupKey', authenticateToken, (req, res) => {
   });
 });
 
-app.delete('/api/groups/:groupKey', authenticateToken, (req, res) => {
+app.delete('/api/groups/:groupKey', authenticateToken, (req: any, res) => {
+  if (!canManageGroups(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to manage groups.' });
+    return;
+  }
+
   const groupKey = getNormalizedGroupKey(req.params.groupKey);
   if (!groupKey || groupKey === RESERVED_UNGROUPED_KEY) {
     res.status(400).json({ error: 'Invalid group key.' });
@@ -789,48 +1564,71 @@ app.delete('/api/groups/:groupKey', authenticateToken, (req, res) => {
   res.json({ success: true, reassignedCount: reassigned });
 });
 
-app.post('/api/mappings', authenticateToken, (req, res) => {
-  const { twitterUsernames, bskyIdentifier, bskyPassword, bskyServiceUrl, owner, groupName, groupEmoji } = req.body;
-  const config = getConfig();
-
-  // Handle both array and comma-separated string
-  let usernames: string[] = [];
-  if (Array.isArray(twitterUsernames)) {
-    usernames = twitterUsernames;
-  } else if (typeof twitterUsernames === 'string') {
-    usernames = twitterUsernames
-      .split(',')
-      .map((u) => u.trim())
-      .filter((u) => u.length > 0);
+app.post('/api/mappings', authenticateToken, (req: any, res) => {
+  if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to create mappings.' });
+    return;
   }
 
-  const normalizedGroupName = normalizeGroupName(groupName);
-  const normalizedGroupEmoji = normalizeGroupEmoji(groupEmoji);
+  const config = getConfig();
+  const usersById = createUserLookupById(config);
+  const twitterUsernames = parseTwitterUsernames(req.body?.twitterUsernames);
+  if (twitterUsernames.length === 0) {
+    res.status(400).json({ error: 'At least one Twitter username is required.' });
+    return;
+  }
 
-  const newMapping = {
-    id: Math.random().toString(36).substring(7),
-    twitterUsernames: usernames,
+  const bskyIdentifier = normalizeActor(req.body?.bskyIdentifier || '');
+  const bskyPassword = normalizeOptionalString(req.body?.bskyPassword);
+  if (!bskyIdentifier || !bskyPassword) {
+    res.status(400).json({ error: 'Bluesky identifier and app password are required.' });
+    return;
+  }
+
+  let createdByUserId = req.user.id;
+  const requestedCreatorId = normalizeOptionalString(req.body?.createdByUserId);
+  if (requestedCreatorId && requestedCreatorId !== req.user.id) {
+    if (!canManageAllMappings(req.user)) {
+      res.status(403).json({ error: 'You cannot assign mappings to another user.' });
+      return;
+    }
+    if (!usersById.has(requestedCreatorId)) {
+      res.status(400).json({ error: 'Selected account owner does not exist.' });
+      return;
+    }
+    createdByUserId = requestedCreatorId;
+  }
+
+  const ownerUser = usersById.get(createdByUserId);
+  const owner =
+    normalizeOptionalString(req.body?.owner) || (ownerUser ? getUserPublicLabel(ownerUser) : getActorPublicLabel(req.user));
+  const normalizedGroupName = normalizeGroupName(req.body?.groupName);
+  const normalizedGroupEmoji = normalizeGroupEmoji(req.body?.groupEmoji);
+
+  const newMapping: AccountMapping = {
+    id: randomUUID(),
+    twitterUsernames,
     bskyIdentifier,
     bskyPassword,
-    bskyServiceUrl: bskyServiceUrl || 'https://bsky.social',
+    bskyServiceUrl: normalizeOptionalString(req.body?.bskyServiceUrl) || 'https://bsky.social',
     enabled: true,
     owner,
     groupName: normalizedGroupName || undefined,
     groupEmoji: normalizedGroupEmoji || undefined,
+    createdByUserId,
   };
 
   ensureGroupExists(config, normalizedGroupName, normalizedGroupEmoji);
   config.mappings.push(newMapping);
   saveConfig(config);
-  res.json(newMapping);
+  res.json(sanitizeMapping(newMapping, createUserLookupById(config), req.user));
 });
 
-app.put('/api/mappings/:id', authenticateToken, (req, res) => {
+app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
   const { id } = req.params;
-  const { twitterUsernames, bskyIdentifier, bskyPassword, bskyServiceUrl, owner, groupName, groupEmoji } = req.body;
   const config = getConfig();
-
-  const index = config.mappings.findIndex((m) => m.id === id);
+  const usersById = createUserLookupById(config);
+  const index = config.mappings.findIndex((mapping) => mapping.id === id);
   const existingMapping = config.mappings[index];
 
   if (index === -1 || !existingMapping) {
@@ -838,52 +1636,98 @@ app.put('/api/mappings/:id', authenticateToken, (req, res) => {
     return;
   }
 
-  let usernames: string[] = existingMapping.twitterUsernames;
-  if (twitterUsernames !== undefined) {
-    if (Array.isArray(twitterUsernames)) {
-      usernames = twitterUsernames;
-    } else if (typeof twitterUsernames === 'string') {
-      usernames = twitterUsernames
-        .split(',')
-        .map((u) => u.trim())
-        .filter((u) => u.length > 0);
+  if (!canManageMapping(req.user, existingMapping)) {
+    res.status(403).json({ error: 'You do not have permission to update this mapping.' });
+    return;
+  }
+
+  let twitterUsernames: string[] = existingMapping.twitterUsernames;
+  if (req.body?.twitterUsernames !== undefined) {
+    twitterUsernames = parseTwitterUsernames(req.body.twitterUsernames);
+    if (twitterUsernames.length === 0) {
+      res.status(400).json({ error: 'At least one Twitter username is required.' });
+      return;
     }
   }
 
+  let bskyIdentifier = existingMapping.bskyIdentifier;
+  if (req.body?.bskyIdentifier !== undefined) {
+    const normalizedIdentifier = normalizeActor(req.body?.bskyIdentifier);
+    if (!normalizedIdentifier) {
+      res.status(400).json({ error: 'Invalid Bluesky identifier.' });
+      return;
+    }
+    bskyIdentifier = normalizedIdentifier;
+  }
+
+  let createdByUserId = existingMapping.createdByUserId || req.user.id;
+  if (req.body?.createdByUserId !== undefined) {
+    if (!canManageAllMappings(req.user)) {
+      res.status(403).json({ error: 'You cannot reassign mapping ownership.' });
+      return;
+    }
+
+    const requestedCreatorId = normalizeOptionalString(req.body?.createdByUserId);
+    if (!requestedCreatorId || !usersById.has(requestedCreatorId)) {
+      res.status(400).json({ error: 'Selected account owner does not exist.' });
+      return;
+    }
+    createdByUserId = requestedCreatorId;
+  }
+
   let nextGroupName = existingMapping.groupName;
-  if (groupName !== undefined) {
-    const normalizedGroupName = normalizeGroupName(groupName);
-    nextGroupName = normalizedGroupName || undefined;
+  if (req.body?.groupName !== undefined) {
+    const normalizedName = normalizeGroupName(req.body?.groupName);
+    nextGroupName = normalizedName || undefined;
   }
 
   let nextGroupEmoji = existingMapping.groupEmoji;
-  if (groupEmoji !== undefined) {
-    const normalizedGroupEmoji = normalizeGroupEmoji(groupEmoji);
-    nextGroupEmoji = normalizedGroupEmoji || undefined;
+  if (req.body?.groupEmoji !== undefined) {
+    const normalizedEmoji = normalizeGroupEmoji(req.body?.groupEmoji);
+    nextGroupEmoji = normalizedEmoji || undefined;
   }
 
-  const updatedMapping = {
+  const ownerUser = usersById.get(createdByUserId);
+  const owner =
+    req.body?.owner !== undefined
+      ? normalizeOptionalString(req.body?.owner) || existingMapping.owner
+      : existingMapping.owner || (ownerUser ? getUserPublicLabel(ownerUser) : undefined);
+
+  const updatedMapping: AccountMapping = {
     ...existingMapping,
-    twitterUsernames: usernames,
-    bskyIdentifier: bskyIdentifier || existingMapping.bskyIdentifier,
-    // Only update password if provided
-    bskyPassword: bskyPassword || existingMapping.bskyPassword,
-    bskyServiceUrl: bskyServiceUrl || existingMapping.bskyServiceUrl,
-    owner: owner || existingMapping.owner,
+    twitterUsernames,
+    bskyIdentifier,
+    bskyPassword: normalizeOptionalString(req.body?.bskyPassword) || existingMapping.bskyPassword,
+    bskyServiceUrl: normalizeOptionalString(req.body?.bskyServiceUrl) || existingMapping.bskyServiceUrl,
+    owner,
     groupName: nextGroupName,
     groupEmoji: nextGroupEmoji,
+    createdByUserId,
   };
 
   ensureGroupExists(config, nextGroupName, nextGroupEmoji);
   config.mappings[index] = updatedMapping;
   saveConfig(config);
-  res.json(updatedMapping);
+  res.json(sanitizeMapping(updatedMapping, createUserLookupById(config), req.user));
 });
 
-app.delete('/api/mappings/:id', authenticateToken, (req, res) => {
+app.delete('/api/mappings/:id', authenticateToken, (req: any, res) => {
   const { id } = req.params;
   const config = getConfig();
-  config.mappings = config.mappings.filter((m) => m.id !== id);
+  const mapping = config.mappings.find((entry) => entry.id === id);
+
+  if (!mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have permission to delete this mapping.' });
+    return;
+  }
+
+  config.mappings = config.mappings.filter((entry) => entry.id !== id);
+  pendingBackfills = pendingBackfills.filter((entry) => entry.id !== id);
   saveConfig(config);
   res.json({ success: true });
 });
@@ -915,13 +1759,12 @@ app.post('/api/mappings/:id/delete-all-posts', authenticateToken, requireAdmin, 
 
   try {
     const deletedCount = await deleteAllPosts(id);
-    
-    // Clear local cache to stay in sync
+
     dbService.deleteTweetsByBskyIdentifier(mapping.bskyIdentifier);
-    
-    res.json({ 
-        success: true, 
-        message: `Deleted ${deletedCount} posts from ${mapping.bskyIdentifier} and cleared local cache.` 
+
+    res.json({
+      success: true,
+      message: `Deleted ${deletedCount} posts from ${mapping.bskyIdentifier} and cleared local cache.`,
     });
   } catch (err) {
     console.error('Failed to delete all posts:', err);
@@ -946,7 +1789,6 @@ app.post('/api/twitter-config', authenticateToken, requireAdmin, (req, res) => {
 
 app.get('/api/ai-config', authenticateToken, requireAdmin, (_req, res) => {
   const config = getConfig();
-  // Return legacy gemini key as part of new structure if needed
   const aiConfig = config.ai || {
     provider: 'gemini',
     apiKey: config.geminiApiKey || '',
@@ -965,7 +1807,6 @@ app.post('/api/ai-config', authenticateToken, requireAdmin, (req, res) => {
     baseUrl: baseUrl || undefined,
   };
 
-  // Clear legacy key to avoid confusion
   delete config.geminiApiKey;
 
   saveConfig(config);
@@ -974,25 +1815,36 @@ app.post('/api/ai-config', authenticateToken, requireAdmin, (req, res) => {
 
 // --- Status & Actions Routes ---
 
-app.get('/api/status', authenticateToken, (_req, res) => {
+app.get('/api/status', authenticateToken, (req: any, res) => {
   const config = getConfig();
   const now = Date.now();
-  const checkIntervalMs = (config.checkIntervalMinutes || 5) * 60 * 1000;
   const nextRunMs = Math.max(0, nextCheckTime - now);
+  const visibleMappingIds = getVisibleMappingIdSet(config, req.user);
+  const scopedPendingBackfills = pendingBackfills
+    .filter((backfill) => visibleMappingIds.has(backfill.id))
+    .sort((a, b) => a.sequence - b.sequence);
+
+  const scopedStatus =
+    currentAppStatus.state === 'backfilling' &&
+    currentAppStatus.backfillMappingId &&
+    !visibleMappingIds.has(currentAppStatus.backfillMappingId)
+      ? {
+          state: 'idle',
+          message: 'Idle',
+          lastUpdate: currentAppStatus.lastUpdate,
+        }
+      : currentAppStatus;
 
   res.json({
     lastCheckTime,
     nextCheckTime,
     nextCheckMinutes: Math.ceil(nextRunMs / 60000),
     checkIntervalMinutes: config.checkIntervalMinutes,
-    pendingBackfills: pendingBackfills
-      .slice()
-      .sort((a, b) => a.sequence - b.sequence)
-      .map((backfill, index) => ({
-        ...backfill,
-        position: index + 1,
-      })),
-    currentStatus: currentAppStatus,
+    pendingBackfills: scopedPendingBackfills.map((backfill, index) => ({
+      ...backfill,
+      position: index + 1,
+    })),
+    currentStatus: scopedStatus,
   });
 });
 
@@ -1005,7 +1857,7 @@ app.get('/api/update-status', authenticateToken, requireAdmin, (_req, res) => {
 });
 
 app.post('/api/update', authenticateToken, requireAdmin, (req: any, res) => {
-  const startedBy = typeof req.user?.email === 'string' && req.user.email.length > 0 ? req.user.email : 'admin';
+  const startedBy = getActorLabel(req.user);
   const result = startUpdateJob(startedBy);
   if (!result.ok) {
     const message = result.message;
@@ -1022,7 +1874,12 @@ app.post('/api/update', authenticateToken, requireAdmin, (req: any, res) => {
   });
 });
 
-app.post('/api/run-now', authenticateToken, (_req, res) => {
+app.post('/api/run-now', authenticateToken, (req: any, res) => {
+  if (!canRunNow(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to run checks manually.' });
+    return;
+  }
+
   lastCheckTime = 0;
   nextCheckTime = Date.now() + 1000;
   res.json({ success: true, message: 'Check triggered' });
@@ -1039,7 +1896,12 @@ app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res)
   res.json({ success: true, message: 'All backfills cleared' });
 });
 
-app.post('/api/backfill/:id', authenticateToken, requireAdmin, (req, res) => {
+app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
+  if (!canQueueBackfills(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to queue backfills.' });
+    return;
+  }
+
   const { id } = req.params;
   const { limit } = req.body;
   const config = getConfig();
@@ -1050,20 +1912,26 @@ app.post('/api/backfill/:id', authenticateToken, requireAdmin, (req, res) => {
     return;
   }
 
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have access to this mapping.' });
+    return;
+  }
+
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : undefined;
   const queuedAt = Date.now();
   const sequence = backfillSequence++;
-  const requestId = Math.random().toString(36).slice(2);
-  pendingBackfills = pendingBackfills.filter((b) => b.id !== id);
+  const requestId = randomUUID();
+  pendingBackfills = pendingBackfills.filter((entry) => entry.id !== id);
   pendingBackfills.push({
     id,
-    limit: limit ? Number(limit) : undefined,
+    limit: safeLimit,
     queuedAt,
     sequence,
     requestId,
   });
   pendingBackfills.sort((a, b) => a.sequence - b.sequence);
 
-  // Do not force a global run; the scheduler loop will pick up the pending backfill in ~5s
   res.json({
     success: true,
     message: `Backfill queued for @${mapping.twitterUsernames.join(', ')}`,
@@ -1071,9 +1939,22 @@ app.post('/api/backfill/:id', authenticateToken, requireAdmin, (req, res) => {
   });
 });
 
-app.delete('/api/backfill/:id', authenticateToken, (req, res) => {
+app.delete('/api/backfill/:id', authenticateToken, (req: any, res) => {
   const { id } = req.params;
-  pendingBackfills = pendingBackfills.filter((bid) => bid.id !== id);
+  const config = getConfig();
+  const mapping = config.mappings.find((entry) => entry.id === id);
+
+  if (!mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have permission to update this queue entry.' });
+    return;
+  }
+
+  pendingBackfills = pendingBackfills.filter((entry) => entry.id !== id);
   res.json({ success: true });
 });
 
@@ -1081,9 +1962,8 @@ app.delete('/api/backfill/:id', authenticateToken, (req, res) => {
 
 app.get('/api/config/export', authenticateToken, requireAdmin, (_req, res) => {
   const config = getConfig();
-  // Create a copy without user data (passwords)
   const { users, ...cleanConfig } = config;
-  
+
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', 'attachment; filename=tweets-2-bsky-config.json');
   res.json(cleanConfig);
@@ -1094,24 +1974,18 @@ app.post('/api/config/import', authenticateToken, requireAdmin, (req, res) => {
     const importData = req.body;
     const currentConfig = getConfig();
 
-    // Validate minimal structure
     if (!importData.mappings || !Array.isArray(importData.mappings)) {
-        res.status(400).json({ error: 'Invalid config format: missing mappings array' });
-        return;
+      res.status(400).json({ error: 'Invalid config format: missing mappings array' });
+      return;
     }
 
-    // Merge logic:
-    // 1. Keep current users (don't overwrite admin/passwords)
-    // 2. Overwrite mappings, twitter, ai config from import
-    // 3. Keep current values if import is missing them (optional, but safer to just replace sections)
-    
     const newConfig = {
-        ...currentConfig,
-        mappings: importData.mappings,
-        groups: Array.isArray(importData.groups) ? importData.groups : currentConfig.groups,
-        twitter: importData.twitter || currentConfig.twitter,
-        ai: importData.ai || currentConfig.ai,
-        checkIntervalMinutes: importData.checkIntervalMinutes || currentConfig.checkIntervalMinutes
+      ...currentConfig,
+      mappings: importData.mappings,
+      groups: Array.isArray(importData.groups) ? importData.groups : currentConfig.groups,
+      twitter: importData.twitter || currentConfig.twitter,
+      ai: importData.ai || currentConfig.ai,
+      checkIntervalMinutes: importData.checkIntervalMinutes || currentConfig.checkIntervalMinutes,
     };
 
     saveConfig(newConfig);
@@ -1122,10 +1996,23 @@ app.post('/api/config/import', authenticateToken, requireAdmin, (req, res) => {
   }
 });
 
-app.get('/api/recent-activity', authenticateToken, (req, res) => {
-  const limit = req.query.limit ? Number(req.query.limit) : 50;
-  const tweets = dbService.getRecentProcessedTweets(limit);
-  res.json(tweets);
+app.get('/api/recent-activity', authenticateToken, (req: any, res) => {
+  const limitCandidate = req.query.limit ? Number(req.query.limit) : 50;
+  const limit = Number.isFinite(limitCandidate) ? Math.max(1, Math.min(limitCandidate, 200)) : 50;
+  const config = getConfig();
+  const visibleSets = getVisibleMappingIdentitySets(config, req.user);
+  const scanLimit = canViewAllMappings(req.user) ? limit : Math.max(limit * 6, 150);
+
+  const tweets = dbService.getRecentProcessedTweets(scanLimit);
+  const filtered = canViewAllMappings(req.user)
+    ? tweets
+    : tweets.filter(
+        (tweet) =>
+          visibleSets.twitterUsernames.has(normalizeActor(tweet.twitter_username)) ||
+          visibleSets.bskyIdentifiers.has(normalizeActor(tweet.bsky_identifier)),
+      );
+
+  res.json(filtered.slice(0, limit));
 });
 
 app.post('/api/bsky/profiles', authenticateToken, async (req, res) => {
@@ -1143,7 +2030,7 @@ app.post('/api/bsky/profiles', authenticateToken, async (req, res) => {
   res.json(profiles);
 });
 
-app.get('/api/posts/search', authenticateToken, (req, res) => {
+app.get('/api/posts/search', authenticateToken, (req: any, res) => {
   const query = typeof req.query.q === 'string' ? req.query.q : '';
   if (!query.trim()) {
     res.json([]);
@@ -1152,8 +2039,21 @@ app.get('/api/posts/search', authenticateToken, (req, res) => {
 
   const requestedLimit = req.query.limit ? Number(req.query.limit) : 80;
   const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 200)) : 80;
+  const searchLimit = Math.min(200, Math.max(80, limit * 4));
+  const config = getConfig();
+  const visibleSets = getVisibleMappingIdentitySets(config, req.user);
 
-  const results = dbService.searchMigratedTweets(query, limit).map<LocalPostSearchResult>((row) => ({
+  const scopedRows = dbService
+    .searchMigratedTweets(query, searchLimit)
+    .filter(
+      (row) =>
+        canViewAllMappings(req.user) ||
+        visibleSets.twitterUsernames.has(normalizeActor(row.twitter_username)) ||
+        visibleSets.bskyIdentifiers.has(normalizeActor(row.bsky_identifier)),
+    )
+    .slice(0, limit);
+
+  const results = scopedRows.map<LocalPostSearchResult>((row) => ({
     twitterId: row.twitter_id,
     twitterUsername: row.twitter_username,
     bskyIdentifier: row.bsky_identifier,
@@ -1169,12 +2069,21 @@ app.get('/api/posts/search', authenticateToken, (req, res) => {
   res.json(results);
 });
 
-app.get('/api/posts/enriched', authenticateToken, async (req, res) => {
+app.get('/api/posts/enriched', authenticateToken, async (req: any, res) => {
   const requestedLimit = req.query.limit ? Number(req.query.limit) : 24;
   const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 80)) : 24;
+  const config = getConfig();
+  const visibleSets = getVisibleMappingIdentitySets(config, req.user);
 
-  const recent = dbService.getRecentProcessedTweets(limit * 4);
-  const migratedWithUri = recent.filter((row) => row.status === 'migrated' && row.bsky_uri);
+  const recent = dbService.getRecentProcessedTweets(limit * 8);
+  const migratedWithUri = recent.filter(
+    (row) =>
+      row.status === 'migrated' &&
+      row.bsky_uri &&
+      (canViewAllMappings(req.user) ||
+        visibleSets.twitterUsernames.has(normalizeActor(row.twitter_username)) ||
+        visibleSets.bskyIdentifiers.has(normalizeActor(row.bsky_identifier))),
+  );
 
   const deduped: ProcessedTweet[] = [];
   const seenUris = new Set<string>();
@@ -1192,7 +2101,6 @@ app.get('/api/posts/enriched', authenticateToken, async (req, res) => {
 
   res.json(enriched);
 });
-
 // Export for use by index.ts
 export function updateLastCheckTime() {
   const config = getConfig();
@@ -1230,8 +2138,12 @@ app.use((_req, res) => {
 });
 
 export function startServer() {
-  app.listen(PORT, '0.0.0.0' as any, () => {
+  app.listen(PORT, HOST as any, () => {
     console.log(`🚀 Web interface running at http://localhost:${PORT}`);
+    if (HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost') {
+      console.log(`🔒 Bound to ${HOST} (local-only). Use Tailscale Serve or a reverse proxy for remote access.`);
+      return;
+    }
     console.log('📡 Accessible on your local network/Tailscale via your IP.');
   });
 }

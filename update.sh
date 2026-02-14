@@ -1,84 +1,470 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
+APP_NAME="tweets-2-bsky"
+LEGACY_APP_NAME="twitter-mirror"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+RUNTIME_DIR="$SCRIPT_DIR/data/runtime"
+PID_FILE="$RUNTIME_DIR/${APP_NAME}.pid"
+LOCK_DIR="$RUNTIME_DIR/.update.lock"
+
+CONFIG_FILE="$SCRIPT_DIR/config.json"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+DO_INSTALL=1
+DO_BUILD=1
+DO_NATIVE_REBUILD=1
+DO_RESTART=1
+REMOTE_OVERRIDE=""
+BRANCH_OVERRIDE=""
+
+STASH_REF=""
+STASH_CREATED=0
+STASH_RESTORED=0
+
+BACKUP_SOURCES=()
+BACKUP_PATHS=()
+
+usage() {
+  cat <<'USAGE'
+Usage: ./update.sh [options]
+
+Default behavior:
+  - Pull latest git changes safely
+  - Install dependencies
+  - Rebuild native modules if needed
+  - Build server + web dashboard
+  - Restart existing runtime (PM2 or nohup) when possible
+
+Options:
+  --remote <name>         Git remote to pull from (default: origin or first remote)
+  --branch <name>         Git branch to pull (default: current branch or remote HEAD)
+  --skip-install          Skip npm install
+  --skip-build            Skip npm run build
+  --skip-native-rebuild   Skip native-module rebuild checks
+  --no-restart            Do not restart process after update
+  -h, --help              Show this help
+USAGE
+}
+
+require_command() {
+  local command_name="$1"
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "❌ Required command not found: $command_name"
+    exit 1
+  fi
+}
+
+check_node_version() {
+  local node_major
+  node_major="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
+  if [[ "$node_major" -lt 22 ]]; then
+    echo "❌ Node.js 22+ is required. Current: $(node -v 2>/dev/null || echo 'unknown')"
+    exit 1
+  fi
+}
+
+acquire_lock() {
+  mkdir -p "$RUNTIME_DIR"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "❌ Another update appears to be running."
+    echo "   If this is stale, remove: $LOCK_DIR"
+    exit 1
+  fi
+}
+
+release_lock() {
+  rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
+}
+
+backup_file() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+
+  local base
+  base="$(basename "$file")"
+  local backup_path
+  backup_path="$(mktemp "${TMPDIR:-/tmp}/tweets2bsky-${base}.XXXXXX")"
+  cp "$file" "$backup_path"
+  BACKUP_SOURCES+=("$file")
+  BACKUP_PATHS+=("$backup_path")
+}
+
+restore_backups() {
+  local idx
+  for idx in "${!BACKUP_SOURCES[@]}"; do
+    local src="${BACKUP_SOURCES[$idx]}"
+    local bak="${BACKUP_PATHS[$idx]}"
+    if [[ -f "$bak" ]]; then
+      cp "$bak" "$src"
+      rm -f "$bak"
+    fi
+  done
+}
+
+cleanup() {
+  restore_backups
+  release_lock
+}
+
+ensure_git_repo() {
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "❌ This directory is not a git repository: $SCRIPT_DIR"
+    exit 1
+  fi
+}
+
+resolve_remote() {
+  if [[ -n "$REMOTE_OVERRIDE" ]]; then
+    if ! git remote | grep -qx "$REMOTE_OVERRIDE"; then
+      echo "❌ Remote '$REMOTE_OVERRIDE' does not exist."
+      exit 1
+    fi
+    printf '%s\n' "$REMOTE_OVERRIDE"
+    return 0
+  fi
+
+  if git remote | grep -qx "origin"; then
+    printf '%s\n' "origin"
+    return 0
+  fi
+
+  local first_remote
+  first_remote="$(git remote | head -n 1)"
+  if [[ -z "$first_remote" ]]; then
+    echo "❌ No git remote configured."
+    exit 1
+  fi
+
+  printf '%s\n' "$first_remote"
+}
+
+resolve_branch() {
+  local remote="$1"
+
+  if [[ -n "$BRANCH_OVERRIDE" ]]; then
+    printf '%s\n' "$BRANCH_OVERRIDE"
+    return 0
+  fi
+
+  local current_branch
+  current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [[ -n "$current_branch" ]] && git show-ref --verify --quiet "refs/remotes/${remote}/${current_branch}"; then
+    printf '%s\n' "$current_branch"
+    return 0
+  fi
+
+  local remote_head
+  remote_head="$(git symbolic-ref --quiet --short "refs/remotes/${remote}/HEAD" 2>/dev/null || true)"
+  if [[ -n "$remote_head" ]]; then
+    printf '%s\n' "${remote_head#${remote}/}"
+    return 0
+  fi
+
+  if git show-ref --verify --quiet "refs/remotes/${remote}/main"; then
+    printf '%s\n' "main"
+    return 0
+  fi
+
+  if git show-ref --verify --quiet "refs/remotes/${remote}/master"; then
+    printf '%s\n' "master"
+    return 0
+  fi
+
+  if [[ -n "$current_branch" ]]; then
+    printf '%s\n' "$current_branch"
+    return 0
+  fi
+
+  echo "❌ Could not determine target branch for remote '$remote'."
+  exit 1
+}
+
+working_tree_dirty() {
+  [[ -n "$(git status --porcelain --untracked-files=normal)" ]]
+}
+
+stash_local_changes() {
+  if ! working_tree_dirty; then
+    return 0
+  fi
+
+  echo "🧳 Stashing local changes before update..."
+
+  local before after message
+  before="$(git stash list -n 1 --format=%gd || true)"
+  message="tweets-2-bsky-update-autostash-$(date -u +%Y%m%d-%H%M%S)"
+  git stash push -u -m "$message" >/dev/null
+  after="$(git stash list -n 1 --format=%gd || true)"
+
+  if [[ -n "$after" && "$after" != "$before" ]]; then
+    STASH_REF="$after"
+    STASH_CREATED=1
+    echo "✅ Saved local changes to $STASH_REF"
+  fi
+}
+
+restore_stash_if_needed() {
+  if [[ "$STASH_CREATED" -ne 1 || -z "$STASH_REF" ]]; then
+    return 0
+  fi
+
+  echo "🔁 Restoring stashed local changes ($STASH_REF)..."
+  if git stash apply --index "$STASH_REF" >/dev/null 2>&1; then
+    git stash drop "$STASH_REF" >/dev/null 2>&1 || true
+    STASH_RESTORED=1
+    echo "✅ Restored local changes from stash."
+  else
+    echo "⚠️  Could not auto-apply $STASH_REF cleanly."
+    echo "   Your changes are still preserved in stash."
+    echo "   Review manually with: git stash show -p $STASH_REF"
+  fi
+}
+
+checkout_branch() {
+  local remote="$1"
+  local target_branch="$2"
+
+  if ! git show-ref --verify --quiet "refs/remotes/${remote}/${target_branch}"; then
+    echo "❌ Remote branch not found: ${remote}/${target_branch}"
+    exit 1
+  fi
+
+  local current_branch
+  current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+
+  if [[ "$current_branch" == "$target_branch" ]]; then
+    return 0
+  fi
+
+  if git show-ref --verify --quiet "refs/heads/${target_branch}"; then
+    git switch "$target_branch" >/dev/null 2>&1 || git checkout "$target_branch" >/dev/null 2>&1
+  else
+    git switch -c "$target_branch" --track "${remote}/${target_branch}" >/dev/null 2>&1 || \
+      git checkout -b "$target_branch" --track "${remote}/${target_branch}" >/dev/null 2>&1
+  fi
+}
+
+pull_latest() {
+  local remote="$1"
+  local branch="$2"
+
+  echo "⬇️  Fetching latest changes from $remote..."
+  git fetch "$remote" --prune
+
+  checkout_branch "$remote" "$branch"
+  git branch --set-upstream-to="${remote}/${branch}" "$branch" >/dev/null 2>&1 || true
+
+  echo "🔄 Pulling latest changes from ${remote}/${branch}..."
+  if ! git pull --ff-only "$remote" "$branch"; then
+    echo "ℹ️  Fast-forward pull failed, retrying with rebase..."
+    git pull --rebase "$remote" "$branch"
+  fi
+}
+
+native_module_compatible() {
+  node -e "try{require('better-sqlite3');process.exit(0)}catch(e){console.error(e && e.message ? e.message : e);process.exit(1)}" >/dev/null 2>&1
+}
+
+rebuild_native_modules() {
+  if [[ "$DO_NATIVE_REBUILD" -eq 0 ]]; then
+    return 0
+  fi
+
+  if native_module_compatible; then
+    return 0
+  fi
+
+  echo "🔧 Native module mismatch detected, rebuilding..."
+  if npm run rebuild:native; then
+    return 0
+  fi
+
+  echo "⚠️  rebuild:native failed, trying npm rebuild better-sqlite3..."
+  if npm rebuild better-sqlite3; then
+    return 0
+  fi
+
+  npm rebuild better-sqlite3 --build-from-source
+}
+
+install_dependencies() {
+  if [[ "$DO_INSTALL" -ne 1 ]]; then
+    return 0
+  fi
+
+  echo "📦 Installing dependencies..."
+  npm install --no-audit --no-fund
+}
+
+build_project() {
+  if [[ "$DO_BUILD" -ne 1 ]]; then
+    return 0
+  fi
+
+  echo "🏗️  Building server + web dashboard..."
+  npm run build
+}
+
+pm2_has_process() {
+  local name="$1"
+  command -v pm2 >/dev/null 2>&1 && pm2 describe "$name" >/dev/null 2>&1
+}
+
+nohup_process_running() {
+  if [[ ! -f "$PID_FILE" ]]; then
+    return 1
+  fi
+
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -z "$pid" ]]; then
+    return 1
+  fi
+
+  if ! kill -0 "$pid" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local cmd
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$cmd" == *"dist/index.js"* || "$cmd" == *"npm start"* || "$cmd" == *"$APP_NAME"* ]]
+}
+
+restart_runtime() {
+  if [[ "$DO_RESTART" -ne 1 ]]; then
+    echo "⏭️  Skipping restart (--no-restart)."
+    return 0
+  fi
+
+  echo "🔄 Restarting runtime..."
+
+  if pm2_has_process "$APP_NAME"; then
+    pm2 restart "$APP_NAME" --update-env >/dev/null 2>&1 || {
+      echo "⚠️  PM2 restart failed for $APP_NAME. Recreating process..."
+      pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
+      pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env >/dev/null 2>&1
+    }
+    pm2 save >/dev/null 2>&1 || true
+    echo "✅ Restarted PM2 process: $APP_NAME"
+    return 0
+  fi
+
+  if pm2_has_process "$LEGACY_APP_NAME"; then
+    pm2 restart "$LEGACY_APP_NAME" --update-env >/dev/null 2>&1 || {
+      echo "⚠️  PM2 restart failed for $LEGACY_APP_NAME. Recreating under $APP_NAME..."
+      pm2 delete "$LEGACY_APP_NAME" >/dev/null 2>&1 || true
+      pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env >/dev/null 2>&1
+    }
+    pm2 save >/dev/null 2>&1 || true
+    echo "✅ Restarted PM2 process."
+    return 0
+  fi
+
+  if nohup_process_running; then
+    bash "$SCRIPT_DIR/install.sh" --start-only --nohup --skip-native-rebuild >/dev/null
+    echo "✅ Restarted nohup runtime."
+    return 0
+  fi
+
+  if command -v pm2 >/dev/null 2>&1; then
+    bash "$SCRIPT_DIR/install.sh" --start-only --pm2 --skip-native-rebuild >/dev/null
+    echo "✅ Started PM2 runtime (was not running)."
+    return 0
+  fi
+
+  bash "$SCRIPT_DIR/install.sh" --start-only --nohup --skip-native-rebuild >/dev/null
+  echo "✅ Started nohup runtime (was not running)."
+}
+
+print_summary() {
+  echo ""
+  echo "✅ Update complete!"
+  echo ""
+  echo "Current commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+  echo "Current branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
+
+  if [[ "$STASH_CREATED" -eq 1 ]]; then
+    if [[ "$STASH_RESTORED" -eq 1 ]]; then
+      echo "Stash restore: restored"
+    else
+      echo "Stash restore: pending manual apply ($STASH_REF)"
+    fi
+  fi
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remote)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --remote"
+        exit 1
+      fi
+      REMOTE_OVERRIDE="$2"
+      shift
+      ;;
+    --branch)
+      if [[ $# -lt 2 ]]; then
+        echo "Missing value for --branch"
+        exit 1
+      fi
+      BRANCH_OVERRIDE="$2"
+      shift
+      ;;
+    --skip-install)
+      DO_INSTALL=0
+      ;;
+    --skip-build)
+      DO_BUILD=0
+      ;;
+    --skip-native-rebuild)
+      DO_NATIVE_REBUILD=0
+      ;;
+    --no-restart)
+      DO_RESTART=0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1"
+      usage
+      exit 1
+      ;;
+  esac
+  shift
+done
 
 echo "🔄 Tweets-2-Bsky Updater"
 echo "========================="
 
-CONFIG_FILE="$SCRIPT_DIR/config.json"
-CONFIG_BACKUP=""
+require_command git
+require_command node
+require_command npm
+check_node_version
+ensure_git_repo
 
-if [ -f "$CONFIG_FILE" ]; then
-  CONFIG_BACKUP="$(mktemp "${TMPDIR:-/tmp}/tweets2bsky-config.XXXXXX")"
-  cp "$CONFIG_FILE" "$CONFIG_BACKUP"
-  echo "🛡️  Backed up config.json to protect local settings."
-fi
+acquire_lock
+trap cleanup EXIT
 
-restore_config() {
-  if [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ]; then
-    cp "$CONFIG_BACKUP" "$CONFIG_FILE"
-    rm -f "$CONFIG_BACKUP"
-    echo "🔐 Restored config.json."
-  fi
-}
+backup_file "$CONFIG_FILE"
+backup_file "$ENV_FILE"
 
-trap restore_config EXIT
+stash_local_changes
 
-if ! command -v git >/dev/null 2>&1; then
-  echo "❌ Git is not installed. Please install git to update."
-  exit 1
-fi
+remote="$(resolve_remote)"
+branch="$(resolve_branch "$remote")"
 
-if ! command -v npm >/dev/null 2>&1; then
-  echo "❌ npm is not installed. Please install Node.js/npm to update."
-  exit 1
-fi
-
-echo "⬇️  Pulling latest changes..."
-if ! git pull --autostash; then
-  echo "⚠️  Standard pull failed. Attempting to stash local changes and retry..."
-  git stash push -u -m "tweets-2-bsky-update-autostash"
-  if ! git pull; then
-    echo "❌ Git pull failed even after stashing. Resolve conflicts manually and rerun ./update.sh."
-    exit 1
-  fi
-fi
-
-echo "📦 Installing dependencies..."
-npm install
-
-echo "🔧 Verifying native modules..."
-if ! npm run rebuild:native; then
-  echo "⚠️  rebuild:native failed (or missing). Falling back to direct better-sqlite3 rebuild..."
-  if ! npm rebuild better-sqlite3; then
-    npm rebuild better-sqlite3 --build-from-source
-  fi
-fi
-
-echo "🏗️  Building server + web dashboard..."
-npm run build
-
-echo "✅ Update complete!"
-
-if command -v pm2 >/dev/null 2>&1; then
-  PROCESS_NAME="tweets-2-bsky"
-  if pm2 describe twitter-mirror >/dev/null 2>&1; then
-    PROCESS_NAME="twitter-mirror"
-  elif pm2 describe tweets-2-bsky >/dev/null 2>&1; then
-    PROCESS_NAME="tweets-2-bsky"
-  fi
-
-  echo "🔄 Restarting PM2 process '$PROCESS_NAME'..."
-  if ! pm2 restart "$PROCESS_NAME" --update-env >/dev/null 2>&1; then
-    echo "ℹ️  PM2 process '$PROCESS_NAME' not found or restart failed. Recreating..."
-    pm2 delete "$PROCESS_NAME" >/dev/null 2>&1 || true
-    pm2 start dist/index.js --name "$PROCESS_NAME"
-  fi
-  pm2 save
-  echo "✅ PM2 process restarted and saved."
-else
-  echo "⚠️  PM2 not found. Please restart your application manually."
-fi
+pull_latest "$remote" "$branch"
+install_dependencies
+rebuild_native_modules
+build_project
+restart_runtime
+restore_stash_if_needed
+print_summary

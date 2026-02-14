@@ -1,10 +1,9 @@
 import axios from 'axios';
 import {
-  AlertTriangle,
   ArrowUpRight,
   Bot,
-  ChevronLeft,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Clock3,
   Download,
@@ -43,7 +42,7 @@ import { cn } from './lib/utils';
 type ThemeMode = 'system' | 'light' | 'dark';
 type AuthView = 'login' | 'register';
 type DashboardTab = 'overview' | 'accounts' | 'posts' | 'activity' | 'settings';
-type SettingsSection = 'twitter' | 'ai' | 'data';
+type SettingsSection = 'account' | 'users' | 'twitter' | 'ai' | 'data';
 
 type AppState = 'idle' | 'checking' | 'backfilling' | 'pacing' | 'processing';
 
@@ -51,12 +50,20 @@ interface AccountMapping {
   id: string;
   twitterUsernames: string[];
   bskyIdentifier: string;
-  bskyPassword: string;
+  bskyPassword?: string;
   bskyServiceUrl?: string;
   enabled: boolean;
   owner?: string;
   groupName?: string;
   groupEmoji?: string;
+  createdByUserId?: string;
+  createdByLabel?: string;
+  createdByUser?: {
+    id: string;
+    username?: string;
+    email?: string;
+    role: 'admin' | 'user';
+  };
 }
 
 interface AccountGroup {
@@ -200,9 +207,39 @@ interface StatusResponse {
   currentStatus: StatusState;
 }
 
+interface UserPermissions {
+  viewAllMappings: boolean;
+  manageOwnMappings: boolean;
+  manageAllMappings: boolean;
+  manageGroups: boolean;
+  queueBackfills: boolean;
+  runNow: boolean;
+}
+
 interface AuthUser {
-  email: string;
+  id: string;
+  username?: string;
+  email?: string;
   isAdmin: boolean;
+  permissions: UserPermissions;
+}
+
+interface ManagedUser {
+  id: string;
+  username?: string;
+  email?: string;
+  role: 'admin' | 'user';
+  isAdmin: boolean;
+  permissions: UserPermissions;
+  createdAt: string;
+  updatedAt: string;
+  mappingCount: number;
+  activeMappingCount: number;
+  mappings: AccountMapping[];
+}
+
+interface BootstrapStatus {
+  bootstrapOpen: boolean;
 }
 
 interface RuntimeVersionInfo {
@@ -238,6 +275,26 @@ interface MappingFormState {
   groupEmoji: string;
 }
 
+interface UserFormState {
+  username: string;
+  email: string;
+  password: string;
+  isAdmin: boolean;
+  permissions: UserPermissions;
+}
+
+interface AccountSecurityEmailState {
+  currentEmail: string;
+  newEmail: string;
+  password: string;
+}
+
+interface AccountSecurityPasswordState {
+  currentPassword: string;
+  newPassword: string;
+  confirmPassword: string;
+}
+
 const defaultMappingForm = (): MappingFormState => ({
   owner: '',
   bskyIdentifier: '',
@@ -245,6 +302,14 @@ const defaultMappingForm = (): MappingFormState => ({
   bskyServiceUrl: 'https://bsky.social',
   groupName: '',
   groupEmoji: '📁',
+});
+
+const defaultUserForm = (): UserFormState => ({
+  username: '',
+  email: '',
+  password: '',
+  isAdmin: false,
+  permissions: { ...DEFAULT_USER_PERMISSIONS },
 });
 
 const DEFAULT_GROUP_NAME = 'Ungrouped';
@@ -261,6 +326,26 @@ const ADD_ACCOUNT_STEP_COUNT = 4;
 const ADD_ACCOUNT_STEPS = ['Owner', 'Sources', 'Bluesky', 'Confirm'] as const;
 const ACCOUNT_SEARCH_MIN_SCORE = 22;
 const DEFAULT_BACKFILL_LIMIT = 15;
+const DEFAULT_USER_PERMISSIONS: UserPermissions = {
+  viewAllMappings: false,
+  manageOwnMappings: true,
+  manageAllMappings: false,
+  manageGroups: false,
+  queueBackfills: true,
+  runNow: true,
+};
+const PERMISSION_OPTIONS: Array<{
+  key: keyof UserPermissions;
+  label: string;
+  help: string;
+}> = [
+  { key: 'viewAllMappings', label: 'View all mappings', help: 'See every mapped account, post, and activity row.' },
+  { key: 'manageOwnMappings', label: 'Manage own mappings', help: 'Create, edit, and delete mappings this user owns.' },
+  { key: 'manageAllMappings', label: 'Manage all mappings', help: 'Edit/delete mappings created by any user.' },
+  { key: 'manageGroups', label: 'Manage groups', help: 'Create, rename, and delete account groups.' },
+  { key: 'queueBackfills', label: 'Queue backfills', help: 'Queue backfills for mappings they can manage.' },
+  { key: 'runNow', label: 'Run checks now', help: 'Trigger an immediate scheduler run.' },
+];
 
 const selectClassName =
   'flex h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
@@ -354,6 +439,25 @@ function getTabFromPath(pathname: string): DashboardTab | null {
   const normalized = normalizePath(pathname);
   const entry = (Object.entries(TAB_PATHS) as Array<[DashboardTab, string]>).find(([, path]) => path === normalized);
   return entry ? entry[0] : null;
+}
+
+function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function normalizeUsername(value: string): string {
+  return value.trim().replace(/^@/, '').toLowerCase();
+}
+
+function getUserLabel(user?: Pick<AuthUser, 'username' | 'email'>): string {
+  return user?.username || user?.email || 'user';
+}
+
+function normalizePermissions(permissions?: Partial<UserPermissions>): UserPermissions {
+  return {
+    ...DEFAULT_USER_PERMISSIONS,
+    ...(permissions || {}),
+  };
 }
 
 function addTwitterUsernames(current: string[], value: string): string[] {
@@ -522,7 +626,11 @@ function buildFacetSegments(text: string, facets: BskyFacet[]): FacetSegment[] {
     } else if (feature.$type === 'app.bsky.richtext.facet#mention' && feature.did) {
       segments.push({ type: 'mention', text: rawText, href: `https://bsky.app/profile/${feature.did}` });
     } else if (feature.$type === 'app.bsky.richtext.facet#tag' && feature.tag) {
-      segments.push({ type: 'tag', text: rawText, href: `https://bsky.app/hashtag/${encodeURIComponent(feature.tag)}` });
+      segments.push({
+        type: 'tag',
+        text: rawText,
+        href: `https://bsky.app/hashtag/${encodeURIComponent(feature.tag)}`,
+      });
     } else {
       segments.push({ type: 'text', text: rawText });
     }
@@ -548,6 +656,7 @@ function formatCompactNumber(value: number): string {
 function App() {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('token'));
   const [authView, setAuthView] = useState<AuthView>('login');
+  const [bootstrapOpen, setBootstrapOpen] = useState(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
     const saved = localStorage.getItem('theme-mode');
     if (saved === 'light' || saved === 'dark' || saved === 'system') {
@@ -599,7 +708,9 @@ function App() {
   const [newGroupEmoji, setNewGroupEmoji] = useState(DEFAULT_GROUP_EMOJI);
   const [isAddAccountSheetOpen, setIsAddAccountSheetOpen] = useState(false);
   const [addAccountStep, setAddAccountStep] = useState(1);
-  const [settingsSectionOverrides, setSettingsSectionOverrides] = useState<Partial<Record<SettingsSection, boolean>>>({});
+  const [settingsSectionOverrides, setSettingsSectionOverrides] = useState<Partial<Record<SettingsSection, boolean>>>(
+    {},
+  );
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Record<string, boolean>>(() => {
     const raw = localStorage.getItem('accounts-collapsed-groups');
     if (!raw) return {};
@@ -620,6 +731,21 @@ function App() {
   const [groupDraftsByKey, setGroupDraftsByKey] = useState<Record<string, { name: string; emoji: string }>>({});
   const [isGroupActionBusy, setIsGroupActionBusy] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [managedUsers, setManagedUsers] = useState<ManagedUser[]>([]);
+  const [accountsCreatorFilter, setAccountsCreatorFilter] = useState('all');
+  const [newUserForm, setNewUserForm] = useState<UserFormState>(defaultUserForm);
+  const [editingUserId, setEditingUserId] = useState<string | null>(null);
+  const [editingUserForm, setEditingUserForm] = useState<UserFormState>(defaultUserForm);
+  const [emailForm, setEmailForm] = useState<AccountSecurityEmailState>({
+    currentEmail: '',
+    newEmail: '',
+    password: '',
+  });
+  const [passwordForm, setPasswordForm] = useState<AccountSecurityPasswordState>({
+    currentPassword: '',
+    newPassword: '',
+    confirmPassword: '',
+  });
 
   const [isBusy, setIsBusy] = useState(false);
   const [isUpdateBusy, setIsUpdateBusy] = useState(false);
@@ -630,6 +756,14 @@ function App() {
   const postsSearchRequestRef = useRef(0);
 
   const isAdmin = me?.isAdmin ?? false;
+  const effectivePermissions = useMemo<UserPermissions>(() => normalizePermissions(me?.permissions), [me?.permissions]);
+  const canManageAllMappings = isAdmin || effectivePermissions.manageAllMappings;
+  const canManageOwnMappings = isAdmin || effectivePermissions.manageOwnMappings;
+  const canCreateMappings = canManageAllMappings || canManageOwnMappings;
+  const canManageGroupsPermission = isAdmin || effectivePermissions.manageGroups;
+  const canQueueBackfillsPermission = isAdmin || effectivePermissions.queueBackfills;
+  const canRunNowPermission = isAdmin || effectivePermissions.runNow;
+  const hasCurrentEmail = Boolean(me?.email && me.email.trim().length > 0);
   const authHeaders = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
 
   const showNotice = useCallback((tone: Notice['tone'], message: string) => {
@@ -670,6 +804,13 @@ function App() {
     setGroupDraftsByKey({});
     setIsGroupActionBusy(false);
     setIsUpdateBusy(false);
+    setManagedUsers([]);
+    setAccountsCreatorFilter('all');
+    setNewUserForm(defaultUserForm());
+    setEditingUserId(null);
+    setEditingUserForm(defaultUserForm());
+    setEmailForm({ currentEmail: '', newEmail: '', password: '' });
+    setPasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
     postsSearchRequestRef.current = 0;
     setAuthView('login');
   }, []);
@@ -684,6 +825,15 @@ function App() {
     },
     [handleLogout, showNotice],
   );
+
+  const fetchBootstrapStatus = useCallback(async () => {
+    try {
+      const response = await axios.get<BootstrapStatus>('/api/auth/bootstrap-status');
+      setBootstrapOpen(Boolean(response.data?.bootstrapOpen));
+    } catch {
+      setBootstrapOpen(false);
+    }
+  }, []);
 
   const fetchStatus = useCallback(async () => {
     if (!authHeaders) {
@@ -763,6 +913,20 @@ function App() {
     }
   }, [authHeaders, handleAuthFailure, isAdmin]);
 
+  const fetchManagedUsers = useCallback(async () => {
+    if (!authHeaders || !isAdmin) {
+      setManagedUsers([]);
+      return;
+    }
+
+    try {
+      const response = await axios.get<ManagedUser[]>('/api/admin/users', { headers: authHeaders });
+      setManagedUsers(Array.isArray(response.data) ? response.data : []);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to fetch dashboard users.');
+    }
+  }, [authHeaders, handleAuthFailure, isAdmin]);
+
   const fetchProfiles = useCallback(
     async (actors: string[]) => {
       if (!authHeaders) {
@@ -802,19 +966,27 @@ function App() {
       ]);
 
       const profile = meResponse.data;
-      const mappingData = mappingsResponse.data;
+      const mappingData = Array.isArray(mappingsResponse.data) ? mappingsResponse.data : [];
       const groupData = Array.isArray(groupsResponse.data) ? groupsResponse.data : [];
-      setMe(profile);
+      setMe({
+        ...profile,
+        permissions: normalizePermissions(profile.permissions),
+      });
       setMappings(mappingData);
       setGroups(groupData);
+      setEmailForm((previous) => ({
+        ...previous,
+        currentEmail: profile.email || '',
+      }));
       const versionResponse = await axios.get<RuntimeVersionInfo>('/api/version', { headers: authHeaders });
       setRuntimeVersion(versionResponse.data);
 
       if (profile.isAdmin) {
-        const [twitterResponse, aiResponse, updateStatusResponse] = await Promise.all([
+        const [twitterResponse, aiResponse, updateStatusResponse, usersResponse] = await Promise.all([
           axios.get<TwitterConfig>('/api/twitter-config', { headers: authHeaders }),
           axios.get<AIConfig>('/api/ai-config', { headers: authHeaders }),
           axios.get<UpdateStatusInfo>('/api/update-status', { headers: authHeaders }),
+          axios.get<ManagedUser[]>('/api/admin/users', { headers: authHeaders }),
         ]);
 
         setTwitterConfig({
@@ -831,8 +1003,10 @@ function App() {
           baseUrl: aiResponse.data.baseUrl || '',
         });
         setUpdateStatus(updateStatusResponse.data);
+        setManagedUsers(Array.isArray(usersResponse.data) ? usersResponse.data : []);
       } else {
         setUpdateStatus(null);
+        setManagedUsers([]);
       }
 
       await Promise.all([fetchStatus(), fetchRecentActivity(), fetchEnrichedPosts()]);
@@ -879,12 +1053,6 @@ function App() {
   }, [collapsedGroupKeys]);
 
   useEffect(() => {
-    if (!isAdmin && activeTab === 'settings') {
-      setActiveTab('overview');
-    }
-  }, [activeTab, isAdmin]);
-
-  useEffect(() => {
     const media = window.matchMedia('(prefers-color-scheme: dark)');
 
     const applyTheme = () => {
@@ -904,11 +1072,18 @@ function App() {
 
   useEffect(() => {
     if (!token) {
+      void fetchBootstrapStatus();
       return;
     }
 
     void fetchData();
-  }, [token, fetchData]);
+  }, [token, fetchBootstrapStatus, fetchData]);
+
+  useEffect(() => {
+    if (!bootstrapOpen && authView === 'register') {
+      setAuthView('login');
+    }
+  }, [authView, bootstrapOpen]);
 
   useEffect(() => {
     if (!token) {
@@ -1006,20 +1181,16 @@ function App() {
   const currentStatus = status?.currentStatus;
   const latestActivity = recentActivity[0];
   const dashboardTabs = useMemo(
-    () =>
-      [
-        { id: 'overview' as DashboardTab, label: 'Overview', icon: LayoutDashboard },
-        { id: 'accounts' as DashboardTab, label: 'Accounts', icon: Users },
-        { id: 'posts' as DashboardTab, label: 'Posts', icon: Newspaper },
-        { id: 'activity' as DashboardTab, label: 'Activity', icon: History },
-        { id: 'settings' as DashboardTab, label: 'Settings', icon: Settings2, adminOnly: true },
-      ].filter((tab) => (tab.adminOnly ? isAdmin : true)),
-    [isAdmin],
+    () => [
+      { id: 'overview' as DashboardTab, label: 'Overview', icon: LayoutDashboard },
+      { id: 'accounts' as DashboardTab, label: 'Accounts', icon: Users },
+      { id: 'posts' as DashboardTab, label: 'Posts', icon: Newspaper },
+      { id: 'activity' as DashboardTab, label: 'Activity', icon: History },
+      { id: 'settings' as DashboardTab, label: 'Settings', icon: Settings2 },
+    ],
+    [],
   );
-  const postedActivity = useMemo(
-    () => enrichedPosts.slice(0, 12),
-    [enrichedPosts],
-  );
+  const postedActivity = useMemo(() => enrichedPosts.slice(0, 12), [enrichedPosts]);
   const engagementByAccount = useMemo(() => {
     const map = new Map<string, { identifier: string; score: number; posts: number }>();
     for (const post of enrichedPosts) {
@@ -1083,6 +1254,13 @@ function App() {
     () => groupOptions.filter((group) => group.key !== DEFAULT_GROUP_KEY),
     [groupOptions],
   );
+  const managedUsersById = useMemo(() => new Map(managedUsers.map((user) => [user.id, user])), [managedUsers]);
+  const accountMappingsForView = useMemo(() => {
+    if (!isAdmin || accountsCreatorFilter === 'all') {
+      return mappings;
+    }
+    return mappings.filter((mapping) => mapping.createdByUserId === accountsCreatorFilter);
+  }, [accountsCreatorFilter, isAdmin, mappings]);
   const groupedMappings = useMemo(() => {
     const groups = new Map<string, { key: string; name: string; emoji: string; mappings: AccountMapping[] }>();
     for (const option of groupOptions) {
@@ -1091,7 +1269,7 @@ function App() {
         mappings: [],
       });
     }
-    for (const mapping of mappings) {
+    for (const mapping of accountMappingsForView) {
       const group = getMappingGroupMeta(mapping);
       const existing = groups.get(group.key);
       if (!existing) {
@@ -1117,7 +1295,7 @@ function App() {
           ),
         ),
       }));
-  }, [groupOptions, mappings]);
+  }, [accountMappingsForView, groupOptions]);
   const normalizedAccountsQuery = useMemo(() => normalizeSearchValue(accountsSearchQuery), [accountsSearchQuery]);
   const accountSearchTokens = useMemo(() => tokenizeSearchValue(normalizedAccountsQuery), [normalizedAccountsQuery]);
   const accountSearchScores = useMemo(() => {
@@ -1126,11 +1304,11 @@ function App() {
       return scores;
     }
 
-    for (const mapping of mappings) {
+    for (const mapping of accountMappingsForView) {
       scores.set(mapping.id, scoreAccountMapping(mapping, normalizedAccountsQuery, accountSearchTokens));
     }
     return scores;
-  }, [accountSearchTokens, mappings, normalizedAccountsQuery]);
+  }, [accountMappingsForView, accountSearchTokens, normalizedAccountsQuery]);
   const filteredGroupedMappings = useMemo(() => {
     const hasQuery = normalizedAccountsQuery.length > 0;
     const sortByScore = (items: AccountMapping[]) => {
@@ -1164,8 +1342,10 @@ function App() {
 
     const allMappings = sortByScore(
       hasQuery
-        ? mappings.filter((mapping) => (accountSearchScores.get(mapping.id) || 0) >= ACCOUNT_SEARCH_MIN_SCORE)
-        : [...mappings].sort((a, b) =>
+        ? accountMappingsForView.filter(
+            (mapping) => (accountSearchScores.get(mapping.id) || 0) >= ACCOUNT_SEARCH_MIN_SCORE,
+          )
+        : [...accountMappingsForView].sort((a, b) =>
             `${(a.owner || '').toLowerCase()}-${a.bskyIdentifier.toLowerCase()}`.localeCompare(
               `${(b.owner || '').toLowerCase()}-${b.bskyIdentifier.toLowerCase()}`,
             ),
@@ -1180,17 +1360,16 @@ function App() {
         mappings: allMappings,
       },
     ];
-  }, [accountSearchScores, accountsViewMode, groupedMappings, mappings, normalizedAccountsQuery]);
+  }, [accountMappingsForView, accountSearchScores, accountsViewMode, groupedMappings, normalizedAccountsQuery]);
   const accountMatchesCount = useMemo(
     () => filteredGroupedMappings.reduce((total, group) => total + group.mappings.length, 0),
     [filteredGroupedMappings],
   );
-  const groupKeysForCollapse = useMemo(
-    () => groupedMappings.map((group) => group.key),
-    [groupedMappings],
-  );
+  const groupKeysForCollapse = useMemo(() => groupedMappings.map((group) => group.key), [groupedMappings]);
   const allGroupsCollapsed = useMemo(
-    () => groupKeysForCollapse.length > 0 && groupKeysForCollapse.every((groupKey) => collapsedGroupKeys[groupKey] === true),
+    () =>
+      groupKeysForCollapse.length > 0 &&
+      groupKeysForCollapse.every((groupKey) => collapsedGroupKeys[groupKey] === true),
     [collapsedGroupKeys, groupKeysForCollapse],
   );
   const resolveMappingForLocalPost = useCallback(
@@ -1238,10 +1417,18 @@ function App() {
       }),
     [activityGroupFilter, recentActivity, resolveMappingForActivity],
   );
+  const canManageMapping = useCallback(
+    (mapping: AccountMapping) =>
+      canManageAllMappings ||
+      (canManageOwnMappings && (!mapping.createdByUserId || mapping.createdByUserId === me?.id)),
+    [canManageAllMappings, canManageOwnMappings, me?.id],
+  );
   const twitterConfigured = Boolean(twitterConfig.authToken && twitterConfig.ct0);
   const aiConfigured = Boolean(aiConfig.apiKey);
   const sectionDefaultExpanded = useMemo<Record<SettingsSection, boolean>>(
     () => ({
+      account: true,
+      users: true,
       twitter: !twitterConfigured,
       ai: !aiConfigured,
       data: false,
@@ -1267,6 +1454,19 @@ function App() {
       setActivityGroupFilter('all');
     }
   }, [activityGroupFilter, groupOptions, postsGroupFilter]);
+
+  useEffect(() => {
+    if (!isAdmin) {
+      if (accountsCreatorFilter !== 'all') {
+        setAccountsCreatorFilter('all');
+      }
+      return;
+    }
+
+    if (accountsCreatorFilter !== 'all' && !managedUsers.some((user) => user.id === accountsCreatorFilter)) {
+      setAccountsCreatorFilter('all');
+    }
+  }, [accountsCreatorFilter, isAdmin, managedUsers]);
 
   useEffect(() => {
     setGroupDraftsByKey((previous) => {
@@ -1361,10 +1561,15 @@ function App() {
   };
 
   const themeIcon =
-    themeMode === 'system' ? <SunMoon className="h-4 w-4" /> : themeMode === 'light' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />;
+    themeMode === 'system' ? (
+      <SunMoon className="h-4 w-4" />
+    ) : themeMode === 'light' ? (
+      <Sun className="h-4 w-4" />
+    ) : (
+      <Moon className="h-4 w-4" />
+    );
 
-  const themeLabel =
-    themeMode === 'system' ? `Theme: system (${resolvedTheme})` : `Theme: ${themeMode}`;
+  const themeLabel = themeMode === 'system' ? `Theme: system (${resolvedTheme})` : `Theme: ${themeMode}`;
   const runtimeVersionLabel = runtimeVersion
     ? `v${runtimeVersion.version}${runtimeVersion.commit ? ` (${runtimeVersion.commit})` : ''}`
     : 'v--';
@@ -1383,11 +1588,11 @@ function App() {
     setIsBusy(true);
 
     const data = new FormData(event.currentTarget);
-    const email = String(data.get('email') || '').trim();
+    const identifier = String(data.get('identifier') || '').trim();
     const password = String(data.get('password') || '');
 
     try {
-      const response = await axios.post<{ token: string }>('/api/login', { email, password });
+      const response = await axios.post<{ token: string }>('/api/login', { identifier, password });
       localStorage.setItem('token', response.data.token);
       setToken(response.data.token);
       showNotice('success', 'Logged in.');
@@ -1404,13 +1609,15 @@ function App() {
     setIsBusy(true);
 
     const data = new FormData(event.currentTarget);
+    const username = String(data.get('username') || '').trim();
     const email = String(data.get('email') || '').trim();
     const password = String(data.get('password') || '');
 
     try {
-      await axios.post('/api/register', { email, password });
+      await axios.post('/api/register', { username, email, password });
       setAuthView('login');
       showNotice('success', 'Registration successful. Please log in.');
+      await fetchBootstrapStatus();
     } catch (error) {
       setAuthError(getApiErrorMessage(error, 'Registration failed.'));
     } finally {
@@ -1420,6 +1627,10 @@ function App() {
 
   const runNow = async () => {
     if (!authHeaders) {
+      return;
+    }
+    if (!canRunNowPermission) {
+      showNotice('error', 'You do not have permission to run checks now.');
       return;
     }
 
@@ -1455,6 +1666,11 @@ function App() {
     if (!authHeaders) {
       return;
     }
+    const mapping = mappings.find((entry) => entry.id === mappingId);
+    if (!mapping || !canQueueBackfillsPermission || !canManageMapping(mapping)) {
+      showNotice('error', 'You do not have permission to queue backfill for this account.');
+      return;
+    }
 
     const busy = pendingBackfills.length > 0 || currentStatus?.state === 'backfilling';
     if (busy) {
@@ -1469,6 +1685,10 @@ function App() {
 
     try {
       if (mode === 'reset') {
+        if (!isAdmin) {
+          showNotice('error', 'Only admins can reset cache before backfill.');
+          return;
+        }
         await axios.delete(`/api/mappings/${mappingId}/cache`, { headers: authHeaders });
       }
 
@@ -1517,6 +1737,11 @@ function App() {
 
   const handleDeleteMapping = async (mappingId: string) => {
     if (!authHeaders) {
+      return;
+    }
+    const mapping = mappings.find((entry) => entry.id === mappingId);
+    if (!mapping || !canManageMapping(mapping)) {
+      showNotice('error', 'You do not have permission to delete this mapping.');
       return;
     }
 
@@ -1580,6 +1805,10 @@ function App() {
     if (!authHeaders) {
       return;
     }
+    if (!canManageGroupsPermission) {
+      showNotice('error', 'You do not have permission to create groups.');
+      return;
+    }
 
     const name = newGroupName.trim();
     const emoji = newGroupEmoji.trim() || DEFAULT_GROUP_EMOJI;
@@ -1604,6 +1833,10 @@ function App() {
 
   const handleAssignMappingGroup = async (mapping: AccountMapping, groupKey: string) => {
     if (!authHeaders) {
+      return;
+    }
+    if (!canManageMapping(mapping)) {
+      showNotice('error', 'You do not have permission to update this mapping.');
       return;
     }
 
@@ -1662,6 +1895,10 @@ function App() {
     if (!authHeaders) {
       return;
     }
+    if (!canManageGroupsPermission) {
+      showNotice('error', 'You do not have permission to rename groups.');
+      return;
+    }
 
     const draft = groupDraftsByKey[groupKey];
     if (!draft || !draft.name.trim()) {
@@ -1690,6 +1927,10 @@ function App() {
 
   const handleDeleteGroup = async (groupKey: string) => {
     if (!authHeaders) {
+      return;
+    }
+    if (!canManageGroupsPermission) {
+      showNotice('error', 'You do not have permission to delete groups.');
       return;
     }
 
@@ -1722,13 +1963,20 @@ function App() {
   };
 
   const resetAddAccountDraft = () => {
-    setNewMapping(defaultMappingForm());
+    setNewMapping({
+      ...defaultMappingForm(),
+      owner: getUserLabel(me),
+    });
     setNewTwitterUsers([]);
     setNewTwitterInput('');
     setAddAccountStep(1);
   };
 
   const openAddAccountSheet = () => {
+    if (!canCreateMappings) {
+      showNotice('error', 'You do not have permission to add mappings.');
+      return;
+    }
     resetAddAccountDraft();
     setIsAddAccountSheetOpen(true);
   };
@@ -1752,6 +2000,10 @@ function App() {
 
   const submitNewMapping = async () => {
     if (!authHeaders) {
+      return;
+    }
+    if (!canCreateMappings) {
+      showNotice('error', 'You do not have permission to add mappings.');
       return;
     }
 
@@ -1824,6 +2076,10 @@ function App() {
   };
 
   const startEditMapping = (mapping: AccountMapping) => {
+    if (!canManageMapping(mapping)) {
+      showNotice('error', 'You do not have permission to edit this mapping.');
+      return;
+    }
     setEditingMapping(mapping);
     setEditForm({
       owner: mapping.owner || '',
@@ -1840,6 +2096,10 @@ function App() {
   const handleUpdateMapping = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!authHeaders || !editingMapping) {
+      return;
+    }
+    if (!canManageMapping(editingMapping)) {
+      showNotice('error', 'You do not have permission to edit this mapping.');
       return;
     }
 
@@ -2016,6 +2276,239 @@ function App() {
     }
   };
 
+  const beginEditUser = (user: ManagedUser) => {
+    setEditingUserId(user.id);
+    setEditingUserForm({
+      username: user.username || '',
+      email: user.email || '',
+      password: '',
+      isAdmin: user.isAdmin,
+      permissions: normalizePermissions(user.permissions),
+    });
+  };
+
+  const resetEditingUser = () => {
+    setEditingUserId(null);
+    setEditingUserForm(defaultUserForm());
+  };
+
+  const handleCreateUser = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!authHeaders || !isAdmin) {
+      return;
+    }
+
+    const username = normalizeUsername(newUserForm.username);
+    const email = normalizeEmail(newUserForm.email);
+    if (!username && !email) {
+      showNotice('error', 'Provide at least a username or email.');
+      return;
+    }
+    if (!newUserForm.password || newUserForm.password.length < 8) {
+      showNotice('error', 'Password must be at least 8 characters.');
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      await axios.post(
+        '/api/admin/users',
+        {
+          username: username || undefined,
+          email: email || undefined,
+          password: newUserForm.password,
+          isAdmin: newUserForm.isAdmin,
+          permissions: newUserForm.permissions,
+        },
+        { headers: authHeaders },
+      );
+      setNewUserForm(defaultUserForm());
+      showNotice('success', 'User account created.');
+      await fetchManagedUsers();
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to create user.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleSaveEditedUser = async (userId: string) => {
+    if (!authHeaders || !isAdmin) {
+      return;
+    }
+
+    const username = normalizeUsername(editingUserForm.username);
+    const email = normalizeEmail(editingUserForm.email);
+    if (!username && !email) {
+      showNotice('error', 'Provide at least a username or email.');
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      await axios.put(
+        `/api/admin/users/${userId}`,
+        {
+          username: username || undefined,
+          email: email || undefined,
+          isAdmin: editingUserForm.isAdmin,
+          permissions: editingUserForm.permissions,
+        },
+        { headers: authHeaders },
+      );
+      showNotice('success', 'User updated.');
+      resetEditingUser();
+      await Promise.all([fetchManagedUsers(), fetchData()]);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to update user.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleResetUserPassword = async (userId: string) => {
+    if (!authHeaders || !isAdmin) {
+      return;
+    }
+
+    const newPassword = window.prompt('Enter a new password (min 8 chars):');
+    if (!newPassword) {
+      return;
+    }
+    if (newPassword.length < 8) {
+      showNotice('error', 'Password must be at least 8 characters.');
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      await axios.post(
+        `/api/admin/users/${userId}/reset-password`,
+        {
+          newPassword,
+        },
+        { headers: authHeaders },
+      );
+      showNotice('success', 'Password reset.');
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to reset password.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleDeleteUser = async (user: ManagedUser) => {
+    if (!authHeaders || !isAdmin) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${user.username || user.email || user.id}? Their mapped accounts will be disabled.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      await axios.delete(`/api/admin/users/${user.id}`, { headers: authHeaders });
+      showNotice('success', 'User deleted and owned mappings disabled.');
+      if (accountsCreatorFilter === user.id) {
+        setAccountsCreatorFilter('all');
+      }
+      await Promise.all([fetchManagedUsers(), fetchData()]);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to delete user.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleChangeOwnEmail = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!authHeaders) {
+      return;
+    }
+
+    if (!emailForm.newEmail.trim() || !emailForm.password || (hasCurrentEmail && !emailForm.currentEmail.trim())) {
+      showNotice('error', hasCurrentEmail ? 'Fill in current email, new email, and password.' : 'Fill in new email and password.');
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      const response = await axios.post<{ token?: string; me?: AuthUser }>(
+        '/api/me/change-email',
+        {
+          currentEmail: emailForm.currentEmail,
+          newEmail: emailForm.newEmail,
+          password: emailForm.password,
+        },
+        { headers: authHeaders },
+      );
+
+      if (response.data?.token) {
+        localStorage.setItem('token', response.data.token);
+        setToken(response.data.token);
+      }
+      if (response.data?.me) {
+        setMe({
+          ...response.data.me,
+          permissions: normalizePermissions(response.data.me.permissions),
+        });
+      }
+      setEmailForm((previous) => ({
+        currentEmail: previous.newEmail,
+        newEmail: '',
+        password: '',
+      }));
+      showNotice('success', 'Email updated.');
+      await fetchData();
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to update email.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleChangeOwnPassword = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!authHeaders) {
+      return;
+    }
+
+    if (!passwordForm.currentPassword || !passwordForm.newPassword || !passwordForm.confirmPassword) {
+      showNotice('error', 'Complete all password fields.');
+      return;
+    }
+    if (passwordForm.newPassword.length < 8) {
+      showNotice('error', 'New password must be at least 8 characters.');
+      return;
+    }
+    if (passwordForm.newPassword !== passwordForm.confirmPassword) {
+      showNotice('error', 'New password and confirmation do not match.');
+      return;
+    }
+
+    setIsBusy(true);
+    try {
+      await axios.post(
+        '/api/me/change-password',
+        {
+          currentPassword: passwordForm.currentPassword,
+          newPassword: passwordForm.newPassword,
+        },
+        { headers: authHeaders },
+      );
+      setPasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
+      showNotice('success', 'Password updated.');
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to update password.');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
   if (!token) {
     return (
       <main className="flex min-h-screen items-center justify-center p-4">
@@ -2036,10 +2529,23 @@ function App() {
             ) : null}
 
             <form className="space-y-4" onSubmit={authView === 'login' ? handleLogin : handleRegister}>
-              <div className="space-y-2">
-                <Label htmlFor="email">Email</Label>
-                <Input id="email" name="email" type="email" autoComplete="email" required />
-              </div>
+              {authView === 'login' ? (
+                <div className="space-y-2">
+                  <Label htmlFor="identifier">Email or Username</Label>
+                  <Input id="identifier" name="identifier" autoComplete="username" required />
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="username">Username</Label>
+                    <Input id="username" name="username" autoComplete="username" placeholder="optional" />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="email">Email</Label>
+                    <Input id="email" name="email" type="email" autoComplete="email" placeholder="optional" />
+                  </div>
+                </>
+              )}
 
               <div className="space-y-2">
                 <Label htmlFor="password">Password</Label>
@@ -2052,17 +2558,23 @@ function App() {
               </Button>
             </form>
 
-            <Button
-              className="mt-4 w-full"
-              variant="ghost"
-              onClick={() => {
-                setAuthError('');
-                setAuthView(authView === 'login' ? 'register' : 'login');
-              }}
-              type="button"
-            >
-              {authView === 'login' ? 'Need an account? Register' : 'Have an account? Sign in'}
-            </Button>
+            {bootstrapOpen || authView === 'register' ? (
+              <Button
+                className="mt-4 w-full"
+                variant="ghost"
+                onClick={() => {
+                  setAuthError('');
+                  setAuthView(authView === 'login' ? 'register' : 'login');
+                }}
+                type="button"
+              >
+                {authView === 'login' ? 'Need an account? Register' : 'Have an account? Sign in'}
+              </Button>
+            ) : (
+              <p className="mt-4 text-center text-xs text-muted-foreground">
+                Account creation is disabled. Ask an admin to create your user.
+              </p>
+            )}
           </CardContent>
         </Card>
       </main>
@@ -2092,7 +2604,7 @@ function App() {
                 {themeIcon}
                 <span className="ml-2 hidden sm:inline">{themeLabel}</span>
               </Button>
-              {isAdmin ? (
+              {canCreateMappings ? (
                 <Button
                   size="sm"
                   variant="outline"
@@ -2105,7 +2617,7 @@ function App() {
                   Add account
                 </Button>
               ) : null}
-              <Button size="sm" onClick={runNow}>
+              <Button size="sm" onClick={runNow} disabled={!canRunNowPermission}>
                 <Play className="mr-2 h-4 w-4" />
                 Run now
               </Button>
@@ -2126,14 +2638,13 @@ function App() {
 
       {notice ? (
         <div
-                className={cn(
-                  'mb-5 animate-pop-in rounded-md border px-4 py-2 text-sm',
-                  notice.tone === 'success' &&
-                    'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:border-emerald-500/30 dark:text-emerald-300',
+          className={cn(
+            'mb-5 animate-pop-in rounded-md border px-4 py-2 text-sm',
+            notice.tone === 'success' &&
+              'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:border-emerald-500/30 dark:text-emerald-300',
             notice.tone === 'error' &&
               'border-red-500/40 bg-red-500/10 text-red-700 dark:border-red-500/30 dark:text-red-300',
-            notice.tone === 'info' &&
-              'border-border bg-muted text-muted-foreground',
+            notice.tone === 'info' && 'border-border bg-muted text-muted-foreground',
           )}
         >
           {notice.message}
@@ -2162,7 +2673,8 @@ function App() {
             <div className="text-right">
               <p className="text-lg font-semibold">{progressPercent || 0}%</p>
               <p className="text-xs text-muted-foreground">
-                {(currentStatus.processedCount || 0).toLocaleString()} / {(currentStatus.totalCount || 0).toLocaleString()}
+                {(currentStatus.processedCount || 0).toLocaleString()} /{' '}
+                {(currentStatus.totalCount || 0).toLocaleString()}
               </p>
             </div>
           </CardContent>
@@ -2219,7 +2731,9 @@ function App() {
               <CardContent className="p-4">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">Latest Activity</p>
                 <p className="mt-2 text-sm font-medium text-foreground">
-                  {latestActivity?.created_at ? new Date(latestActivity.created_at).toLocaleString() : 'No activity yet'}
+                  {latestActivity?.created_at
+                    ? new Date(latestActivity.created_at).toLocaleString()
+                    : 'No activity yet'}
                 </p>
               </CardContent>
             </Card>
@@ -2275,7 +2789,6 @@ function App() {
                 })}
             </CardContent>
           </Card>
-
         </section>
       ) : null}
 
@@ -2289,50 +2802,54 @@ function App() {
                   <CardDescription>Organize mappings into folders and collapse/expand groups.</CardDescription>
                 </div>
                 <div className="flex items-center gap-2">
-                  {isAdmin ? (
+                  {canCreateMappings ? (
                     <Button size="sm" variant="outline" onClick={openAddAccountSheet}>
                       <Plus className="mr-2 h-4 w-4" />
                       Add account
                     </Button>
                   ) : null}
-                  <Badge variant="outline">{mappings.length} configured</Badge>
+                  <Badge variant="outline">{accountMappingsForView.length} configured</Badge>
                 </div>
               </div>
             </CardHeader>
             <CardContent className="space-y-4 pt-0">
-              <form
-                className="rounded-lg border border-border/70 bg-muted/30 p-3"
-                onSubmit={(event) => {
-                  void handleCreateGroup(event);
-                }}
-              >
-                <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">Create Folder</p>
-                <div className="flex flex-wrap items-end gap-2">
-                  <div className="min-w-[180px] flex-1 space-y-1">
-                    <Label htmlFor="accounts-group-name">Folder name</Label>
-                    <Input
-                      id="accounts-group-name"
-                      value={newGroupName}
-                      onChange={(event) => setNewGroupName(event.target.value)}
-                      placeholder="Gaming, News, Sports..."
-                    />
+              {canManageGroupsPermission ? (
+                <form
+                  className="rounded-lg border border-border/70 bg-muted/30 p-3"
+                  onSubmit={(event) => {
+                    void handleCreateGroup(event);
+                  }}
+                >
+                  <p className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Create Folder
+                  </p>
+                  <div className="flex flex-wrap items-end gap-2">
+                    <div className="min-w-[180px] flex-1 space-y-1">
+                      <Label htmlFor="accounts-group-name">Folder name</Label>
+                      <Input
+                        id="accounts-group-name"
+                        value={newGroupName}
+                        onChange={(event) => setNewGroupName(event.target.value)}
+                        placeholder="Gaming, News, Sports..."
+                      />
+                    </div>
+                    <div className="w-20 space-y-1">
+                      <Label htmlFor="accounts-group-emoji">Emoji</Label>
+                      <Input
+                        id="accounts-group-emoji"
+                        value={newGroupEmoji}
+                        onChange={(event) => setNewGroupEmoji(event.target.value)}
+                        placeholder="📁"
+                        maxLength={8}
+                      />
+                    </div>
+                    <Button type="submit" size="sm" disabled={isBusy || newGroupName.trim().length === 0}>
+                      <Plus className="mr-2 h-4 w-4" />
+                      Create
+                    </Button>
                   </div>
-                  <div className="w-20 space-y-1">
-                    <Label htmlFor="accounts-group-emoji">Emoji</Label>
-                    <Input
-                      id="accounts-group-emoji"
-                      value={newGroupEmoji}
-                      onChange={(event) => setNewGroupEmoji(event.target.value)}
-                      placeholder="📁"
-                      maxLength={8}
-                    />
-                  </div>
-                  <Button type="submit" size="sm" disabled={isBusy || newGroupName.trim().length === 0}>
-                    <Plus className="mr-2 h-4 w-4" />
-                    Create
-                  </Button>
-                </div>
-              </form>
+                </form>
+              ) : null}
 
               <div className="grid gap-2 md:grid-cols-[1fr_auto]">
                 <div className="space-y-1">
@@ -2347,6 +2864,24 @@ function App() {
                     <p className="text-xs text-muted-foreground">
                       {accountMatchesCount} result{accountMatchesCount === 1 ? '' : 's'} ranked by relevance
                     </p>
+                  ) : null}
+                  {isAdmin ? (
+                    <div className="mt-2 space-y-1">
+                      <Label htmlFor="accounts-creator-filter">Created by user</Label>
+                      <select
+                        id="accounts-creator-filter"
+                        className={cn(selectClassName, 'h-9 text-xs')}
+                        value={accountsCreatorFilter}
+                        onChange={(event) => setAccountsCreatorFilter(event.target.value)}
+                      >
+                        <option value="all">All users</option>
+                        {managedUsers.map((user) => (
+                          <option key={`creator-filter-${user.id}`} value={user.id}>
+                            {user.username || user.email || user.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   ) : null}
                 </div>
                 <div className="flex flex-wrap items-end justify-end gap-2">
@@ -2373,7 +2908,7 @@ function App() {
               {filteredGroupedMappings.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border/70 p-6 text-center text-sm text-muted-foreground">
                   {normalizedAccountsQuery ? 'No accounts matched this search.' : 'No mappings yet.'}
-                  {isAdmin ? (
+                  {canCreateMappings ? (
                     <div className="mt-3">
                       <Button size="sm" variant="outline" onClick={openAddAccountSheet}>
                         <Plus className="mr-2 h-4 w-4" />
@@ -2439,6 +2974,7 @@ function App() {
                                   <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
                                     <tr>
                                       <th className="px-2 py-3">Owner</th>
+                                      {isAdmin ? <th className="px-2 py-3">Created By</th> : null}
                                       <th className="px-2 py-3">Twitter Sources</th>
                                       <th className="px-2 py-3">Bluesky Target</th>
                                       <th className="px-2 py-3">Status</th>
@@ -2456,13 +2992,24 @@ function App() {
                                       const mappingGroup = getMappingGroupMeta(mapping);
 
                                       return (
-                                        <tr key={mapping.id} className="interactive-row border-b border-border/60 last:border-0">
+                                        <tr
+                                          key={mapping.id}
+                                          className="interactive-row border-b border-border/60 last:border-0"
+                                        >
                                           <td className="px-2 py-3 align-top">
                                             <div className="flex items-center gap-2 font-medium">
                                               <UserRound className="h-4 w-4 text-muted-foreground" />
                                               {mapping.owner || 'System'}
                                             </div>
                                           </td>
+                                          {isAdmin ? (
+                                            <td className="px-2 py-3 align-top text-xs text-muted-foreground">
+                                              {mapping.createdByLabel ||
+                                                mapping.createdByUser?.username ||
+                                                mapping.createdByUser?.email ||
+                                                '--'}
+                                            </td>
+                                          ) : null}
                                           <td className="px-2 py-3 align-top">
                                             <div className="flex flex-wrap gap-2">
                                               {mapping.twitterUsernames.map((username) => (
@@ -2488,7 +3035,9 @@ function App() {
                                               )}
                                               <div className="min-w-0">
                                                 <p className="truncate text-sm font-medium">{profileName}</p>
-                                                <p className="truncate font-mono text-xs text-muted-foreground">{profileHandle}</p>
+                                                <p className="truncate font-mono text-xs text-muted-foreground">
+                                                  {profileHandle}
+                                                </p>
                                               </div>
                                             </div>
                                           </td>
@@ -2496,7 +3045,9 @@ function App() {
                                             {active ? (
                                               <Badge variant="warning">Backfilling</Badge>
                                             ) : queued ? (
-                                              <Badge variant="warning">Queued {queuePosition ? `#${queuePosition}` : ''}</Badge>
+                                              <Badge variant="warning">
+                                                Queued {queuePosition ? `#${queuePosition}` : ''}
+                                              </Badge>
                                             ) : (
                                               <Badge variant="success">Active</Badge>
                                             )}
@@ -2506,6 +3057,7 @@ function App() {
                                               <select
                                                 className={cn(selectClassName, 'h-9 w-44 px-2 py-1 text-xs')}
                                                 value={mappingGroup.key}
+                                                disabled={!canManageMapping(mapping) || !canManageGroupsPermission}
                                                 onChange={(event) => {
                                                   void handleAssignMappingGroup(mapping, event.target.value);
                                                 }}
@@ -2516,55 +3068,72 @@ function App() {
                                                 {groupOptions
                                                   .filter((option) => option.key !== DEFAULT_GROUP_KEY)
                                                   .map((option) => (
-                                                    <option key={`group-move-${mapping.id}-${option.key}`} value={option.key}>
+                                                    <option
+                                                      key={`group-move-${mapping.id}-${option.key}`}
+                                                      value={option.key}
+                                                    >
                                                       {option.emoji} {option.name}
                                                     </option>
                                                   ))}
                                               </select>
-                                              {isAdmin ? (
+                                              {canManageMapping(mapping) ? (
                                                 <>
-                                                  <Button variant="outline" size="sm" onClick={() => startEditMapping(mapping)}>
-                                                    Edit
-                                                  </Button>
                                                   <Button
                                                     variant="outline"
                                                     size="sm"
-                                                    onClick={() => {
-                                                      void requestBackfill(mapping.id, 'normal');
-                                                    }}
+                                                    onClick={() => startEditMapping(mapping)}
                                                   >
-                                                    Backfill
+                                                    Edit
                                                   </Button>
-                                                  <Button
-                                                    variant="subtle"
-                                                    size="sm"
-                                                    onClick={() => {
-                                                      void requestBackfill(mapping.id, 'reset');
-                                                    }}
-                                                  >
-                                                    Reset + Backfill
-                                                  </Button>
-                                                  <Button
-                                                    variant="destructive"
-                                                    size="sm"
-                                                    onClick={() => {
-                                                      void handleDeleteAllPosts(mapping.id);
-                                                    }}
-                                                  >
-                                                    Delete Posts
-                                                  </Button>
+                                                  {canQueueBackfillsPermission ? (
+                                                    <>
+                                                      <Button
+                                                        variant="outline"
+                                                        size="sm"
+                                                        onClick={() => {
+                                                          void requestBackfill(mapping.id, 'normal');
+                                                        }}
+                                                      >
+                                                        Backfill
+                                                      </Button>
+                                                      {isAdmin ? (
+                                                        <Button
+                                                          variant="subtle"
+                                                          size="sm"
+                                                          onClick={() => {
+                                                            void requestBackfill(mapping.id, 'reset');
+                                                          }}
+                                                        >
+                                                          Reset + Backfill
+                                                        </Button>
+                                                      ) : null}
+                                                    </>
+                                                  ) : null}
+                                                  {isAdmin ? (
+                                                    <Button
+                                                      variant="destructive"
+                                                      size="sm"
+                                                      onClick={() => {
+                                                        void handleDeleteAllPosts(mapping.id);
+                                                      }}
+                                                    >
+                                                      Delete Posts
+                                                    </Button>
+                                                  ) : null}
                                                 </>
                                               ) : null}
-                                              <Button
-                                                variant="ghost"
-                                                size="sm"
-                                                onClick={() => {
-                                                  void handleDeleteMapping(mapping.id);
-                                                }}
-                                              >
-                                                <Trash2 className="mr-1 h-4 w-4" />
-                                                Remove
-                                              </Button>
+                                              {canManageMapping(mapping) ? (
+                                                <Button
+                                                  variant="ghost"
+                                                  size="sm"
+                                                  onClick={() => {
+                                                    void handleDeleteMapping(mapping.id);
+                                                  }}
+                                                >
+                                                  <Trash2 className="mr-1 h-4 w-4" />
+                                                  Remove
+                                                </Button>
+                                              ) : null}
                                             </div>
                                           </td>
                                         </tr>
@@ -2584,74 +3153,76 @@ function App() {
             </CardContent>
           </Card>
 
-          <Card className="animate-slide-up">
-            <CardHeader className="pb-3">
-              <CardTitle>Group Manager</CardTitle>
-              <CardDescription>Edit folder names/emojis or delete a group.</CardDescription>
-            </CardHeader>
-            <CardContent className="pt-0">
-              {reusableGroupOptions.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-border/70 p-4 text-sm text-muted-foreground">
-                  No custom folders yet.
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {reusableGroupOptions.map((group) => {
-                    const draft = groupDraftsByKey[group.key] || { name: group.name, emoji: group.emoji };
-                    return (
-                      <div
-                        key={`group-manager-${group.key}`}
-                        className="grid gap-2 rounded-lg border border-border/70 bg-muted/20 p-3 md:grid-cols-[90px_minmax(0,1fr)_auto_auto]"
-                      >
-                        <div className="space-y-1">
-                          <Label htmlFor={`group-manager-emoji-${group.key}`}>Emoji</Label>
-                          <Input
-                            id={`group-manager-emoji-${group.key}`}
-                            value={draft.emoji}
-                            onChange={(event) => updateGroupDraft(group.key, 'emoji', event.target.value)}
-                            maxLength={8}
-                          />
-                        </div>
-                        <div className="space-y-1">
-                          <Label htmlFor={`group-manager-name-${group.key}`}>Name</Label>
-                          <Input
-                            id={`group-manager-name-${group.key}`}
-                            value={draft.name}
-                            onChange={(event) => updateGroupDraft(group.key, 'name', event.target.value)}
-                          />
-                        </div>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="self-end"
-                          disabled={isGroupActionBusy || !draft.name.trim()}
-                          onClick={() => {
-                            void handleRenameGroup(group.key);
-                          }}
+          {canManageGroupsPermission ? (
+            <Card className="animate-slide-up">
+              <CardHeader className="pb-3">
+                <CardTitle>Group Manager</CardTitle>
+                <CardDescription>Edit folder names/emojis or delete a group.</CardDescription>
+              </CardHeader>
+              <CardContent className="pt-0">
+                {reusableGroupOptions.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-border/70 p-4 text-sm text-muted-foreground">
+                    No custom folders yet.
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {reusableGroupOptions.map((group) => {
+                      const draft = groupDraftsByKey[group.key] || { name: group.name, emoji: group.emoji };
+                      return (
+                        <div
+                          key={`group-manager-${group.key}`}
+                          className="grid gap-2 rounded-lg border border-border/70 bg-muted/20 p-3 md:grid-cols-[90px_minmax(0,1fr)_auto_auto]"
                         >
-                          Save
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="self-end text-red-600 hover:text-red-500 dark:text-red-300 dark:hover:text-red-200"
-                          disabled={isGroupActionBusy}
-                          onClick={() => {
-                            void handleDeleteGroup(group.key);
-                          }}
-                        >
-                          Delete
-                        </Button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              <p className="mt-3 text-xs text-muted-foreground">
-                Deleting a folder keeps mappings intact and moves them to {DEFAULT_GROUP_NAME}.
-              </p>
-            </CardContent>
-          </Card>
+                          <div className="space-y-1">
+                            <Label htmlFor={`group-manager-emoji-${group.key}`}>Emoji</Label>
+                            <Input
+                              id={`group-manager-emoji-${group.key}`}
+                              value={draft.emoji}
+                              onChange={(event) => updateGroupDraft(group.key, 'emoji', event.target.value)}
+                              maxLength={8}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <Label htmlFor={`group-manager-name-${group.key}`}>Name</Label>
+                            <Input
+                              id={`group-manager-name-${group.key}`}
+                              value={draft.name}
+                              onChange={(event) => updateGroupDraft(group.key, 'name', event.target.value)}
+                            />
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="self-end"
+                            disabled={isGroupActionBusy || !draft.name.trim()}
+                            onClick={() => {
+                              void handleRenameGroup(group.key);
+                            }}
+                          >
+                            Save
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="self-end text-red-600 hover:text-red-500 dark:text-red-300 dark:hover:text-red-200"
+                            disabled={isGroupActionBusy}
+                            onClick={() => {
+                              void handleDeleteGroup(group.key);
+                            }}
+                          >
+                            Delete
+                          </Button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <p className="mt-3 text-xs text-muted-foreground">
+                  Deleting a folder keeps mappings intact and moves them to {DEFAULT_GROUP_NAME}.
+                </p>
+              </CardContent>
+            </Card>
+          ) : null}
         </section>
       ) : null}
 
@@ -2715,10 +3286,9 @@ function App() {
                       const postUrl =
                         post.postUrl ||
                         (post.bskyUri
-                          ? `https://bsky.app/profile/${post.bskyIdentifier}/post/${post.bskyUri
-                              .split('/')
-                              .filter(Boolean)
-                              .pop() || ''}`
+                          ? `https://bsky.app/profile/${post.bskyIdentifier}/post/${
+                              post.bskyUri.split('/').filter(Boolean).pop() || ''
+                            }`
                           : undefined);
 
                       return (
@@ -2729,7 +3299,8 @@ function App() {
                           <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                             <div className="min-w-0">
                               <p className="truncate text-sm font-semibold">
-                                @{post.bskyIdentifier} <span className="text-muted-foreground">from @{post.twitterUsername}</span>
+                                @{post.bskyIdentifier}{' '}
+                                <span className="text-muted-foreground">from @{post.twitterUsername}</span>
                               </p>
                               <p className="text-xs text-muted-foreground">
                                 {post.createdAt ? new Date(post.createdAt).toLocaleString() : 'Unknown time'}
@@ -2785,10 +3356,9 @@ function App() {
                     const postUrl =
                       post.postUrl ||
                       (post.bskyUri
-                        ? `https://bsky.app/profile/${post.bskyIdentifier}/post/${post.bskyUri
-                            .split('/')
-                            .filter(Boolean)
-                            .pop() || ''}`
+                        ? `https://bsky.app/profile/${post.bskyIdentifier}/post/${
+                            post.bskyUri.split('/').filter(Boolean).pop() || ''
+                          }`
                         : undefined);
                     const sourceTweetUrl = post.twitterUrl || getTwitterPostUrl(post.twitterUsername, post.twitterId);
                     const segments = buildFacetSegments(post.text, post.facets || []);
@@ -2859,7 +3429,10 @@ function App() {
                             return (
                               <a
                                 key={`${post.bskyUri}-segment-${segmentIndex}`}
-                                className={cn('underline decoration-transparent transition hover:decoration-current', linkTone)}
+                                className={cn(
+                                  'underline decoration-transparent transition hover:decoration-current',
+                                  linkTone,
+                                )}
                                 href={segment.href}
                                 target="_blank"
                                 rel="noreferrer"
@@ -2949,9 +3522,7 @@ function App() {
                                       />
                                     ) : null}
                                     <div className="space-y-1 p-3">
-                                      <p className="truncate text-sm font-medium">
-                                        {media.title || media.url}
-                                      </p>
+                                      <p className="truncate text-sm font-medium">{media.title || media.url}</p>
                                       {media.description ? (
                                         <p className="max-h-10 overflow-hidden text-xs text-muted-foreground">
                                           {media.description}
@@ -3080,7 +3651,10 @@ function App() {
                         >
                           <td className="px-2 py-3 align-top text-xs text-muted-foreground">
                             {activity.created_at
-                              ? new Date(activity.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                              ? new Date(activity.created_at).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                })
                               : '--'}
                           </td>
                           <td className="px-2 py-3 align-top font-medium">@{activity.twitter_username}</td>
@@ -3099,7 +3673,9 @@ function App() {
                             )}
                           </td>
                           <td className="px-2 py-3 align-top text-xs text-muted-foreground">
-                            <div className="max-w-[340px] truncate">{activity.tweet_text || `Tweet ID: ${activity.twitter_id}`}</div>
+                            <div className="max-w-[340px] truncate">
+                              {activity.tweet_text || `Tweet ID: ${activity.twitter_id}`}
+                            </div>
                           </td>
                           <td className="px-2 py-3 align-top text-right">
                             <div className="flex flex-col items-end gap-1">
@@ -3148,304 +3724,750 @@ function App() {
       ) : null}
 
       {activeTab === 'settings' ? (
-        isAdmin ? (
-          <section className="space-y-6 animate-fade-in">
-            <Card className="animate-slide-up">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Settings2 className="h-4 w-4" />
-                  Admin Settings
-                </CardTitle>
-                <CardDescription>Configured sections stay collapsed so adding accounts is one click.</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4 pt-0">
-                <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="space-y-1">
-                      <p className="text-sm font-semibold">Running Version</p>
-                      <p className="font-mono text-sm text-foreground">{runtimeVersionLabel}</p>
-                      {runtimeBranchLabel ? (
-                        <p className="text-xs text-muted-foreground">{runtimeBranchLabel}</p>
-                      ) : null}
-                      <p className="text-xs text-muted-foreground">{updateStateLabel}</p>
+        <section className="space-y-6 animate-fade-in">
+          <Card className="animate-slide-up">
+            <button
+              className="flex w-full items-center justify-between px-5 py-4 text-left"
+              onClick={() => toggleSettingsSection('account')}
+              type="button"
+            >
+              <div>
+                <p className="text-sm font-semibold">Account Security</p>
+                <p className="text-xs text-muted-foreground">Update your own email/password with verification.</p>
+              </div>
+              <ChevronDown
+                className={cn(
+                  'h-4 w-4 transition-transform duration-200',
+                  isSettingsSectionExpanded('account') ? 'rotate-0' : '-rotate-90',
+                )}
+              />
+            </button>
+            <div
+              className={cn(
+                'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                isSettingsSectionExpanded('account') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+              )}
+            >
+              <div className="min-h-0 overflow-hidden">
+                <CardContent className="grid gap-4 border-t border-border/70 pt-4 lg:grid-cols-2">
+                  <form className="space-y-3" onSubmit={handleChangeOwnEmail}>
+                    <p className="text-sm font-semibold">Change Email</p>
+                    <div className="space-y-2">
+                      <Label htmlFor="account-current-email">Current Email</Label>
+                      <Input
+                        id="account-current-email"
+                        type="email"
+                        value={emailForm.currentEmail}
+                        onChange={(event) => {
+                          setEmailForm((previous) => ({ ...previous, currentEmail: event.target.value }));
+                        }}
+                        placeholder={hasCurrentEmail ? undefined : 'No current email on this account'}
+                        required={hasCurrentEmail}
+                        disabled={!hasCurrentEmail}
+                      />
                     </div>
-                    <div className="flex flex-wrap gap-2">
+                    <div className="space-y-2">
+                      <Label htmlFor="account-new-email">New Email</Label>
+                      <Input
+                        id="account-new-email"
+                        type="email"
+                        value={emailForm.newEmail}
+                        onChange={(event) => {
+                          setEmailForm((previous) => ({ ...previous, newEmail: event.target.value }));
+                        }}
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="account-email-password">Current Password</Label>
+                      <Input
+                        id="account-email-password"
+                        type="password"
+                        value={emailForm.password}
+                        onChange={(event) => {
+                          setEmailForm((previous) => ({ ...previous, password: event.target.value }));
+                        }}
+                        required
+                      />
+                    </div>
+                    <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
+                      <Save className="mr-2 h-4 w-4" />
+                      Save Email
+                    </Button>
+                  </form>
+
+                  <form className="space-y-3" onSubmit={handleChangeOwnPassword}>
+                    <p className="text-sm font-semibold">Change Password</p>
+                    <div className="space-y-2">
+                      <Label htmlFor="account-current-password">Current Password</Label>
+                      <Input
+                        id="account-current-password"
+                        type="password"
+                        value={passwordForm.currentPassword}
+                        onChange={(event) => {
+                          setPasswordForm((previous) => ({ ...previous, currentPassword: event.target.value }));
+                        }}
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="account-new-password">New Password</Label>
+                      <Input
+                        id="account-new-password"
+                        type="password"
+                        value={passwordForm.newPassword}
+                        onChange={(event) => {
+                          setPasswordForm((previous) => ({ ...previous, newPassword: event.target.value }));
+                        }}
+                        required
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="account-confirm-password">Confirm New Password</Label>
+                      <Input
+                        id="account-confirm-password"
+                        type="password"
+                        value={passwordForm.confirmPassword}
+                        onChange={(event) => {
+                          setPasswordForm((previous) => ({ ...previous, confirmPassword: event.target.value }));
+                        }}
+                        required
+                      />
+                    </div>
+                    <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
+                      <Save className="mr-2 h-4 w-4" />
+                      Save Password
+                    </Button>
+                  </form>
+                </CardContent>
+              </div>
+            </div>
+          </Card>
+
+          {isAdmin ? (
+            <>
+              <Card className="animate-slide-up">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Settings2 className="h-4 w-4" />
+                    Admin Settings
+                  </CardTitle>
+                  <CardDescription>Configured sections stay collapsed so adding accounts is one click.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4 pt-0">
+                  <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <p className="text-sm font-semibold">Running Version</p>
+                        <p className="font-mono text-sm text-foreground">{runtimeVersionLabel}</p>
+                        {runtimeBranchLabel ? (
+                          <p className="text-xs text-muted-foreground">{runtimeBranchLabel}</p>
+                        ) : null}
+                        <p className="text-xs text-muted-foreground">{updateStateLabel}</p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() => {
+                            void handleRunUpdate();
+                          }}
+                          disabled={isUpdateBusy || updateStatus?.running}
+                        >
+                          {isUpdateBusy || updateStatus?.running ? (
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          ) : (
+                            <RefreshCw className="mr-2 h-4 w-4" />
+                          )}
+                          {updateStatus?.running ? 'Updating...' : 'Update'}
+                        </Button>
+                        {canCreateMappings ? (
+                          <Button className="w-full sm:w-auto" onClick={openAddAccountSheet}>
+                            <Plus className="mr-2 h-4 w-4" />
+                            Add Account
+                          </Button>
+                        ) : null}
+                      </div>
+                    </div>
+                    {updateStatus?.logTail && updateStatus.logTail.length > 0 ? (
+                      <details className="mt-3">
+                        <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                          Update log
+                        </summary>
+                        <pre className="mt-2 max-h-44 overflow-auto rounded-md bg-background p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                          {updateStatus.logTail.join('\n')}
+                        </pre>
+                      </details>
+                    ) : null}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card className="animate-slide-up">
+                <button
+                  className="flex w-full items-center justify-between px-5 py-4 text-left"
+                  onClick={() => toggleSettingsSection('users')}
+                  type="button"
+                >
+                  <div>
+                    <p className="text-sm font-semibold">User Access Manager</p>
+                    <p className="text-xs text-muted-foreground">Create users and control what they can see/manage.</p>
+                  </div>
+                  <ChevronDown
+                    className={cn(
+                      'h-4 w-4 transition-transform duration-200',
+                      isSettingsSectionExpanded('users') ? 'rotate-0' : '-rotate-90',
+                    )}
+                  />
+                </button>
+                <div
+                  className={cn(
+                    'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                    isSettingsSectionExpanded('users') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                  )}
+                >
+                  <div className="min-h-0 overflow-hidden">
+                    <CardContent className="space-y-4 border-t border-border/70 pt-4">
+                      <form
+                        className="space-y-3 rounded-lg border border-border/70 bg-muted/20 p-3"
+                        onSubmit={handleCreateUser}
+                      >
+                        <p className="text-sm font-semibold">Create User</p>
+                        <div className="grid gap-3 md:grid-cols-3">
+                          <div className="space-y-2">
+                            <Label htmlFor="new-user-username">Username</Label>
+                            <Input
+                              id="new-user-username"
+                              value={newUserForm.username}
+                              onChange={(event) => {
+                                setNewUserForm((previous) => ({ ...previous, username: event.target.value }));
+                              }}
+                              placeholder="operator"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label htmlFor="new-user-email">Email</Label>
+                            <Input
+                              id="new-user-email"
+                              type="email"
+                              value={newUserForm.email}
+                              onChange={(event) => {
+                                setNewUserForm((previous) => ({ ...previous, email: event.target.value }));
+                              }}
+                              placeholder="operator@example.com"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label htmlFor="new-user-password">Password</Label>
+                            <Input
+                              id="new-user-password"
+                              type="password"
+                              value={newUserForm.password}
+                              onChange={(event) => {
+                                setNewUserForm((previous) => ({ ...previous, password: event.target.value }));
+                              }}
+                              placeholder="Minimum 8 characters"
+                              required
+                            />
+                          </div>
+                        </div>
+
+                        <label className="inline-flex items-center gap-2 text-sm font-medium">
+                          <input
+                            type="checkbox"
+                            checked={newUserForm.isAdmin}
+                            onChange={(event) => {
+                              setNewUserForm((previous) => ({
+                                ...previous,
+                                isAdmin: event.target.checked,
+                              }));
+                            }}
+                          />
+                          Make admin
+                        </label>
+
+                        {!newUserForm.isAdmin ? (
+                          <div className="grid gap-2 md:grid-cols-2">
+                            {PERMISSION_OPTIONS.map((permission) => (
+                              <label
+                                key={`new-user-permission-${permission.key}`}
+                                className="rounded-md border border-border/70 bg-background/80 px-3 py-2 text-xs"
+                              >
+                                <span className="flex items-center justify-between gap-2">
+                                  <span className="font-medium">{permission.label}</span>
+                                  <input
+                                    type="checkbox"
+                                    checked={newUserForm.permissions[permission.key]}
+                                    onChange={(event) => {
+                                      const checked = event.target.checked;
+                                      setNewUserForm((previous) => ({
+                                        ...previous,
+                                        permissions: {
+                                          ...previous.permissions,
+                                          [permission.key]: checked,
+                                        },
+                                      }));
+                                    }}
+                                  />
+                                </span>
+                                <span className="mt-1 block text-muted-foreground">{permission.help}</span>
+                              </label>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">Admins always get full access.</p>
+                        )}
+
+                        <Button size="sm" type="submit" disabled={isBusy}>
+                          <Plus className="mr-2 h-4 w-4" />
+                          Create user
+                        </Button>
+                      </form>
+
+                      {managedUsers.length === 0 ? (
+                        <div className="rounded-lg border border-dashed border-border/70 p-4 text-sm text-muted-foreground">
+                          No user accounts created yet.
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          {managedUsers.map((user) => {
+                            const isEditing = editingUserId === user.id;
+                            const displayName = user.username || user.email || user.id;
+                            return (
+                              <div
+                                key={`managed-user-${user.id}`}
+                                className="rounded-lg border border-border/70 bg-card/60 p-3"
+                              >
+                                {isEditing ? (
+                                  <div className="space-y-3">
+                                    <div className="grid gap-3 md:grid-cols-2">
+                                      <div className="space-y-1">
+                                        <Label htmlFor={`edit-user-username-${user.id}`}>Username</Label>
+                                        <Input
+                                          id={`edit-user-username-${user.id}`}
+                                          value={editingUserForm.username}
+                                          onChange={(event) => {
+                                            setEditingUserForm((previous) => ({
+                                              ...previous,
+                                              username: event.target.value,
+                                            }));
+                                          }}
+                                        />
+                                      </div>
+                                      <div className="space-y-1">
+                                        <Label htmlFor={`edit-user-email-${user.id}`}>Email</Label>
+                                        <Input
+                                          id={`edit-user-email-${user.id}`}
+                                          type="email"
+                                          value={editingUserForm.email}
+                                          onChange={(event) => {
+                                            setEditingUserForm((previous) => ({
+                                              ...previous,
+                                              email: event.target.value,
+                                            }));
+                                          }}
+                                        />
+                                      </div>
+                                    </div>
+
+                                    <label className="inline-flex items-center gap-2 text-sm font-medium">
+                                      <input
+                                        type="checkbox"
+                                        checked={editingUserForm.isAdmin}
+                                        onChange={(event) => {
+                                          setEditingUserForm((previous) => ({
+                                            ...previous,
+                                            isAdmin: event.target.checked,
+                                          }));
+                                        }}
+                                      />
+                                      Admin access
+                                    </label>
+
+                                    {!editingUserForm.isAdmin ? (
+                                      <div className="grid gap-2 md:grid-cols-2">
+                                        {PERMISSION_OPTIONS.map((permission) => (
+                                          <label
+                                            key={`edit-user-permission-${user.id}-${permission.key}`}
+                                            className="rounded-md border border-border/70 bg-background/80 px-3 py-2 text-xs"
+                                          >
+                                            <span className="flex items-center justify-between gap-2">
+                                              <span className="font-medium">{permission.label}</span>
+                                              <input
+                                                type="checkbox"
+                                                checked={editingUserForm.permissions[permission.key]}
+                                                onChange={(event) => {
+                                                  const checked = event.target.checked;
+                                                  setEditingUserForm((previous) => ({
+                                                    ...previous,
+                                                    permissions: {
+                                                      ...previous.permissions,
+                                                      [permission.key]: checked,
+                                                    },
+                                                  }));
+                                                }}
+                                              />
+                                            </span>
+                                            <span className="mt-1 block text-muted-foreground">{permission.help}</span>
+                                          </label>
+                                        ))}
+                                      </div>
+                                    ) : null}
+
+                                    <div className="flex flex-wrap justify-end gap-2">
+                                      <Button size="sm" variant="ghost" onClick={resetEditingUser} type="button">
+                                        Cancel
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        onClick={() => {
+                                          void handleSaveEditedUser(user.id);
+                                        }}
+                                        type="button"
+                                        disabled={isBusy}
+                                      >
+                                        Save user
+                                      </Button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="space-y-3">
+                                    <div className="flex flex-wrap items-start justify-between gap-3">
+                                      <div className="space-y-1">
+                                        <p className="text-sm font-semibold">{displayName}</p>
+                                        <p className="text-xs text-muted-foreground">
+                                          {user.email ? `Email: ${user.email}` : 'No email set'}
+                                        </p>
+                                        <p className="text-xs text-muted-foreground">
+                                          {user.mappingCount} mappings ({user.activeMappingCount} active)
+                                        </p>
+                                      </div>
+                                      <div className="flex flex-wrap gap-2">
+                                        <Badge variant={user.isAdmin ? 'success' : 'outline'}>
+                                          {user.isAdmin ? 'Admin' : 'User'}
+                                        </Badge>
+                                        {user.id === me?.id ? <Badge variant="secondary">You</Badge> : null}
+                                      </div>
+                                    </div>
+
+                                    {!user.isAdmin ? (
+                                      <div className="flex flex-wrap gap-2">
+                                        {PERMISSION_OPTIONS.filter(
+                                          (permission) => user.permissions[permission.key],
+                                        ).map((permission) => (
+                                          <Badge key={`user-perm-${user.id}-${permission.key}`} variant="outline">
+                                            {permission.label}
+                                          </Badge>
+                                        ))}
+                                      </div>
+                                    ) : null}
+
+                                    <div className="flex flex-wrap gap-2">
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => {
+                                          setAccountsCreatorFilter(user.id);
+                                          setActiveTab('accounts');
+                                        }}
+                                      >
+                                        View Accounts
+                                      </Button>
+                                      <Button size="sm" variant="outline" onClick={() => beginEditUser(user)}>
+                                        Edit
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => {
+                                          void handleResetUserPassword(user.id);
+                                        }}
+                                      >
+                                        Reset Password
+                                      </Button>
+                                      {user.id !== me?.id ? (
+                                        <Button
+                                          size="sm"
+                                          variant="ghost"
+                                          className="text-red-600 hover:text-red-500 dark:text-red-300 dark:hover:text-red-200"
+                                          onClick={() => {
+                                            void handleDeleteUser(user);
+                                          }}
+                                        >
+                                          Delete
+                                        </Button>
+                                      ) : null}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </CardContent>
+                  </div>
+                </div>
+              </Card>
+
+              <Card className="animate-slide-up">
+                <button
+                  className="flex w-full items-center justify-between px-5 py-4 text-left"
+                  onClick={() => toggleSettingsSection('twitter')}
+                  type="button"
+                >
+                  <div>
+                    <p className="text-sm font-semibold">Twitter Credentials</p>
+                    <p className="text-xs text-muted-foreground">Primary and backup cookie values.</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant={twitterConfigured ? 'success' : 'outline'}>
+                      {twitterConfigured ? 'Configured' : 'Missing'}
+                    </Badge>
+                    <ChevronDown
+                      className={cn(
+                        'h-4 w-4 transition-transform duration-200',
+                        isSettingsSectionExpanded('twitter') ? 'rotate-0' : '-rotate-90',
+                      )}
+                    />
+                  </div>
+                </button>
+                <div
+                  className={cn(
+                    'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                    isSettingsSectionExpanded('twitter') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                  )}
+                >
+                  <div className="min-h-0 overflow-hidden">
+                    <CardContent className="space-y-3 border-t border-border/70 pt-4">
+                      <form className="space-y-3" onSubmit={handleSaveTwitterConfig}>
+                        <div className="space-y-2">
+                          <Label htmlFor="authToken">Primary Auth Token</Label>
+                          <Input
+                            id="authToken"
+                            value={twitterConfig.authToken}
+                            onChange={(event) => {
+                              setTwitterConfig((prev) => ({ ...prev, authToken: event.target.value }));
+                            }}
+                            required
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="ct0">Primary CT0</Label>
+                          <Input
+                            id="ct0"
+                            value={twitterConfig.ct0}
+                            onChange={(event) => {
+                              setTwitterConfig((prev) => ({ ...prev, ct0: event.target.value }));
+                            }}
+                            required
+                          />
+                        </div>
+
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="space-y-2">
+                            <Label htmlFor="backupAuthToken">Backup Auth Token</Label>
+                            <Input
+                              id="backupAuthToken"
+                              value={twitterConfig.backupAuthToken || ''}
+                              onChange={(event) => {
+                                setTwitterConfig((prev) => ({ ...prev, backupAuthToken: event.target.value }));
+                              }}
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label htmlFor="backupCt0">Backup CT0</Label>
+                            <Input
+                              id="backupCt0"
+                              value={twitterConfig.backupCt0 || ''}
+                              onChange={(event) => {
+                                setTwitterConfig((prev) => ({ ...prev, backupCt0: event.target.value }));
+                              }}
+                            />
+                          </div>
+                        </div>
+
+                        <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
+                          <Save className="mr-2 h-4 w-4" />
+                          Save Twitter Credentials
+                        </Button>
+                      </form>
+                    </CardContent>
+                  </div>
+                </div>
+              </Card>
+
+              <Card className="animate-slide-up">
+                <button
+                  className="flex w-full items-center justify-between px-5 py-4 text-left"
+                  onClick={() => toggleSettingsSection('ai')}
+                  type="button"
+                >
+                  <div>
+                    <p className="text-sm font-semibold">AI Settings</p>
+                    <p className="text-xs text-muted-foreground">Optional enrichment and rewrite provider config.</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant={aiConfigured ? 'success' : 'outline'}>
+                      {aiConfigured ? 'Configured' : 'Optional'}
+                    </Badge>
+                    <ChevronDown
+                      className={cn(
+                        'h-4 w-4 transition-transform duration-200',
+                        isSettingsSectionExpanded('ai') ? 'rotate-0' : '-rotate-90',
+                      )}
+                    />
+                  </div>
+                </button>
+                <div
+                  className={cn(
+                    'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                    isSettingsSectionExpanded('ai') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                  )}
+                >
+                  <div className="min-h-0 overflow-hidden">
+                    <CardContent className="space-y-3 border-t border-border/70 pt-4">
+                      <form className="space-y-3" onSubmit={handleSaveAiConfig}>
+                        <div className="space-y-2">
+                          <Label htmlFor="provider">Provider</Label>
+                          <select
+                            className={selectClassName}
+                            id="provider"
+                            value={aiConfig.provider}
+                            onChange={(event) => {
+                              setAiConfig((prev) => ({
+                                ...prev,
+                                provider: event.target.value as AIConfig['provider'],
+                              }));
+                            }}
+                          >
+                            <option value="gemini">Google Gemini</option>
+                            <option value="openai">OpenAI / OpenRouter</option>
+                            <option value="anthropic">Anthropic</option>
+                            <option value="custom">Custom</option>
+                          </select>
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="apiKey">API Key</Label>
+                          <Input
+                            id="apiKey"
+                            type="password"
+                            value={aiConfig.apiKey || ''}
+                            onChange={(event) => {
+                              setAiConfig((prev) => ({ ...prev, apiKey: event.target.value }));
+                            }}
+                          />
+                        </div>
+                        {aiConfig.provider !== 'gemini' ? (
+                          <>
+                            <div className="space-y-2">
+                              <Label htmlFor="model">Model ID</Label>
+                              <Input
+                                id="model"
+                                value={aiConfig.model || ''}
+                                onChange={(event) => {
+                                  setAiConfig((prev) => ({ ...prev, model: event.target.value }));
+                                }}
+                                placeholder="gpt-4o"
+                              />
+                            </div>
+                            <div className="space-y-2">
+                              <Label htmlFor="baseUrl">Base URL</Label>
+                              <Input
+                                id="baseUrl"
+                                value={aiConfig.baseUrl || ''}
+                                onChange={(event) => {
+                                  setAiConfig((prev) => ({ ...prev, baseUrl: event.target.value }));
+                                }}
+                                placeholder="https://api.example.com/v1"
+                              />
+                            </div>
+                          </>
+                        ) : null}
+
+                        <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
+                          <Bot className="mr-2 h-4 w-4" />
+                          Save AI Settings
+                        </Button>
+                      </form>
+                    </CardContent>
+                  </div>
+                </div>
+              </Card>
+
+              <Card className="animate-slide-up">
+                <button
+                  className="flex w-full items-center justify-between px-5 py-4 text-left"
+                  onClick={() => toggleSettingsSection('data')}
+                  type="button"
+                >
+                  <div>
+                    <p className="text-sm font-semibold">Data Management</p>
+                    <p className="text-xs text-muted-foreground">Export/import mappings and provider settings.</p>
+                  </div>
+                  <ChevronDown
+                    className={cn(
+                      'h-4 w-4 transition-transform duration-200',
+                      isSettingsSectionExpanded('data') ? 'rotate-0' : '-rotate-90',
+                    )}
+                  />
+                </button>
+                <div
+                  className={cn(
+                    'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                    isSettingsSectionExpanded('data') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                  )}
+                >
+                  <div className="min-h-0 overflow-hidden">
+                    <CardContent className="space-y-3 border-t border-border/70 pt-4">
+                      <Button className="w-full sm:w-auto" variant="outline" onClick={handleExportConfig}>
+                        <Download className="mr-2 h-4 w-4" />
+                        Export configuration
+                      </Button>
+                      <input
+                        ref={importInputRef}
+                        className="hidden"
+                        type="file"
+                        accept="application/json,.json"
+                        onChange={(event) => {
+                          void handleImportConfig(event);
+                        }}
+                      />
                       <Button
+                        className="w-full sm:w-auto"
                         variant="outline"
                         onClick={() => {
-                          void handleRunUpdate();
+                          importInputRef.current?.click();
                         }}
-                        disabled={isUpdateBusy || updateStatus?.running}
                       >
-                        {isUpdateBusy || updateStatus?.running ? (
-                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        ) : (
-                          <RefreshCw className="mr-2 h-4 w-4" />
-                        )}
-                        {updateStatus?.running ? 'Updating...' : 'Update'}
+                        <Upload className="mr-2 h-4 w-4" />
+                        Import configuration
                       </Button>
-                      <Button className="w-full sm:w-auto" onClick={openAddAccountSheet}>
-                        <Plus className="mr-2 h-4 w-4" />
-                        Add Account
-                      </Button>
-                    </div>
+                      <p className="text-xs text-muted-foreground">
+                        Imports preserve dashboard users and passwords while replacing mappings, provider keys, and
+                        scheduler settings.
+                      </p>
+                    </CardContent>
                   </div>
-                  {updateStatus?.logTail && updateStatus.logTail.length > 0 ? (
-                    <details className="mt-3">
-                      <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-                        Update log
-                      </summary>
-                      <pre className="mt-2 max-h-44 overflow-auto rounded-md bg-background p-2 font-mono text-[11px] leading-relaxed text-muted-foreground">
-                        {updateStatus.logTail.join('\n')}
-                      </pre>
-                    </details>
-                  ) : null}
                 </div>
+              </Card>
+            </>
+          ) : (
+            <Card className="animate-slide-up">
+              <CardHeader>
+                <CardTitle>Access Scope</CardTitle>
+                <CardDescription>Your current account permissions.</CardDescription>
+              </CardHeader>
+              <CardContent className="flex flex-wrap gap-2 pt-0">
+                {PERMISSION_OPTIONS.filter((permission) => effectivePermissions[permission.key]).map((permission) => (
+                  <Badge key={`self-perm-${permission.key}`} variant="outline">
+                    {permission.label}
+                  </Badge>
+                ))}
               </CardContent>
             </Card>
-
-            <Card className="animate-slide-up">
-              <button
-                className="flex w-full items-center justify-between px-5 py-4 text-left"
-                onClick={() => toggleSettingsSection('twitter')}
-                type="button"
-              >
-                <div>
-                  <p className="text-sm font-semibold">Twitter Credentials</p>
-                  <p className="text-xs text-muted-foreground">Primary and backup cookie values.</p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant={twitterConfigured ? 'success' : 'outline'}>
-                    {twitterConfigured ? 'Configured' : 'Missing'}
-                  </Badge>
-                  <ChevronDown
-                    className={cn(
-                      'h-4 w-4 transition-transform duration-200',
-                      isSettingsSectionExpanded('twitter') ? 'rotate-0' : '-rotate-90',
-                    )}
-                  />
-                </div>
-              </button>
-              <div
-                className={cn(
-                  'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
-                  isSettingsSectionExpanded('twitter') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
-                )}
-              >
-                <div className="min-h-0 overflow-hidden">
-                  <CardContent className="space-y-3 border-t border-border/70 pt-4">
-                    <form className="space-y-3" onSubmit={handleSaveTwitterConfig}>
-                      <div className="space-y-2">
-                        <Label htmlFor="authToken">Primary Auth Token</Label>
-                        <Input
-                          id="authToken"
-                          value={twitterConfig.authToken}
-                          onChange={(event) => {
-                            setTwitterConfig((prev) => ({ ...prev, authToken: event.target.value }));
-                          }}
-                          required
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="ct0">Primary CT0</Label>
-                        <Input
-                          id="ct0"
-                          value={twitterConfig.ct0}
-                          onChange={(event) => {
-                            setTwitterConfig((prev) => ({ ...prev, ct0: event.target.value }));
-                          }}
-                          required
-                        />
-                      </div>
-
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <div className="space-y-2">
-                          <Label htmlFor="backupAuthToken">Backup Auth Token</Label>
-                          <Input
-                            id="backupAuthToken"
-                            value={twitterConfig.backupAuthToken || ''}
-                            onChange={(event) => {
-                              setTwitterConfig((prev) => ({ ...prev, backupAuthToken: event.target.value }));
-                            }}
-                          />
-                        </div>
-                        <div className="space-y-2">
-                          <Label htmlFor="backupCt0">Backup CT0</Label>
-                          <Input
-                            id="backupCt0"
-                            value={twitterConfig.backupCt0 || ''}
-                            onChange={(event) => {
-                              setTwitterConfig((prev) => ({ ...prev, backupCt0: event.target.value }));
-                            }}
-                          />
-                        </div>
-                      </div>
-
-                      <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
-                        <Save className="mr-2 h-4 w-4" />
-                        Save Twitter Credentials
-                      </Button>
-                    </form>
-                  </CardContent>
-                </div>
-              </div>
-            </Card>
-
-            <Card className="animate-slide-up">
-              <button
-                className="flex w-full items-center justify-between px-5 py-4 text-left"
-                onClick={() => toggleSettingsSection('ai')}
-                type="button"
-              >
-                <div>
-                  <p className="text-sm font-semibold">AI Settings</p>
-                  <p className="text-xs text-muted-foreground">Optional enrichment and rewrite provider config.</p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Badge variant={aiConfigured ? 'success' : 'outline'}>
-                    {aiConfigured ? 'Configured' : 'Optional'}
-                  </Badge>
-                  <ChevronDown
-                    className={cn(
-                      'h-4 w-4 transition-transform duration-200',
-                      isSettingsSectionExpanded('ai') ? 'rotate-0' : '-rotate-90',
-                    )}
-                  />
-                </div>
-              </button>
-              <div
-                className={cn(
-                  'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
-                  isSettingsSectionExpanded('ai') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
-                )}
-              >
-                <div className="min-h-0 overflow-hidden">
-                  <CardContent className="space-y-3 border-t border-border/70 pt-4">
-                    <form className="space-y-3" onSubmit={handleSaveAiConfig}>
-                      <div className="space-y-2">
-                        <Label htmlFor="provider">Provider</Label>
-                        <select
-                          className={selectClassName}
-                          id="provider"
-                          value={aiConfig.provider}
-                          onChange={(event) => {
-                            setAiConfig((prev) => ({ ...prev, provider: event.target.value as AIConfig['provider'] }));
-                          }}
-                        >
-                          <option value="gemini">Google Gemini</option>
-                          <option value="openai">OpenAI / OpenRouter</option>
-                          <option value="anthropic">Anthropic</option>
-                          <option value="custom">Custom</option>
-                        </select>
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="apiKey">API Key</Label>
-                        <Input
-                          id="apiKey"
-                          type="password"
-                          value={aiConfig.apiKey || ''}
-                          onChange={(event) => {
-                            setAiConfig((prev) => ({ ...prev, apiKey: event.target.value }));
-                          }}
-                        />
-                      </div>
-                      {aiConfig.provider !== 'gemini' ? (
-                        <>
-                          <div className="space-y-2">
-                            <Label htmlFor="model">Model ID</Label>
-                            <Input
-                              id="model"
-                              value={aiConfig.model || ''}
-                              onChange={(event) => {
-                                setAiConfig((prev) => ({ ...prev, model: event.target.value }));
-                              }}
-                              placeholder="gpt-4o"
-                            />
-                          </div>
-                          <div className="space-y-2">
-                            <Label htmlFor="baseUrl">Base URL</Label>
-                            <Input
-                              id="baseUrl"
-                              value={aiConfig.baseUrl || ''}
-                              onChange={(event) => {
-                                setAiConfig((prev) => ({ ...prev, baseUrl: event.target.value }));
-                              }}
-                              placeholder="https://api.example.com/v1"
-                            />
-                          </div>
-                        </>
-                      ) : null}
-
-                      <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
-                        <Bot className="mr-2 h-4 w-4" />
-                        Save AI Settings
-                      </Button>
-                    </form>
-                  </CardContent>
-                </div>
-              </div>
-            </Card>
-
-            <Card className="animate-slide-up">
-              <button
-                className="flex w-full items-center justify-between px-5 py-4 text-left"
-                onClick={() => toggleSettingsSection('data')}
-                type="button"
-              >
-                <div>
-                  <p className="text-sm font-semibold">Data Management</p>
-                  <p className="text-xs text-muted-foreground">Export/import mappings and provider settings.</p>
-                </div>
-                <ChevronDown
-                  className={cn(
-                    'h-4 w-4 transition-transform duration-200',
-                    isSettingsSectionExpanded('data') ? 'rotate-0' : '-rotate-90',
-                  )}
-                />
-              </button>
-              <div
-                className={cn(
-                  'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
-                  isSettingsSectionExpanded('data') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
-                )}
-              >
-                <div className="min-h-0 overflow-hidden">
-                  <CardContent className="space-y-3 border-t border-border/70 pt-4">
-                    <Button className="w-full sm:w-auto" variant="outline" onClick={handleExportConfig}>
-                      <Download className="mr-2 h-4 w-4" />
-                      Export configuration
-                    </Button>
-                    <input
-                      ref={importInputRef}
-                      className="hidden"
-                      type="file"
-                      accept="application/json,.json"
-                      onChange={(event) => {
-                        void handleImportConfig(event);
-                      }}
-                    />
-                    <Button
-                      className="w-full sm:w-auto"
-                      variant="outline"
-                      onClick={() => {
-                        importInputRef.current?.click();
-                      }}
-                    >
-                      <Upload className="mr-2 h-4 w-4" />
-                      Import configuration
-                    </Button>
-                    <p className="text-xs text-muted-foreground">
-                      Imports preserve dashboard users and passwords while replacing mappings, provider keys, and
-                      scheduler settings.
-                    </p>
-                  </CardContent>
-                </div>
-              </div>
-            </Card>
-          </section>
-        ) : null
+          )}
+        </section>
       ) : null}
-
       {isAddAccountSheetOpen ? (
         <div
           className="fixed inset-0 z-50 flex items-end justify-center bg-black/55 p-0 backdrop-blur-sm sm:items-stretch sm:justify-end"
@@ -3635,9 +4657,7 @@ function App() {
                 <div className="space-y-4 animate-fade-in">
                   <div className="space-y-1">
                     <p className="text-sm font-semibold">Target Bluesky account</p>
-                    <p className="text-xs text-muted-foreground">
-                      Use an app password for the destination account.
-                    </p>
+                    <p className="text-xs text-muted-foreground">Use an app password for the destination account.</p>
                   </div>
                   <div className="space-y-2">
                     <Label htmlFor="add-account-bsky-identifier">Bluesky Identifier</Label>
@@ -3864,15 +4884,6 @@ function App() {
               </form>
             </CardContent>
           </Card>
-        </div>
-      ) : null}
-
-      {!isAdmin ? (
-        <div className="mt-6 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
-          <p className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4" />
-            Admin-only settings are hidden for this account.
-          </p>
         </div>
       ) : null}
     </main>

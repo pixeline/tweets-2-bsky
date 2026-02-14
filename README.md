@@ -47,9 +47,53 @@ Open the printed URL in your browser, then:
 ./install.sh --stop
 ./install.sh --status
 ./install.sh --port 3100
+./install.sh --host 127.0.0.1
+./install.sh --skip-native-rebuild
 ```
 
 If you prefer full manual setup, skip to [Manual Setup](#manual-setup-technical).
+
+## Linux VPS Without Domain (Secure HTTPS via Tailscale)
+
+If you host on a public VPS (Linux) and do not own a domain, use the server installer:
+
+```bash
+chmod +x install-server.sh
+./install-server.sh
+```
+
+What this does:
+
+- runs the normal app install/build/start flow
+- auto-selects a free local app port if your chosen/default port is already in use
+- forces the app to bind locally only (`HOST=127.0.0.1`)
+- installs and starts Tailscale if needed
+- configures `tailscale serve` on a free HTTPS port so your dashboard is reachable over Tailnet HTTPS
+- prints the final Tailnet URL to open from any device authenticated on your Tailscale account
+
+Optional non-interactive login:
+
+```bash
+./install-server.sh --auth-key <TS_AUTHKEY>
+```
+
+Optional fixed Tailscale HTTPS port:
+
+```bash
+./install-server.sh --https-port 443
+```
+
+Optional public exposure (internet) with Funnel:
+
+```bash
+./install-server.sh --funnel
+```
+
+Notes:
+
+- this does **not** replace or delete `install.sh`; it wraps server-hardening around it
+- normal updates still use `./update.sh` and keep your local `.env` values
+- if you already installed manually, this is still safe to run later
 
 ## What This Project Does
 
@@ -235,12 +279,21 @@ Use:
 
 `update.sh`:
 
-- pulls latest code
+- stashes local uncommitted changes before pull and restores them after update
+- pulls latest code (supports non-`origin` remotes and detached-head recovery)
 - installs dependencies
-- rebuilds native modules
+- rebuilds native modules when Node ABI changed
 - builds server + web dashboard
-- restarts PM2 process when PM2 is available
-- preserves local `config.json` with backup/restore
+- restarts existing runtime for PM2 **or** nohup mode
+- preserves local `config.json` and `.env` with backup/restore
+
+Useful update flags:
+
+```bash
+./update.sh --no-restart
+./update.sh --skip-install --skip-build
+./update.sh --remote origin --branch main
+```
 
 ## Data, Config, and Security
 
@@ -253,8 +306,30 @@ Local files:
 Security notes:
 
 - first registered dashboard user is admin
+- after bootstrap, only admins can create additional dashboard users
+- users can sign in with username or email
+- non-admin users only see mappings they created by default
+- admins can grant fine-grained permissions (view all mappings, manage groups, queue backfills, run-now, etc.)
+- only admins can view or edit Twitter/AI provider credentials
+- admin user management never exposes other users' password hashes in the UI
 - if `JWT_SECRET` is missing, server falls back to an insecure default; set your own secret in `.env`
 - prefer Bluesky app passwords (not your full account password)
+
+### Multi-User Access Control
+
+- bootstrap account:
+  - the first account created through the web UI becomes admin
+  - open registration is automatically disabled after this
+- admin capabilities:
+  - create, edit, reset password, and delete dashboard users
+  - assign role (`admin` or `user`) and per-user permissions
+  - filter the Accounts page by creator to review each user's mappings
+- deleting a user:
+  - disables that user's mappings so crossposting stops
+  - leaves already-published Bluesky posts untouched
+- self-service security:
+  - every user can change their own password
+  - users can change their own email after password verification
 
 ## Development
 
