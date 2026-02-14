@@ -1,103 +1,149 @@
 # Tweets-2-Bsky
 
-A powerful tool to crosspost Tweets to Bluesky, supporting threads, videos, and high-quality images.
+Crosspost Tweets/X posts to Bluesky with support for threads, media, and multiple account mappings.
 
 ## Features
 
-- 🔄 **Crossposting**: Automatically mirrors your Tweets to Bluesky.
-- 🧵 **Thread Support**: INTELLIGENTLY handles threads, posting them as Bluesky threads.
-- 📹 **Video & GIF Support**: Downloads and uploads videos/GIFs natively to Bluesky (not just links!).
-- 🖼️ **High-Quality Images**: Fetches the highest resolution images available.
-- 🔗 **Smart Link Expansion**: Resolves `t.co` links to their original URLs.
-- 👥 **Multiple Source Accounts**: Map multiple Twitter accounts to a single Bluesky profile.
-- ⚙️ **Web Dashboard**: Manage accounts, view status, and trigger runs via a modern UI.
-- 🛠️ **CLI & Web Support**: Use the command line or the web interface.
+- Automated crossposting from Twitter/X to Bluesky
+- Thread-aware posting
+- Video/GIF and high-quality image handling
+- Multi-source account mappings per Bluesky target
+- React + Vite web dashboard (auto light/dark mode)
+- Native-styled "Already Posted" feed in dashboard
+- Full CLI workflows for CLI-only/cronjob usage
 
-## Quick Start
+## Requirements
 
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/yourusername/tweets-2-bsky.git
-    cd tweets-2-bsky
-    ```
+- Node.js 22+
+- npm
+- Git
 
-2.  **Install dependencies:**
-    ```bash
-    npm install
-    ```
+## Fast Setup (Web + CLI)
 
-3.  **Build the project:**
-    ```bash
-    npm run build
-    ```
+```bash
+git clone https://github.com/j4ckxyz/tweets-2-bsky
+cd tweets-2-bsky
+npm install
+npm run build
+npm start
+```
 
-4.  **Start the server:**
-    ```bash
-    npm start
-    ```
-    Access the dashboard at `http://localhost:3000`.
+Open: [http://localhost:3000](http://localhost:3000)
+
+Notes:
+- `npm install` automatically rebuilds native modules (including `better-sqlite3`) for your active Node version.
+- If you switch Node versions later, run `npm run rebuild:native`.
+
+## CLI-Only Setup
+
+1. Configure Twitter cookies:
+   ```bash
+   npm run cli -- setup-twitter
+   ```
+2. Add mapping(s):
+   ```bash
+   npm run cli -- add-mapping
+   ```
+3. Run one sync cycle now:
+   ```bash
+   npm run cli -- run-now
+   ```
 
 ## Updating
 
-To update to the latest version without losing your configuration:
+Use:
 
 ```bash
 ./update.sh
 ```
 
-This script will pull the latest code, install dependencies, and rebuild the project. **Restart your application** after running the update.
+What it does:
+- pulls latest code
+- installs dependencies
+- rebuilds native modules
+- builds server + web UI
+- restarts PM2 process (if PM2 is installed)
+- preserves local `config.json` via backup/restore
+
+## CLI Commands (Feature Parity)
+
+Always use:
+
+```bash
+npm run cli -- <command>
+```
+
+Core commands:
+- `setup-twitter`: Configure primary + backup Twitter cookies
+- `setup-ai`: Configure AI provider/API settings
+- `add-mapping`, `edit-mapping`, `remove`, `list`
+- `set-interval <minutes>`: Scheduler interval
+- `run-now [--dry-run] [--web]`: Run one cycle immediately (good for cron)
+- `backfill [mapping] --limit 15 [--dry-run] [--web]`
+- `import-history [mapping] --limit 15 [--dry-run] [--web]`
+- `clear-cache [mapping]`
+- `delete-all-posts [mapping]`
+- `recent-activity --limit 20`
+- `config-export [file]`
+- `config-import <file>`
+- `status`
+
+Mapping arguments can be mapping ID, Bluesky handle, or Twitter username.
+
+## Cronjob Example
+
+Run every 5 minutes:
+
+```cron
+*/5 * * * * cd /path/to/tweets-2-bsky && /usr/bin/npm run cli -- run-now >> /tmp/tweets-2-bsky.log 2>&1
+```
+
+Backfill specific mapping once:
+
+```bash
+npm run cli -- backfill <mapping-id-or-handle> --limit 50
+```
+
+## Web Dashboard
+
+1. Register first user (becomes admin)
+2. Configure Twitter + AI settings
+3. Add mappings
+4. Use:
+   - `Run now`
+   - backfill/reset actions per mapping
+   - config export/import
+   - "Already Posted" feed for native-themed post browsing
 
 ## Configuration & Security
 
-### Environment Variables
+### Environment variables
 
-Create a `.env` file for security (optional but recommended):
+Create `.env` (recommended):
 
 ```env
 PORT=3000
 JWT_SECRET=your-super-secret-key-change-this
 ```
 
-> **⚠️ Security Note:** If you do not set `JWT_SECRET`, a fallback secret is used. For production or public-facing deployments, **YOU MUST SET A STRONG SECRET**.
+If `JWT_SECRET` is not set, a fallback secret is used.
 
-### Data Storage
+### Local data files
 
-- **`config.json`**: Stores your account mappings and encrypted web user passwords. Note that Bluesky app passwords are stored in plain text here to facilitate automated login. **Do not share this file.**
-- **`data/database.sqlite`**: Stores the history of processed tweets to prevent duplicates.
+- `config.json`: mappings + auth settings + web users (do not share)
+- `data/database.sqlite`: processed tweet history
 
-## Usage
+## Troubleshooting
 
-### Web Interface
+See: `TROUBLESHOOTING.md`
 
-1.  Register your first account (this user becomes the **Admin**).
-2.  Go to settings to configure your Twitter Auth Token and CT0 (cookies).
-3.  Add mappings:
-    *   Enter one or more **Twitter Usernames** (comma-separated).
-    *   Enter your **Bluesky Handle** and **App Password**.
-4.  The system will check for new tweets every 5 minutes (configurable).
+Most common fix after changing Node versions:
 
-### CLI
-
-- **Add Mapping**: `npm run cli add-mapping`
-- **Edit Mapping**: `npm run cli edit-mapping`
-- **Import History**: `npm run cli import-history`
-- **List Accounts**: `npm run cli list`
-
-### 🤖 Gemini AI Alt Text (Optional)
-
-This tool can automatically generate Alt Text for images using Google's Gemini AI if the original tweet lacks it.
-
-1.  **Get an API Key**: Get a free API Key from [Google AI Studio](https://aistudio.google.com/app/apikey).
-2.  **Configure**:
-    *   **Web UI**: Go to the Admin Dashboard and paste your key in the "Gemini AI (Alt Text)" section.
-    *   **Disable**: Leave the field empty to disable this feature (default).
-
-## Twitter Cookies (Auth)
-
-You need your Twitter `auth_token` and `ct0` cookies.
-1.  Log in to Twitter/X in your browser.
-2.  Open Developer Tools (F12) -> Application -> Cookies.
-3.  Copy the values for `auth_token` and `ct0`.
+```bash
+npm run rebuild:native
+npm run build
+npm start
+```
 
 ## License
 

@@ -1,13 +1,163 @@
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
 import inquirer from 'inquirer';
-import { addMapping, getConfig, removeMapping, saveConfig, updateTwitterConfig } from './config-manager.js';
+import { deleteAllPosts } from './bsky.js';
+import {
+  addMapping,
+  getConfig,
+  removeMapping,
+  saveConfig,
+  updateTwitterConfig,
+  type AccountMapping,
+  type AppConfig,
+} from './config-manager.js';
+import { dbService } from './db.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const ROOT_DIR = path.join(__dirname, '..');
+
+const normalizeHandle = (value: string) => value.trim().replace(/^@/, '').toLowerCase();
+
+const parsePositiveInt = (value: string, defaultValue: number): number => {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return defaultValue;
+  }
+  return parsed;
+};
+
+const findMappingByRef = (config: AppConfig, ref: string): AccountMapping | undefined => {
+  const needle = normalizeHandle(ref);
+  return config.mappings.find(
+    (mapping) =>
+      mapping.id === ref ||
+      normalizeHandle(mapping.bskyIdentifier) === needle ||
+      mapping.twitterUsernames.some((username) => normalizeHandle(username) === needle),
+  );
+};
+
+const selectMapping = async (message: string): Promise<AccountMapping | null> => {
+  const config = getConfig();
+  if (config.mappings.length === 0) {
+    console.log('No mappings found.');
+    return null;
+  }
+
+  const { id } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'id',
+      message,
+      choices: config.mappings.map((mapping) => ({
+        name: `${mapping.owner || 'System'}: ${mapping.twitterUsernames.join(', ')} -> ${mapping.bskyIdentifier}`,
+        value: mapping.id,
+      })),
+    },
+  ]);
+
+  return config.mappings.find((mapping) => mapping.id === id) ?? null;
+};
+
+const spawnAndWait = async (command: string, args: string[], cwd: string): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: 'inherit',
+      env: process.env,
+    });
+
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`Process exited with code ${code}`));
+    });
+  });
+
+const runCoreCommand = async (args: string[]): Promise<void> => {
+  const distEntry = path.join(ROOT_DIR, 'dist', 'index.js');
+  if (fs.existsSync(distEntry)) {
+    await spawnAndWait(process.execPath, [distEntry, ...args], ROOT_DIR);
+    return;
+  }
+
+  const tsxBin =
+    process.platform === 'win32'
+      ? path.join(ROOT_DIR, 'node_modules', '.bin', 'tsx.cmd')
+      : path.join(ROOT_DIR, 'node_modules', '.bin', 'tsx');
+
+  const sourceEntry = path.join(ROOT_DIR, 'src', 'index.ts');
+  if (fs.existsSync(tsxBin) && fs.existsSync(sourceEntry)) {
+    await spawnAndWait(tsxBin, [sourceEntry, ...args], ROOT_DIR);
+    return;
+  }
+
+  throw new Error('Could not find dist/index.js or tsx runtime. Run npm run build first.');
+};
+
+const ensureMapping = async (mappingRef?: string): Promise<AccountMapping | null> => {
+  const config = getConfig();
+  if (config.mappings.length === 0) {
+    console.log('No mappings found.');
+    return null;
+  }
+
+  if (mappingRef) {
+    const mapping = findMappingByRef(config, mappingRef);
+    if (!mapping) {
+      console.log(`No mapping found for '${mappingRef}'.`);
+      return null;
+    }
+    return mapping;
+  }
+
+  return selectMapping('Select a mapping:');
+};
+
+const exportConfig = (outputFile: string) => {
+  const config = getConfig();
+  const { users, ...cleanConfig } = config;
+  const outputPath = path.resolve(outputFile);
+  fs.writeFileSync(outputPath, JSON.stringify(cleanConfig, null, 2));
+  console.log(`Exported config to ${outputPath}.`);
+};
+
+const importConfig = (inputFile: string) => {
+  const inputPath = path.resolve(inputFile);
+  if (!fs.existsSync(inputPath)) {
+    throw new Error(`File not found: ${inputPath}`);
+  }
+
+  const parsed = JSON.parse(fs.readFileSync(inputPath, 'utf8'));
+  if (!parsed.mappings || !Array.isArray(parsed.mappings)) {
+    throw new Error('Invalid config format: missing mappings array.');
+  }
+
+  const currentConfig = getConfig();
+  const nextConfig: AppConfig = {
+    ...currentConfig,
+    mappings: parsed.mappings,
+    twitter: parsed.twitter || currentConfig.twitter,
+    ai: parsed.ai || currentConfig.ai,
+    checkIntervalMinutes: parsed.checkIntervalMinutes || currentConfig.checkIntervalMinutes,
+  };
+
+  saveConfig(nextConfig);
+  console.log('Config imported successfully. Existing users were preserved.');
+};
 
 const program = new Command();
 
 program
   .name('tweets-2-bsky-cli')
-  .description('CLI to manage Twitter to Bluesky crossposting mappings')
-  .version('1.0.0');
+  .description('CLI for full Tweets -> Bluesky dashboard workflows')
+  .version('2.1.0');
 
 program
   .command('setup-ai')
@@ -16,7 +166,6 @@ program
     const config = getConfig();
     const currentAi = config.ai || { provider: 'gemini' };
 
-    // Check legacy gemini key if not in new config
     if (!config.ai && config.geminiApiKey) {
       currentAi.apiKey = config.geminiApiKey;
     }
@@ -39,12 +188,6 @@ program
         name: 'apiKey',
         message: 'Enter API Key (optional for some custom providers):',
         default: currentAi.apiKey,
-        validate: (input: string, answers: any) => {
-          if (['gemini', 'anthropic'].includes(answers.provider) && !input) {
-            return 'API Key is required for this provider.';
-          }
-          return true;
-        },
       },
       {
         type: 'input',
@@ -55,7 +198,7 @@ program
       {
         type: 'input',
         name: 'baseUrl',
-        message: 'Enter Base URL (optional, e.g. for OpenRouter):',
+        message: 'Enter Base URL (optional):',
         default: currentAi.baseUrl,
         when: (answers) => ['openai', 'anthropic', 'custom'].includes(answers.provider),
       },
@@ -68,41 +211,57 @@ program
       baseUrl: answers.baseUrl || undefined,
     };
 
-    // Clear legacy key to avoid confusion
     delete config.geminiApiKey;
-
     saveConfig(config);
-    console.log('AI configuration updated!');
+    console.log('AI configuration updated.');
   });
 
 program
   .command('setup-twitter')
-  .description('Setup Twitter auth cookies')
+  .description('Setup Twitter auth cookies (primary + backup)')
   .action(async () => {
     const config = getConfig();
     const answers = await inquirer.prompt([
       {
         type: 'input',
         name: 'authToken',
-        message: 'Enter Twitter auth_token:',
+        message: 'Primary Twitter auth_token:',
         default: config.twitter.authToken,
       },
       {
         type: 'input',
         name: 'ct0',
-        message: 'Enter Twitter ct0:',
+        message: 'Primary Twitter ct0:',
         default: config.twitter.ct0,
       },
+      {
+        type: 'input',
+        name: 'backupAuthToken',
+        message: 'Backup Twitter auth_token (optional):',
+        default: config.twitter.backupAuthToken,
+      },
+      {
+        type: 'input',
+        name: 'backupCt0',
+        message: 'Backup Twitter ct0 (optional):',
+        default: config.twitter.backupCt0,
+      },
     ]);
+
     updateTwitterConfig(answers);
-    console.log('Twitter config updated!');
+    console.log('Twitter credentials updated.');
   });
 
 program
   .command('add-mapping')
-  .description('Add a new Twitter to Bluesky mapping')
+  .description('Add a new Twitter -> Bluesky mapping')
   .action(async () => {
     const answers = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'owner',
+        message: 'Owner name:',
+      },
       {
         type: 'input',
         name: 'twitterUsernames',
@@ -128,42 +287,34 @@ program
 
     const usernames = answers.twitterUsernames
       .split(',')
-      .map((u: string) => u.trim())
-      .filter((u: string) => u.length > 0);
+      .map((username: string) => username.trim())
+      .filter((username: string) => username.length > 0);
 
     addMapping({
-      ...answers,
+      owner: answers.owner,
       twitterUsernames: usernames,
+      bskyIdentifier: answers.bskyIdentifier,
+      bskyPassword: answers.bskyPassword,
+      bskyServiceUrl: answers.bskyServiceUrl,
     });
-    console.log('Mapping added successfully!');
+    console.log('Mapping added successfully.');
   });
 
 program
-  .command('edit-mapping')
-  .description('Edit an existing mapping')
-  .action(async () => {
-    const config = getConfig();
-    if (config.mappings.length === 0) {
-      console.log('No mappings found.');
-      return;
-    }
-
-    const { id } = await inquirer.prompt([
-      {
-        type: 'list',
-        name: 'id',
-        message: 'Select a mapping to edit:',
-        choices: config.mappings.map((m) => ({
-          name: `${m.twitterUsernames.join(', ')} -> ${m.bskyIdentifier}`,
-          value: m.id,
-        })),
-      },
-    ]);
-
-    const mapping = config.mappings.find((m) => m.id === id);
+  .command('edit-mapping [mapping]')
+  .description('Edit a mapping by id/handle/twitter username')
+  .action(async (mappingRef?: string) => {
+    const mapping = await ensureMapping(mappingRef);
     if (!mapping) return;
 
+    const config = getConfig();
     const answers = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'owner',
+        message: 'Owner:',
+        default: mapping.owner || '',
+      },
       {
         type: 'input',
         name: 'twitterUsernames',
@@ -191,29 +342,30 @@ program
 
     const usernames = answers.twitterUsernames
       .split(',')
-      .map((u: string) => u.trim())
-      .filter((u: string) => u.length > 0);
+      .map((username: string) => username.trim())
+      .filter((username: string) => username.length > 0);
 
-    // Update the mapping directly
-    const index = config.mappings.findIndex((m) => m.id === id);
+    const index = config.mappings.findIndex((entry) => entry.id === mapping.id);
+    if (index === -1) return;
+
     const existingMapping = config.mappings[index];
+    if (!existingMapping) return;
 
-    if (index !== -1 && existingMapping) {
-      const updatedMapping = {
-        ...existingMapping,
-        twitterUsernames: usernames,
-        bskyIdentifier: answers.bskyIdentifier,
-        bskyServiceUrl: answers.bskyServiceUrl,
-      };
+    const updatedMapping = {
+      ...existingMapping,
+      owner: answers.owner,
+      twitterUsernames: usernames,
+      bskyIdentifier: answers.bskyIdentifier,
+      bskyServiceUrl: answers.bskyServiceUrl,
+    };
 
-      if (answers.bskyPassword && answers.bskyPassword.trim().length > 0) {
-        updatedMapping.bskyPassword = answers.bskyPassword;
-      }
-
-      config.mappings[index] = updatedMapping;
-      saveConfig(config);
-      console.log('Mapping updated successfully!');
+    if (answers.bskyPassword && answers.bskyPassword.trim().length > 0) {
+      updatedMapping.bskyPassword = answers.bskyPassword;
     }
+
+    config.mappings[index] = updatedMapping;
+    saveConfig(config);
+    console.log('Mapping updated successfully.');
   });
 
 program
@@ -225,88 +377,239 @@ program
       console.log('No mappings found.');
       return;
     }
+
     console.table(
-      config.mappings.map((m) => ({
-        id: m.id,
-        twitter: m.twitterUsernames.join(', '),
-        bsky: m.bskyIdentifier,
-        enabled: m.enabled,
+      config.mappings.map((mapping) => ({
+        id: mapping.id,
+        owner: mapping.owner || 'System',
+        twitter: mapping.twitterUsernames.join(', '),
+        bsky: mapping.bskyIdentifier,
+        enabled: mapping.enabled,
       })),
     );
   });
 
 program
-  .command('remove')
-  .description('Remove a mapping')
-  .action(async () => {
-    const config = getConfig();
-    if (config.mappings.length === 0) {
-      console.log('No mappings to remove.');
-      return;
-    }
-    const { id } = await inquirer.prompt([
+  .command('remove [mapping]')
+  .description('Remove a mapping by id/handle/twitter username')
+  .action(async (mappingRef?: string) => {
+    const mapping = await ensureMapping(mappingRef);
+    if (!mapping) return;
+
+    const { confirmed } = await inquirer.prompt([
       {
-        type: 'list',
-        name: 'id',
-        message: 'Select a mapping to remove:',
-        choices: config.mappings.map((m) => ({
-          name: `${m.twitterUsernames.join(', ')} -> ${m.bskyIdentifier}`,
-          value: m.id,
-        })),
+        type: 'confirm',
+        name: 'confirmed',
+        message: `Remove mapping ${mapping.twitterUsernames.join(', ')} -> ${mapping.bskyIdentifier}?`,
+        default: false,
       },
     ]);
-    removeMapping(id);
+
+    if (!confirmed) {
+      console.log('Cancelled.');
+      return;
+    }
+
+    removeMapping(mapping.id);
     console.log('Mapping removed.');
   });
 
 program
-  .command('import-history')
-  .description('Import history for a specific mapping')
-  .action(async () => {
-    const config = getConfig();
-    if (config.mappings.length === 0) {
-      console.log('No mappings found.');
-      return;
-    }
-    const { id } = await inquirer.prompt([
-      {
-        type: 'list',
-        name: 'id',
-        message: 'Select a mapping to import history for:',
-        choices: config.mappings.map((m) => ({
-          name: `${m.twitterUsernames.join(', ')} -> ${m.bskyIdentifier}`,
-          value: m.id,
-        })),
-      },
-    ]);
-
-    const mapping = config.mappings.find((m) => m.id === id);
+  .command('import-history [mapping]')
+  .description('Import history immediately for one mapping')
+  .option('-l, --limit <number>', 'Tweet limit', '15')
+  .option('--dry-run', 'Do not post to Bluesky', false)
+  .option('--web', 'Keep web server enabled during import', false)
+  .action(async (mappingRef: string | undefined, options) => {
+    const mapping = await ensureMapping(mappingRef);
     if (!mapping) return;
 
-    console.log(`
-To import history, run one of the following commands:`);
-    for (const username of mapping.twitterUsernames) {
-      console.log(`  npm run import -- --username ${username}`);
+    let username = mapping.twitterUsernames[0] ?? '';
+    if (!username) {
+      console.log('Mapping has no Twitter usernames.');
+      return;
     }
-    console.log(`
-You can also use additional flags:`);
-    console.log('  --limit <number>  Limit the number of tweets to import');
-    console.log('  --dry-run         Fetch and show tweets without posting');
-    console.log(`
-Example:`);
-    console.log(`  npm run import -- --username ${mapping.twitterUsernames[0]} --limit 10 --dry-run
-`);
+
+    if (mapping.twitterUsernames.length > 1) {
+      const answer = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'username',
+          message: 'Select Twitter username to import:',
+          choices: mapping.twitterUsernames,
+          default: username,
+        },
+      ]);
+      username = String(answer.username || '').trim();
+    }
+
+    const args: string[] = [
+      '--import-history',
+      '--username',
+      username,
+      '--limit',
+      String(parsePositiveInt(options.limit, 15)),
+    ];
+    if (options.dryRun) args.push('--dry-run');
+    if (!options.web) args.push('--no-web');
+
+    await runCoreCommand(args);
   });
 
 program
-  .command('set-interval')
-  .description('Set check interval in minutes')
-  .argument('<minutes>', 'Interval in minutes')
+  .command('set-interval <minutes>')
+  .description('Set scheduler interval in minutes')
   .action((minutes) => {
+    const parsed = parsePositiveInt(minutes, 5);
     const config = getConfig();
-    config.checkIntervalMinutes = Number.parseInt(minutes, 10);
+    config.checkIntervalMinutes = parsed;
     saveConfig(config);
-    console.log(`Interval set to ${minutes} minutes.`);
+    console.log(`Interval set to ${parsed} minutes.`);
   });
 
-program.parse();
+program
+  .command('run-now')
+  .description('Run one sync cycle now (ideal for cronjobs)')
+  .option('--dry-run', 'Fetch but do not post', false)
+  .option('--web', 'Keep web server enabled during this run', false)
+  .action(async (options) => {
+    const args = ['--run-once'];
+    if (options.dryRun) args.push('--dry-run');
+    if (!options.web) args.push('--no-web');
+    await runCoreCommand(args);
+  });
+
+program
+  .command('backfill [mapping]')
+  .description('Run backfill now for one mapping (id/handle/twitter username)')
+  .option('-l, --limit <number>', 'Tweet limit', '15')
+  .option('--dry-run', 'Fetch but do not post', false)
+  .option('--web', 'Keep web server enabled during this run', false)
+  .action(async (mappingRef: string | undefined, options) => {
+    const mapping = await ensureMapping(mappingRef);
+    if (!mapping) return;
+
+    const args = ['--run-once', '--backfill-mapping', mapping.id, '--backfill-limit', String(parsePositiveInt(options.limit, 15))];
+    if (options.dryRun) args.push('--dry-run');
+    if (!options.web) args.push('--no-web');
+
+    await runCoreCommand(args);
+  });
+
+program
+  .command('clear-cache [mapping]')
+  .description('Clear cached tweet history for a mapping')
+  .action(async (mappingRef?: string) => {
+    const mapping = await ensureMapping(mappingRef);
+    if (!mapping) return;
+
+    for (const username of mapping.twitterUsernames) {
+      dbService.deleteTweetsByUsername(username);
+    }
+
+    console.log(`Cache cleared for ${mapping.twitterUsernames.join(', ')}.`);
+  });
+
+program
+  .command('delete-all-posts [mapping]')
+  .description('Delete all posts on mapped Bluesky account and clear local cache')
+  .action(async (mappingRef?: string) => {
+    const mapping = await ensureMapping(mappingRef);
+    if (!mapping) return;
+
+    const { confirmed } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirmed',
+        message: `Delete ALL posts for ${mapping.bskyIdentifier}? This cannot be undone.`,
+        default: false,
+      },
+    ]);
+
+    if (!confirmed) {
+      console.log('Cancelled.');
+      return;
+    }
+
+    const { typed } = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'typed',
+        message: 'Type DELETE to confirm:',
+      },
+    ]);
+
+    if (typed !== 'DELETE') {
+      console.log('Confirmation failed. Aborting.');
+      return;
+    }
+
+    const deleted = await deleteAllPosts(mapping.id);
+    dbService.deleteTweetsByBskyIdentifier(mapping.bskyIdentifier);
+    console.log(`Deleted ${deleted} posts for ${mapping.bskyIdentifier} and cleared local cache.`);
+  });
+
+program
+  .command('recent-activity')
+  .description('Show recent processed tweets')
+  .option('-l, --limit <number>', 'Number of rows', '20')
+  .action((options) => {
+    const limit = parsePositiveInt(options.limit, 20);
+    const rows = dbService.getRecentProcessedTweets(limit);
+
+    if (rows.length === 0) {
+      console.log('No recent activity found.');
+      return;
+    }
+
+    console.table(
+      rows.map((row) => ({
+        time: row.created_at,
+        twitter: row.twitter_username,
+        bsky: row.bsky_identifier,
+        status: row.status,
+        text: row.tweet_text ? row.tweet_text.slice(0, 80) : row.twitter_id,
+      })),
+    );
+  });
+
+program
+  .command('config-export [file]')
+  .description('Export dashboard config (without users/password hashes)')
+  .action((file = 'tweets-2-bsky-config.json') => {
+    exportConfig(file);
+  });
+
+program
+  .command('config-import <file>')
+  .description('Import dashboard config (preserves existing users)')
+  .action((file) => {
+    importConfig(file);
+  });
+
+program
+  .command('status')
+  .description('Show local CLI status summary')
+  .action(() => {
+    const config = getConfig();
+    const recent = dbService.getRecentProcessedTweets(5);
+
+    console.log('Tweets-2-Bsky status');
+    console.log('--------------------');
+    console.log(`Mappings: ${config.mappings.length}`);
+    console.log(`Enabled mappings: ${config.mappings.filter((mapping) => mapping.enabled).length}`);
+    console.log(`Check interval: ${config.checkIntervalMinutes} minute(s)`);
+    console.log(`Twitter configured: ${Boolean(config.twitter.authToken && config.twitter.ct0)}`);
+    console.log(`AI provider: ${config.ai?.provider || 'gemini (default)'}`);
+    console.log(`Recent processed tweets: ${recent.length > 0 ? recent.length : 0}`);
+
+    if (recent.length > 0) {
+      const last = recent[0];
+      console.log(`Latest activity: ${last?.created_at || 'unknown'} (${last?.status || 'unknown'})`);
+    }
+  });
+
+program.parseAsync().catch((error) => {
+  console.error(error instanceof Error ? error.message : error);
+  process.exit(1);
+});

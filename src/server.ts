@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import bcrypt from 'bcryptjs';
@@ -14,6 +15,9 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret';
+const WEB_DIST_DIR = path.join(__dirname, '..', 'web', 'dist');
+const LEGACY_PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const staticAssetsDir = fs.existsSync(path.join(WEB_DIST_DIR, 'index.html')) ? WEB_DIST_DIR : LEGACY_PUBLIC_DIR;
 
 // In-memory state for triggers and scheduling
 let lastCheckTime = Date.now();
@@ -47,7 +51,7 @@ let currentAppStatus: AppStatus = {
 app.use(cors());
 app.use(express.json());
 
-app.use(express.static(path.join(__dirname, '../public')));
+app.use(express.static(staticAssetsDir));
 
 // Middleware to protect routes
 const authenticateToken = (req: any, res: any, next: any) => {
@@ -440,7 +444,7 @@ export function clearBackfill(id: string, requestId?: string) {
 
 // Serve the frontend for any other route (middleware approach for Express 5)
 app.use((_req, res) => {
-  res.sendFile(path.join(__dirname, '../public/index.html'));
+  res.sendFile(path.join(staticAssetsDir, 'index.html'));
 });
 
 export function startServer() {

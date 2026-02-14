@@ -1,7 +1,28 @@
 #!/bin/bash
 
+set -e
+
 echo "🔄 Tweets-2-Bsky Updater"
 echo "========================="
+
+CONFIG_FILE="config.json"
+CONFIG_BACKUP=""
+
+if [ -f "$CONFIG_FILE" ]; then
+    CONFIG_BACKUP=$(mktemp)
+    cp "$CONFIG_FILE" "$CONFIG_BACKUP"
+    echo "🛡️  Backed up config.json to protect local settings."
+fi
+
+restore_config() {
+    if [ -n "$CONFIG_BACKUP" ] && [ -f "$CONFIG_BACKUP" ]; then
+        cp "$CONFIG_BACKUP" "$CONFIG_FILE"
+        rm -f "$CONFIG_BACKUP"
+        echo "🔐 Restored config.json."
+    fi
+}
+
+trap restore_config EXIT
 
 # Check if git is available
 if ! command -v git &> /dev/null; then
@@ -24,18 +45,11 @@ fi
 echo "📦 Installing dependencies..."
 npm install
 
-if [ $? -ne 0 ]; then
-    echo "❌ npm install failed."
-    exit 1
-fi
+echo "🔧 Verifying native modules..."
+npm run rebuild:native
 
-echo "🏗️  Building project..."
+echo "🏗️  Building server + web dashboard..."
 npm run build
-
-if [ $? -ne 0 ]; then
-    echo "❌ Build failed."
-    exit 1
-fi
 
 echo "✅ Update complete!"
 
@@ -47,7 +61,7 @@ fi
 
 if command -v pm2 &> /dev/null; then
     echo "🔄 Hard restarting PM2 process '$PROCESS_NAME' to fix environment paths..."
-    pm2 delete $PROCESS_NAME
+    pm2 delete $PROCESS_NAME || true
     pm2 start dist/index.js --name $PROCESS_NAME
     pm2 save
     echo "✅ PM2 process restarted and saved."

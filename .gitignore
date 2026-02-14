@@ -7,3 +7,4 @@ processed/
 npm-debug.log
 .DS_Store
 data/
+web/dist/
