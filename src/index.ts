@@ -1311,6 +1311,7 @@ async function processTweets(
   dryRun = false,
   sharedProcessedMap?: ProcessedTweetsMap,
   sharedTweetMap?: Map<string, Tweet>,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   // Filter tweets to ensure they're actually from this user
   const filteredTweets = tweets.filter((t) => {
@@ -1343,6 +1344,7 @@ async function processTweets(
   filteredTweets.reverse();
   let count = 0;
   for (const tweet of filteredTweets) {
+    throwIfAborted(abortSignal, twitterUsername);
     count++;
     const tweetId = tweet.id_str || tweet.id;
     if (!tweetId) continue;
@@ -1427,6 +1429,7 @@ async function processTweets(
                   dryRun,
                   localProcessedMap,
                   tweetMap,
+                  abortSignal,
                 );
 
                 // Check if it was saved
@@ -1490,6 +1493,7 @@ async function processTweets(
     console.log(`[${twitterUsername}] 🔗 Expanding links...`);
     const urls = tweet.entities?.urls || [];
     for (const urlEntity of urls) {
+      throwIfAborted(abortSignal, twitterUsername);
       const tco = urlEntity.url;
       const expanded = urlEntity.expanded_url;
       if (tco && expanded) text = text.replace(tco, expanded);
@@ -1499,6 +1503,7 @@ async function processTweets(
     const tcoRegex = /https:\/\/t\.co\/[a-zA-Z0-9]+/g;
     const matches = text.match(tcoRegex) || [];
     for (const tco of matches) {
+      throwIfAborted(abortSignal, twitterUsername);
       // Avoid re-resolving if we already handled it via entities
       if (urls.some((u) => u.url === tco)) continue;
 
@@ -1533,6 +1538,7 @@ async function processTweets(
     console.log(`[${twitterUsername}] 🖼️ Found ${mediaEntities.length} media entities.`);
 
     for (const media of mediaEntities) {
+      throwIfAborted(abortSignal, twitterUsername);
       if (media.url) {
         mediaLinksToRemove.push(media.url);
         if (media.expanded_url) mediaLinksToRemove.push(media.expanded_url);
@@ -1782,6 +1788,7 @@ async function processTweets(
     let lastChunkInfo: { uri: string; cid: string; root?: { uri: string; cid: string } } | null = null;
 
     for (let i = 0; i < chunks.length; i++) {
+      throwIfAborted(abortSignal, twitterUsername);
       let chunk = chunks[i] as string;
 
       // Add (i/n) if split
@@ -1941,6 +1948,7 @@ async function importHistory(
   dryRun = false,
   ignoreCancellation = false,
   requestId?: string,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   const config = getConfig();
   const mapping = config.mappings.find((m) =>
@@ -1988,6 +1996,7 @@ async function importHistory(
       const generator = client.getTweets(twitterUsername, fetchLimit);
 
       for await (const scraperTweet of generator) {
+        throwIfAborted(abortSignal, twitterUsername);
         if (!ignoreCancellation) {
           const stillPending = getPendingBackfills().some(
             (b) => b.id === mapping.id && (!requestId || b.requestId === requestId),
@@ -2016,7 +2025,16 @@ async function importHistory(
 
   console.log(`Fetch complete. Found ${allFoundTweets.length} new tweets to import.`);
   if (allFoundTweets.length > 0) {
-    await processTweets(agent as BskyAgent, twitterUsername, bskyIdentifier, allFoundTweets, dryRun);
+    await processTweets(
+      agent as BskyAgent,
+      twitterUsername,
+      bskyIdentifier,
+      allFoundTweets,
+      dryRun,
+      undefined,
+      undefined,
+      abortSignal,
+    );
     console.log('History import complete.');
   }
 }
@@ -2024,8 +2042,14 @@ async function importHistory(
 // Task management
 const activeTasks = new Map<string, Promise<void>>();
 const DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS = 2 * 60 * 1000;
+const TRACE_LOG_ENABLED = process.env.TRACE_LOG_ENABLED !== '0';
+const TRACE_SCHEDULER_LOOP = process.env.TRACE_SCHEDULER_LOOP === '1';
 
 const stageLog = (scope: string, stage: string, details?: Record<string, unknown>) => {
+  if (!TRACE_LOG_ENABLED) {
+    return;
+  }
+
   const timestamp = new Date().toISOString();
   if (!details) {
     console.log(`[TRACE ${timestamp}] [${scope}] ${stage}`);
@@ -2063,6 +2087,12 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMes
     }
   }
 }
+
+const throwIfAborted = (abortSignal: AbortSignal | undefined, scope: string) => {
+  if (abortSignal?.aborted) {
+    throw new Error(`[${scope}] Backfill aborted by timeout/cancellation.`);
+  }
+};
 
 async function runAccountTask(mapping: AccountMapping, backfillRequest?: PendingBackfill, dryRun = false) {
   if (activeTasks.has(mapping.id)) {
@@ -2178,11 +2208,26 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
               backfillMappingId: mapping.id,
               backfillRequestId: backfillReq.requestId,
             });
+            const abortController = new AbortController();
             await withTimeout(
-              importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId),
+              importHistory(
+                twitterUsername,
+                mapping.bskyIdentifier,
+                limit,
+                dryRun,
+                false,
+                backfillReq.requestId,
+                abortController.signal,
+              ),
               backfillAccountTimeoutMs,
               `[${twitterUsername}] Backfill timed out after ${Math.round(backfillAccountTimeoutMs / 1000)}s`,
-            );
+            ).catch((err) => {
+              if ((err instanceof Error ? err.message : String(err)).includes('Backfill timed out after')) {
+                abortController.abort();
+                clearBackfill(mapping.id, backfillReq.requestId);
+              }
+              throw err;
+            });
             updateAppStatus({
               state: 'backfilling',
               currentAccount: twitterUsername,
@@ -2479,16 +2524,18 @@ async function main(): Promise<void> {
       (deferredScheduledRun && pendingBackfills.length === 0) ||
       (wakeRequested && pendingBackfills.length === 0);
 
-    stageLog('Scheduler', 'loop-state', {
-      nowIso: new Date(now).toISOString(),
-      nextCheckIso: new Date(nextTime).toISOString(),
-      isScheduledRunDue,
-      pendingBackfills: pendingBackfills.length,
-      wakeRequested,
-      deferredScheduledRun,
-      shouldRunScheduledCycle,
-      activeTasks: activeTasks.size,
-    });
+    if (TRACE_SCHEDULER_LOOP) {
+      stageLog('Scheduler', 'loop-state', {
+        nowIso: new Date(now).toISOString(),
+        nextCheckIso: new Date(nextTime).toISOString(),
+        isScheduledRunDue,
+        pendingBackfills: pendingBackfills.length,
+        wakeRequested,
+        deferredScheduledRun,
+        shouldRunScheduledCycle,
+        activeTasks: activeTasks.size,
+      });
+    }
 
     if (isScheduledRunDue && pendingBackfills.length > 0) {
       deferredScheduledRun = true;
@@ -2577,10 +2624,18 @@ async function main(): Promise<void> {
 process.on('unhandledRejection', (reason) => {
   const details = reason instanceof Error ? { message: reason.message, stack: reason.stack } : { reason: String(reason) };
   stageLog('Process', 'unhandledRejection', details);
+  console.error('[Process] Unhandled promise rejection detected. Exiting to avoid inconsistent runtime state.');
+  setTimeout(() => {
+    process.exit(1);
+  }, 100);
 });
 
 process.on('uncaughtException', (error) => {
   stageLog('Process', 'uncaughtException', { message: error.message, stack: error.stack });
+  console.error('[Process] Uncaught exception detected. Exiting to avoid inconsistent runtime state.');
+  setTimeout(() => {
+    process.exit(1);
+  }, 100);
 });
 
 main();

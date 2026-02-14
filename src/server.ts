@@ -1909,7 +1909,7 @@ app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res)
 
 app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
   console.log(
-    `[API] backfill enqueue requested by ${getActorLabel(req.user)} for mapping ${String(req.params?.id || '')} with limit ${String(req.body?.limit ?? 'default')}`,
+    `[API] backfill enqueue requested by ${getActorPublicLabel(req.user)} for mapping ${String(req.params?.id || '')} with limit ${String(req.body?.limit ?? 'default')}`,
   );
   if (!canQueueBackfills(req.user)) {
     res.status(403).json({ error: 'You do not have permission to queue backfills.' });
@@ -1964,7 +1964,7 @@ app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
 
 app.delete('/api/backfill/:id', authenticateToken, (req: any, res) => {
   const { id } = req.params;
-  console.log(`[API] backfill dequeue requested by ${getActorLabel(req.user)} for mapping ${id}`);
+  console.log(`[API] backfill dequeue requested by ${getActorPublicLabel(req.user)} for mapping ${id}`);
   const config = getConfig();
   const mapping = config.mappings.find((entry) => entry.id === id);
 
