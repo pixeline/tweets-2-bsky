@@ -20,7 +20,8 @@
     "lint": "biome check --write .",
     "preview:web": "vite preview",
     "format": "biome format --write .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:conflicts": "node scripts/check-conflict-markers.mjs"
   },
   "keywords": [
     "bluesky",
