@@ -1303,10 +1303,6 @@ async function fetchUserTweets(username: string, limit: number, processedIds?: S
 // Main Processing Logic
 // ============================================================================
 
-// ============================================================================
-// Main Processing Logic
-// ============================================================================
-
 async function processTweets(
   agent: BskyAgent,
   twitterUsername: string,
@@ -1315,6 +1311,7 @@ async function processTweets(
   dryRun = false,
   sharedProcessedMap?: ProcessedTweetsMap,
   sharedTweetMap?: Map<string, Tweet>,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   // Filter tweets to ensure they're actually from this user
   const filteredTweets = tweets.filter((t) => {
@@ -1347,6 +1344,7 @@ async function processTweets(
   filteredTweets.reverse();
   let count = 0;
   for (const tweet of filteredTweets) {
+    throwIfAborted(abortSignal, twitterUsername);
     count++;
     const tweetId = tweet.id_str || tweet.id;
     if (!tweetId) continue;
@@ -1431,6 +1429,7 @@ async function processTweets(
                   dryRun,
                   localProcessedMap,
                   tweetMap,
+                  abortSignal,
                 );
 
                 // Check if it was saved
@@ -1494,6 +1493,7 @@ async function processTweets(
     console.log(`[${twitterUsername}] 🔗 Expanding links...`);
     const urls = tweet.entities?.urls || [];
     for (const urlEntity of urls) {
+      throwIfAborted(abortSignal, twitterUsername);
       const tco = urlEntity.url;
       const expanded = urlEntity.expanded_url;
       if (tco && expanded) text = text.replace(tco, expanded);
@@ -1503,6 +1503,7 @@ async function processTweets(
     const tcoRegex = /https:\/\/t\.co\/[a-zA-Z0-9]+/g;
     const matches = text.match(tcoRegex) || [];
     for (const tco of matches) {
+      throwIfAborted(abortSignal, twitterUsername);
       // Avoid re-resolving if we already handled it via entities
       if (urls.some((u) => u.url === tco)) continue;
 
@@ -1537,6 +1538,7 @@ async function processTweets(
     console.log(`[${twitterUsername}] 🖼️ Found ${mediaEntities.length} media entities.`);
 
     for (const media of mediaEntities) {
+      throwIfAborted(abortSignal, twitterUsername);
       if (media.url) {
         mediaLinksToRemove.push(media.url);
         if (media.expanded_url) mediaLinksToRemove.push(media.expanded_url);
@@ -1786,6 +1788,7 @@ async function processTweets(
     let lastChunkInfo: { uri: string; cid: string; root?: { uri: string; cid: string } } | null = null;
 
     for (let i = 0; i < chunks.length; i++) {
+      throwIfAborted(abortSignal, twitterUsername);
       let chunk = chunks[i] as string;
 
       // Add (i/n) if split
@@ -1945,6 +1948,7 @@ async function importHistory(
   dryRun = false,
   ignoreCancellation = false,
   requestId?: string,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   const config = getConfig();
   const mapping = config.mappings.find((m) =>
@@ -1992,6 +1996,7 @@ async function importHistory(
       const generator = client.getTweets(twitterUsername, fetchLimit);
 
       for await (const scraperTweet of generator) {
+        throwIfAborted(abortSignal, twitterUsername);
         if (!ignoreCancellation) {
           const stillPending = getPendingBackfills().some(
             (b) => b.id === mapping.id && (!requestId || b.requestId === requestId),
@@ -2020,27 +2025,140 @@ async function importHistory(
 
   console.log(`Fetch complete. Found ${allFoundTweets.length} new tweets to import.`);
   if (allFoundTweets.length > 0) {
-    await processTweets(agent as BskyAgent, twitterUsername, bskyIdentifier, allFoundTweets, dryRun);
+    await processTweets(
+      agent as BskyAgent,
+      twitterUsername,
+      bskyIdentifier,
+      allFoundTweets,
+      dryRun,
+      undefined,
+      undefined,
+      abortSignal,
+    );
     console.log('History import complete.');
   }
 }
 
 // Task management
 const activeTasks = new Map<string, Promise<void>>();
+const DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS = 2 * 60 * 1000;
+const TRACE_LOG_ENABLED = process.env.TRACE_LOG_ENABLED !== '0';
+const TRACE_SCHEDULER_LOOP = process.env.TRACE_SCHEDULER_LOOP === '1';
+
+const stageLog = (scope: string, stage: string, details?: Record<string, unknown>) => {
+  if (!TRACE_LOG_ENABLED) {
+    return;
+  }
+
+  const timestamp = new Date().toISOString();
+  if (!details) {
+    console.log(`[TRACE ${timestamp}] [${scope}] ${stage}`);
+    return;
+  }
+
+  try {
+    console.log(`[TRACE ${timestamp}] [${scope}] ${stage} :: ${JSON.stringify(details)}`);
+  } catch {
+    console.log(`[TRACE ${timestamp}] [${scope}] ${stage} :: [unserializable details]`);
+  }
+};
+
+const resolveBackfillAccountTimeoutMs = (): number => {
+  const raw = Number(process.env.BACKFILL_ACCOUNT_TIMEOUT_MS);
+  if (Number.isFinite(raw) && raw >= 15_000) {
+    return raw;
+  }
+  return DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS;
+};
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
+const throwIfAborted = (abortSignal: AbortSignal | undefined, scope: string) => {
+  if (abortSignal?.aborted) {
+    throw new Error(`[${scope}] Backfill aborted by timeout/cancellation.`);
+  }
+};
 
 async function runAccountTask(mapping: AccountMapping, backfillRequest?: PendingBackfill, dryRun = false) {
-  if (activeTasks.has(mapping.id)) return; // Already running
+  if (activeTasks.has(mapping.id)) {
+    stageLog(mapping.bskyIdentifier, 'skip-runAccountTask-already-active', { mappingId: mapping.id });
+    return; // Already running
+  }
 
   const task = (async () => {
     try {
-      const agent = await getAgent(mapping);
-      if (!agent) return;
-
       const backfillReq = backfillRequest ?? getPendingBackfills().find((b) => b.id === mapping.id);
+      stageLog(mapping.bskyIdentifier, 'runAccountTask-start', {
+        mappingId: mapping.id,
+        twitterAccounts: mapping.twitterUsernames.length,
+        hasBackfillRequest: Boolean(backfillReq),
+        dryRun,
+      });
+
+      if (mapping.twitterUsernames.length === 0) {
+        console.warn(`[${mapping.bskyIdentifier}] ⚠️ No Twitter usernames configured. Skipping mapping.`);
+        if (backfillReq) {
+          stageLog(mapping.bskyIdentifier, 'backfill-drain-request', { requestId: backfillReq.requestId });
+          clearBackfill(mapping.id, backfillReq.requestId);
+          updateAppStatus({
+            state: 'idle',
+            currentAccount: undefined,
+            processedCount: 0,
+            totalCount: 0,
+            message: `Backfill skipped for ${mapping.bskyIdentifier}: no source accounts configured`,
+            backfillMappingId: undefined,
+            backfillRequestId: undefined,
+          });
+        }
+        return;
+      }
+
+      const agent = await getAgent(mapping);
+      if (!agent) {
+        if (backfillReq) {
+          console.warn(`[${mapping.bskyIdentifier}] ⚠️ Backfill aborted: unable to authenticate Bluesky account.`);
+          stageLog(mapping.bskyIdentifier, 'backfill-drain-request', { requestId: backfillReq.requestId });
+          clearBackfill(mapping.id, backfillReq.requestId);
+          updateAppStatus({
+            state: 'idle',
+            currentAccount: undefined,
+            processedCount: 0,
+            totalCount: mapping.twitterUsernames.length,
+            message: `Backfill skipped for ${mapping.bskyIdentifier}: Bluesky login failed`,
+            backfillMappingId: undefined,
+            backfillRequestId: undefined,
+          });
+        }
+        return;
+      }
+
       const explicitBackfill = Boolean(backfillRequest);
 
       if (backfillReq) {
         const limit = backfillReq.limit || 15;
+        const backfillAccountTimeoutMs = resolveBackfillAccountTimeoutMs();
+        stageLog(mapping.bskyIdentifier, 'backfill-start', {
+          requestId: backfillReq.requestId,
+          limit,
+          timeoutMs: backfillAccountTimeoutMs,
+          accountCount: mapping.twitterUsernames.length,
+          explicitBackfill,
+        });
         const accountCount = mapping.twitterUsernames.length;
         const estimatedTotalTweets = accountCount * limit;
         console.log(
@@ -2056,6 +2174,10 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
           backfillRequestId: backfillReq.requestId,
         });
 
+        let successfulAccounts = 0;
+        let failedAccounts = 0;
+        let timedOutAccounts = 0;
+
         for (let i = 0; i < mapping.twitterUsernames.length; i += 1) {
           const twitterUsername = mapping.twitterUsernames[i];
           if (!twitterUsername) {
@@ -2070,6 +2192,13 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
           }
 
           try {
+            stageLog(mapping.bskyIdentifier, 'backfill-account-start', {
+              requestId: backfillReq.requestId,
+              account: twitterUsername,
+              index: i + 1,
+              total: accountCount,
+              limit,
+            });
             updateAppStatus({
               state: 'backfilling',
               currentAccount: twitterUsername,
@@ -2079,7 +2208,26 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
               backfillMappingId: mapping.id,
               backfillRequestId: backfillReq.requestId,
             });
-            await importHistory(twitterUsername, mapping.bskyIdentifier, limit, dryRun, false, backfillReq.requestId);
+            const abortController = new AbortController();
+            await withTimeout(
+              importHistory(
+                twitterUsername,
+                mapping.bskyIdentifier,
+                limit,
+                dryRun,
+                false,
+                backfillReq.requestId,
+                abortController.signal,
+              ),
+              backfillAccountTimeoutMs,
+              `[${twitterUsername}] Backfill timed out after ${Math.round(backfillAccountTimeoutMs / 1000)}s`,
+            ).catch((err) => {
+              if ((err instanceof Error ? err.message : String(err)).includes('Backfill timed out after')) {
+                abortController.abort();
+                clearBackfill(mapping.id, backfillReq.requestId);
+              }
+              throw err;
+            });
             updateAppStatus({
               state: 'backfilling',
               currentAccount: twitterUsername,
@@ -2089,21 +2237,58 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
               backfillMappingId: mapping.id,
               backfillRequestId: backfillReq.requestId,
             });
+            successfulAccounts += 1;
+            stageLog(mapping.bskyIdentifier, 'backfill-account-complete', {
+              requestId: backfillReq.requestId,
+              account: twitterUsername,
+              index: i + 1,
+              total: accountCount,
+            });
           } catch (err) {
             console.error(`❌ Error backfilling ${twitterUsername}:`, err);
+            failedAccounts += 1;
+            const errorMessage = err instanceof Error ? err.message : String(err);
+            const isTimeout = errorMessage.includes('Backfill timed out after');
+            if (isTimeout) {
+              timedOutAccounts += 1;
+              console.warn(
+                `[${mapping.bskyIdentifier}] ⏱️ Backfill timeout for @${twitterUsername}. ` +
+                  `Increase BACKFILL_ACCOUNT_TIMEOUT_MS if this account usually needs longer than ${Math.round(backfillAccountTimeoutMs / 1000)}s.`,
+              );
+            }
+            stageLog(mapping.bskyIdentifier, 'backfill-account-error', {
+              requestId: backfillReq.requestId,
+              account: twitterUsername,
+              error: errorMessage,
+              isTimeout,
+            });
           }
         }
+        stageLog(mapping.bskyIdentifier, 'backfill-drain-request', { requestId: backfillReq.requestId });
         clearBackfill(mapping.id, backfillReq.requestId);
+
+        const summaryMessageParts = [
+          `${successfulAccounts}/${accountCount} account(s) completed`,
+          failedAccounts > 0 ? `${failedAccounts} failed` : undefined,
+          timedOutAccounts > 0 ? `${timedOutAccounts} timed out` : undefined,
+        ].filter(Boolean);
+        const summaryMessage = `Backfill ${failedAccounts > 0 ? 'finished with errors' : 'complete'} for ${mapping.bskyIdentifier}: ${summaryMessageParts.join(', ')}`;
+
         updateAppStatus({
           state: 'idle',
           processedCount: accountCount,
           totalCount: accountCount,
-          message: `Backfill complete for ${mapping.bskyIdentifier}`,
+          message: summaryMessage,
           backfillMappingId: undefined,
           backfillRequestId: undefined,
         });
-        console.log(`[${mapping.bskyIdentifier}] Backfill complete.`);
+        console.log(
+          `[${mapping.bskyIdentifier}] ${failedAccounts > 0 ? 'Backfill finished with errors' : 'Backfill complete'} ` +
+            `(success=${successfulAccounts}, failed=${failedAccounts}, timedOut=${timedOutAccounts}).`,
+        );
+
       } else {
+        stageLog(mapping.bskyIdentifier, 'scheduled-check-start', { twitterAccounts: mapping.twitterUsernames.length });
         updateAppStatus({ backfillMappingId: undefined, backfillRequestId: undefined });
 
         // Pre-load processed IDs for optimization
@@ -2124,6 +2309,10 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
             // Use fetchUserTweets with early stopping optimization
             // Increase limit slightly since we have early stopping now
             const tweets = await fetchUserTweets(twitterUsername, 50, processedIds);
+            stageLog(mapping.bskyIdentifier, 'scheduled-check-fetch-complete', {
+              account: twitterUsername,
+              fetchedCount: tweets?.length ?? 0,
+            });
 
             if (!tweets || tweets.length === 0) {
               console.log(`[${twitterUsername}] ℹ️ No tweets found (or fetch failed).`);
@@ -2132,6 +2321,10 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
 
             console.log(`[${twitterUsername}] 📥 Fetched ${tweets.length} tweets.`);
             await processTweets(agent, twitterUsername, mapping.bskyIdentifier, tweets, dryRun);
+            stageLog(mapping.bskyIdentifier, 'scheduled-check-process-complete', {
+              account: twitterUsername,
+              fetchedCount: tweets.length,
+            });
           } catch (err) {
             console.error(`❌ Error checking ${twitterUsername}:`, err);
           }
@@ -2141,10 +2334,18 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
       console.error(`Error processing mapping ${mapping.bskyIdentifier}:`, err);
     } finally {
       activeTasks.delete(mapping.id);
+      stageLog(mapping.bskyIdentifier, 'runAccountTask-finish', {
+        mappingId: mapping.id,
+        remainingActiveTasks: activeTasks.size,
+      });
     }
   })();
 
   activeTasks.set(mapping.id, task);
+  stageLog(mapping.bskyIdentifier, 'runAccountTask-registered', {
+    mappingId: mapping.id,
+    activeTasks: activeTasks.size,
+  });
   return task; // Return task promise for await in main loop
 }
 
@@ -2323,6 +2524,19 @@ async function main(): Promise<void> {
       (deferredScheduledRun && pendingBackfills.length === 0) ||
       (wakeRequested && pendingBackfills.length === 0);
 
+    if (TRACE_SCHEDULER_LOOP) {
+      stageLog('Scheduler', 'loop-state', {
+        nowIso: new Date(now).toISOString(),
+        nextCheckIso: new Date(nextTime).toISOString(),
+        isScheduledRunDue,
+        pendingBackfills: pendingBackfills.length,
+        wakeRequested,
+        deferredScheduledRun,
+        shouldRunScheduledCycle,
+        activeTasks: activeTasks.size,
+      });
+    }
+
     if (isScheduledRunDue && pendingBackfills.length > 0) {
       deferredScheduledRun = true;
     }
@@ -2341,6 +2555,11 @@ async function main(): Promise<void> {
       });
 
       const [nextBackfill] = pendingBackfills;
+      stageLog('Scheduler', 'backfill-queue-head', {
+        queueLength: pendingBackfills.length,
+        nextBackfillId: nextBackfill?.id,
+        nextRequestId: nextBackfill?.requestId,
+      });
       if (nextBackfill) {
         const mapping = findMappingById(config.mappings, nextBackfill.id);
         if (mapping && mapping.enabled) {
@@ -2387,6 +2606,7 @@ async function main(): Promise<void> {
       }
 
       if (tasks.length > 0) {
+        stageLog('Scheduler', 'scheduled-cycle-dispatch', { taskCount: tasks.length });
         await Promise.all(tasks);
         console.log(`[Scheduler] ✅ All tasks for this cycle complete.`);
       } else {
@@ -2400,5 +2620,22 @@ async function main(): Promise<void> {
     await sleepWithWake(5000);
   }
 }
+
+process.on('unhandledRejection', (reason) => {
+  const details = reason instanceof Error ? { message: reason.message, stack: reason.stack } : { reason: String(reason) };
+  stageLog('Process', 'unhandledRejection', details);
+  console.error('[Process] Unhandled promise rejection detected. Exiting to avoid inconsistent runtime state.');
+  setTimeout(() => {
+    process.exit(1);
+  }, 100);
+});
+
+process.on('uncaughtException', (error) => {
+  stageLog('Process', 'uncaughtException', { message: error.message, stack: error.stack });
+  console.error('[Process] Uncaught exception detected. Exiting to avoid inconsistent runtime state.');
+  setTimeout(() => {
+    process.exit(1);
+  }, 100);
+});
 
 main();
