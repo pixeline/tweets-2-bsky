@@ -1908,6 +1908,9 @@ app.post('/api/backfill/clear-all', authenticateToken, requireAdmin, (_req, res)
 });
 
 app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
+  console.log(
+    `[API] backfill enqueue requested by ${getActorLabel(req.user)} for mapping ${String(req.params?.id || '')} with limit ${String(req.body?.limit ?? 'default')}`,
+  );
   if (!canQueueBackfills(req.user)) {
     res.status(403).json({ error: 'You do not have permission to queue backfills.' });
     return;
@@ -1928,6 +1931,11 @@ app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
     return;
   }
 
+  if (!Array.isArray(mapping.twitterUsernames) || mapping.twitterUsernames.length === 0) {
+    res.status(400).json({ error: 'Mapping has no Twitter source accounts configured.' });
+    return;
+  }
+
   const parsedLimit = Number(limit);
   const safeLimit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : undefined;
   const queuedAt = Date.now();
@@ -1942,6 +1950,9 @@ app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
     requestId,
   });
   pendingBackfills.sort((a, b) => a.sequence - b.sequence);
+  console.log(
+    `[API] backfill queued for ${mapping.bskyIdentifier} (requestId=${requestId}, queueLength=${pendingBackfills.length}, sequence=${sequence})`,
+  );
   signalSchedulerWake();
 
   res.json({
@@ -1953,6 +1964,7 @@ app.post('/api/backfill/:id', authenticateToken, (req: any, res) => {
 
 app.delete('/api/backfill/:id', authenticateToken, (req: any, res) => {
   const { id } = req.params;
+  console.log(`[API] backfill dequeue requested by ${getActorLabel(req.user)} for mapping ${id}`);
   const config = getConfig();
   const mapping = config.mappings.find((entry) => entry.id === id);
 
@@ -1966,7 +1978,9 @@ app.delete('/api/backfill/:id', authenticateToken, (req: any, res) => {
     return;
   }
 
+  const beforeLength = pendingBackfills.length;
   pendingBackfills = pendingBackfills.filter((entry) => entry.id !== id);
+  console.log(`[API] backfill dequeue applied for mapping ${id} (removed=${beforeLength - pendingBackfills.length})`);
   signalSchedulerWake();
   res.json({ success: true });
 });
