@@ -3,7 +3,9 @@ import {
   AlertTriangle,
   ArrowUpRight,
   Bot,
+  ChevronLeft,
   ChevronDown,
+  ChevronRight,
   Clock3,
   Download,
   Folder,
@@ -27,6 +29,7 @@ import {
   Upload,
   UserRound,
   Users,
+  X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Badge } from './components/ui/badge';
@@ -39,6 +42,7 @@ import { cn } from './lib/utils';
 type ThemeMode = 'system' | 'light' | 'dark';
 type AuthView = 'login' | 'register';
 type DashboardTab = 'overview' | 'accounts' | 'posts' | 'activity' | 'settings';
+type SettingsSection = 'twitter' | 'ai' | 'data';
 
 type AppState = 'idle' | 'checking' | 'backfilling' | 'pacing' | 'processing';
 
@@ -213,6 +217,15 @@ const defaultMappingForm = (): MappingFormState => ({
 const DEFAULT_GROUP_NAME = 'Ungrouped';
 const DEFAULT_GROUP_EMOJI = '📁';
 const DEFAULT_GROUP_KEY = 'ungrouped';
+const TAB_PATHS: Record<DashboardTab, string> = {
+  overview: '/',
+  accounts: '/accounts',
+  posts: '/posts',
+  activity: '/activity',
+  settings: '/settings',
+};
+const ADD_ACCOUNT_STEP_COUNT = 4;
+const ADD_ACCOUNT_STEPS = ['Owner', 'Sources', 'Bluesky', 'Confirm'] as const;
 
 const selectClassName =
   'flex h-10 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2';
@@ -295,6 +308,17 @@ function getTwitterPostUrl(twitterUsername?: string, twitterId?: string): string
     return undefined;
   }
   return `https://x.com/${normalizeTwitterUsername(twitterUsername)}/status/${twitterId}`;
+}
+
+function normalizePath(pathname: string): string {
+  const normalized = pathname.replace(/\/+$/, '');
+  return normalized.length === 0 ? '/' : normalized;
+}
+
+function getTabFromPath(pathname: string): DashboardTab | null {
+  const normalized = normalizePath(pathname);
+  const entry = (Object.entries(TAB_PATHS) as Array<[DashboardTab, string]>).find(([, path]) => path === normalized);
+  return entry ? entry[0] : null;
 }
 
 function addTwitterUsernames(current: string[], value: string): string[] {
@@ -403,6 +427,11 @@ function App() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [countdown, setCountdown] = useState('--');
   const [activeTab, setActiveTab] = useState<DashboardTab>(() => {
+    const fromPath = getTabFromPath(window.location.pathname);
+    if (fromPath) {
+      return fromPath;
+    }
+
     const saved = localStorage.getItem('dashboard-tab');
     if (
       saved === 'overview' ||
@@ -426,6 +455,9 @@ function App() {
   const [editTwitterInput, setEditTwitterInput] = useState('');
   const [newGroupName, setNewGroupName] = useState('');
   const [newGroupEmoji, setNewGroupEmoji] = useState(DEFAULT_GROUP_EMOJI);
+  const [isAddAccountSheetOpen, setIsAddAccountSheetOpen] = useState(false);
+  const [addAccountStep, setAddAccountStep] = useState(1);
+  const [settingsSectionOverrides, setSettingsSectionOverrides] = useState<Partial<Record<SettingsSection, boolean>>>({});
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Record<string, boolean>>(() => {
     const raw = localStorage.getItem('accounts-collapsed-groups');
     if (!raw) return {};
@@ -474,6 +506,9 @@ function App() {
     setEditTwitterUsers([]);
     setNewGroupName('');
     setNewGroupEmoji(DEFAULT_GROUP_EMOJI);
+    setIsAddAccountSheetOpen(false);
+    setAddAccountStep(1);
+    setSettingsSectionOverrides({});
     setAuthView('login');
   }, []);
 
@@ -622,6 +657,30 @@ function App() {
   }, [activeTab]);
 
   useEffect(() => {
+    const expectedPath = TAB_PATHS[activeTab];
+    const currentPath = normalizePath(window.location.pathname);
+    if (currentPath !== expectedPath) {
+      window.history.pushState({ tab: activeTab }, '', expectedPath);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const tabFromPath = getTabFromPath(window.location.pathname);
+      if (tabFromPath) {
+        setActiveTab(tabFromPath);
+      } else {
+        setActiveTab('overview');
+      }
+    };
+
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+    };
+  }, []);
+
+  useEffect(() => {
     localStorage.setItem('accounts-collapsed-groups', JSON.stringify(collapsedGroupKeys));
   }, [collapsedGroupKeys]);
 
@@ -715,6 +774,23 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isAddAccountSheetOpen) {
+      return;
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closeAddAccountSheet();
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [isAddAccountSheetOpen]);
+
   const pendingBackfills = status?.pendingBackfills ?? [];
   const currentStatus = status?.currentStatus;
   const latestActivity = recentActivity[0];
@@ -792,6 +868,10 @@ function App() {
     });
   }, [groups, mappings]);
   const groupOptionsByKey = useMemo(() => new Map(groupOptions.map((group) => [group.key, group])), [groupOptions]);
+  const reusableGroupOptions = useMemo(
+    () => groupOptions.filter((group) => group.key !== DEFAULT_GROUP_KEY),
+    [groupOptions],
+  );
   const groupedMappings = useMemo(() => {
     const groups = new Map<string, { key: string; name: string; emoji: string; mappings: AccountMapping[] }>();
     for (const option of groupOptions) {
@@ -857,6 +937,26 @@ function App() {
       }),
     [activityGroupFilter, recentActivity, resolveMappingForActivity],
   );
+  const twitterConfigured = Boolean(twitterConfig.authToken && twitterConfig.ct0);
+  const aiConfigured = Boolean(aiConfig.apiKey);
+  const sectionDefaultExpanded = useMemo<Record<SettingsSection, boolean>>(
+    () => ({
+      twitter: !twitterConfigured,
+      ai: !aiConfigured,
+      data: false,
+    }),
+    [aiConfigured, twitterConfigured],
+  );
+  const isSettingsSectionExpanded = useCallback(
+    (section: SettingsSection) => settingsSectionOverrides[section] ?? sectionDefaultExpanded[section],
+    [sectionDefaultExpanded, settingsSectionOverrides],
+  );
+  const toggleSettingsSection = (section: SettingsSection) => {
+    setSettingsSectionOverrides((previous) => ({
+      ...previous,
+      [section]: !(previous[section] ?? sectionDefaultExpanded[section]),
+    }));
+  };
 
   useEffect(() => {
     if (postsGroupFilter !== 'all' && !groupOptions.some((group) => group.key === postsGroupFilter)) {
@@ -1165,8 +1265,36 @@ function App() {
     }
   };
 
-  const handleAddMapping = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const resetAddAccountDraft = () => {
+    setNewMapping(defaultMappingForm());
+    setNewTwitterUsers([]);
+    setNewTwitterInput('');
+    setAddAccountStep(1);
+  };
+
+  const openAddAccountSheet = () => {
+    resetAddAccountDraft();
+    setIsAddAccountSheetOpen(true);
+  };
+
+  const closeAddAccountSheet = () => {
+    setIsAddAccountSheetOpen(false);
+    resetAddAccountDraft();
+  };
+
+  const applyGroupPresetToNewMapping = (groupKey: string) => {
+    const group = groupOptionsByKey.get(groupKey);
+    if (!group || group.key === DEFAULT_GROUP_KEY) {
+      return;
+    }
+    setNewMapping((previous) => ({
+      ...previous,
+      groupName: group.name,
+      groupEmoji: group.emoji,
+    }));
+  };
+
+  const submitNewMapping = async () => {
     if (!authHeaders) {
       return;
     }
@@ -1196,6 +1324,8 @@ function App() {
       setNewMapping(defaultMappingForm());
       setNewTwitterUsers([]);
       setNewTwitterInput('');
+      setIsAddAccountSheetOpen(false);
+      setAddAccountStep(1);
       showNotice('success', 'Account mapping added.');
       await fetchData();
     } catch (error) {
@@ -1203,6 +1333,38 @@ function App() {
     } finally {
       setIsBusy(false);
     }
+  };
+
+  const advanceAddAccountStep = () => {
+    if (addAccountStep === 1) {
+      if (!newMapping.owner.trim()) {
+        showNotice('error', 'Owner is required.');
+        return;
+      }
+      setAddAccountStep(2);
+      return;
+    }
+
+    if (addAccountStep === 2) {
+      if (newTwitterUsers.length === 0) {
+        showNotice('error', 'Add at least one Twitter username.');
+        return;
+      }
+      setAddAccountStep(3);
+      return;
+    }
+
+    if (addAccountStep === 3) {
+      if (!newMapping.bskyIdentifier.trim() || !newMapping.bskyPassword.trim()) {
+        showNotice('error', 'Bluesky identifier and app password are required.');
+        return;
+      }
+      setAddAccountStep(4);
+    }
+  };
+
+  const retreatAddAccountStep = () => {
+    setAddAccountStep((previous) => Math.max(1, previous - 1));
   };
 
   const startEditMapping = (mapping: AccountMapping) => {
@@ -1446,6 +1608,19 @@ function App() {
                 {themeIcon}
                 <span className="ml-2 hidden sm:inline">{themeLabel}</span>
               </Button>
+              {isAdmin ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    setActiveTab('settings');
+                    openAddAccountSheet();
+                  }}
+                >
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add account
+                </Button>
+              ) : null}
               <Button size="sm" onClick={runNow}>
                 <Play className="mr-2 h-4 w-4" />
                 Run now
@@ -1628,7 +1803,15 @@ function App() {
                   <CardTitle>Active Accounts</CardTitle>
                   <CardDescription>Organize mappings into folders and collapse/expand groups.</CardDescription>
                 </div>
-                <Badge variant="outline">{mappings.length} configured</Badge>
+                <div className="flex items-center gap-2">
+                  {isAdmin ? (
+                    <Button size="sm" variant="outline" onClick={openAddAccountSheet}>
+                      <Plus className="mr-2 h-4 w-4" />
+                      Add account
+                    </Button>
+                  ) : null}
+                  <Badge variant="outline">{mappings.length} configured</Badge>
+                </div>
               </div>
             </CardHeader>
             <CardContent className="space-y-4 pt-0">
@@ -1668,7 +1851,15 @@ function App() {
 
               {groupedMappings.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border/70 p-6 text-center text-sm text-muted-foreground">
-                  No mappings yet. Add one from the settings panel.
+                  No mappings yet.
+                  {isAdmin ? (
+                    <div className="mt-3">
+                      <Button size="sm" variant="outline" onClick={openAddAccountSheet}>
+                        <Plus className="mr-2 h-4 w-4" />
+                        Create your first account
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -2273,178 +2464,399 @@ function App() {
                   <Settings2 className="h-4 w-4" />
                   Admin Settings
                 </CardTitle>
-                <CardDescription>Credentials, provider setup, and account onboarding.</CardDescription>
+                <CardDescription>Configured sections stay collapsed so adding accounts is one click.</CardDescription>
               </CardHeader>
-              <CardContent className="space-y-8">
-                <form className="space-y-3" onSubmit={handleSaveTwitterConfig}>
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-semibold">Twitter Credentials</h3>
-                    <Badge variant={twitterConfig.authToken && twitterConfig.ct0 ? 'success' : 'outline'}>
-                      {twitterConfig.authToken && twitterConfig.ct0 ? 'Configured' : 'Missing'}
-                    </Badge>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="authToken">Primary Auth Token</Label>
-                    <Input
-                      id="authToken"
-                      value={twitterConfig.authToken}
+              <CardContent className="pt-0">
+                <Button className="w-full sm:w-auto" onClick={openAddAccountSheet}>
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add Account
+                </Button>
+              </CardContent>
+            </Card>
+
+            <Card className="animate-slide-up">
+              <button
+                className="flex w-full items-center justify-between px-5 py-4 text-left"
+                onClick={() => toggleSettingsSection('twitter')}
+                type="button"
+              >
+                <div>
+                  <p className="text-sm font-semibold">Twitter Credentials</p>
+                  <p className="text-xs text-muted-foreground">Primary and backup cookie values.</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge variant={twitterConfigured ? 'success' : 'outline'}>
+                    {twitterConfigured ? 'Configured' : 'Missing'}
+                  </Badge>
+                  <ChevronDown
+                    className={cn(
+                      'h-4 w-4 transition-transform duration-200',
+                      isSettingsSectionExpanded('twitter') ? 'rotate-0' : '-rotate-90',
+                    )}
+                  />
+                </div>
+              </button>
+              <div
+                className={cn(
+                  'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                  isSettingsSectionExpanded('twitter') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                )}
+              >
+                <div className="min-h-0 overflow-hidden">
+                  <CardContent className="space-y-3 border-t border-border/70 pt-4">
+                    <form className="space-y-3" onSubmit={handleSaveTwitterConfig}>
+                      <div className="space-y-2">
+                        <Label htmlFor="authToken">Primary Auth Token</Label>
+                        <Input
+                          id="authToken"
+                          value={twitterConfig.authToken}
+                          onChange={(event) => {
+                            setTwitterConfig((prev) => ({ ...prev, authToken: event.target.value }));
+                          }}
+                          required
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="ct0">Primary CT0</Label>
+                        <Input
+                          id="ct0"
+                          value={twitterConfig.ct0}
+                          onChange={(event) => {
+                            setTwitterConfig((prev) => ({ ...prev, ct0: event.target.value }));
+                          }}
+                          required
+                        />
+                      </div>
+
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div className="space-y-2">
+                          <Label htmlFor="backupAuthToken">Backup Auth Token</Label>
+                          <Input
+                            id="backupAuthToken"
+                            value={twitterConfig.backupAuthToken || ''}
+                            onChange={(event) => {
+                              setTwitterConfig((prev) => ({ ...prev, backupAuthToken: event.target.value }));
+                            }}
+                          />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="backupCt0">Backup CT0</Label>
+                          <Input
+                            id="backupCt0"
+                            value={twitterConfig.backupCt0 || ''}
+                            onChange={(event) => {
+                              setTwitterConfig((prev) => ({ ...prev, backupCt0: event.target.value }));
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
+                        <Save className="mr-2 h-4 w-4" />
+                        Save Twitter Credentials
+                      </Button>
+                    </form>
+                  </CardContent>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="animate-slide-up">
+              <button
+                className="flex w-full items-center justify-between px-5 py-4 text-left"
+                onClick={() => toggleSettingsSection('ai')}
+                type="button"
+              >
+                <div>
+                  <p className="text-sm font-semibold">AI Settings</p>
+                  <p className="text-xs text-muted-foreground">Optional enrichment and rewrite provider config.</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Badge variant={aiConfigured ? 'success' : 'outline'}>
+                    {aiConfigured ? 'Configured' : 'Optional'}
+                  </Badge>
+                  <ChevronDown
+                    className={cn(
+                      'h-4 w-4 transition-transform duration-200',
+                      isSettingsSectionExpanded('ai') ? 'rotate-0' : '-rotate-90',
+                    )}
+                  />
+                </div>
+              </button>
+              <div
+                className={cn(
+                  'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                  isSettingsSectionExpanded('ai') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                )}
+              >
+                <div className="min-h-0 overflow-hidden">
+                  <CardContent className="space-y-3 border-t border-border/70 pt-4">
+                    <form className="space-y-3" onSubmit={handleSaveAiConfig}>
+                      <div className="space-y-2">
+                        <Label htmlFor="provider">Provider</Label>
+                        <select
+                          className={selectClassName}
+                          id="provider"
+                          value={aiConfig.provider}
+                          onChange={(event) => {
+                            setAiConfig((prev) => ({ ...prev, provider: event.target.value as AIConfig['provider'] }));
+                          }}
+                        >
+                          <option value="gemini">Google Gemini</option>
+                          <option value="openai">OpenAI / OpenRouter</option>
+                          <option value="anthropic">Anthropic</option>
+                          <option value="custom">Custom</option>
+                        </select>
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="apiKey">API Key</Label>
+                        <Input
+                          id="apiKey"
+                          type="password"
+                          value={aiConfig.apiKey || ''}
+                          onChange={(event) => {
+                            setAiConfig((prev) => ({ ...prev, apiKey: event.target.value }));
+                          }}
+                        />
+                      </div>
+                      {aiConfig.provider !== 'gemini' ? (
+                        <>
+                          <div className="space-y-2">
+                            <Label htmlFor="model">Model ID</Label>
+                            <Input
+                              id="model"
+                              value={aiConfig.model || ''}
+                              onChange={(event) => {
+                                setAiConfig((prev) => ({ ...prev, model: event.target.value }));
+                              }}
+                              placeholder="gpt-4o"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <Label htmlFor="baseUrl">Base URL</Label>
+                            <Input
+                              id="baseUrl"
+                              value={aiConfig.baseUrl || ''}
+                              onChange={(event) => {
+                                setAiConfig((prev) => ({ ...prev, baseUrl: event.target.value }));
+                              }}
+                              placeholder="https://api.example.com/v1"
+                            />
+                          </div>
+                        </>
+                      ) : null}
+
+                      <Button className="w-full sm:w-auto" size="sm" type="submit" disabled={isBusy}>
+                        <Bot className="mr-2 h-4 w-4" />
+                        Save AI Settings
+                      </Button>
+                    </form>
+                  </CardContent>
+                </div>
+              </div>
+            </Card>
+
+            <Card className="animate-slide-up">
+              <button
+                className="flex w-full items-center justify-between px-5 py-4 text-left"
+                onClick={() => toggleSettingsSection('data')}
+                type="button"
+              >
+                <div>
+                  <p className="text-sm font-semibold">Data Management</p>
+                  <p className="text-xs text-muted-foreground">Export/import mappings and provider settings.</p>
+                </div>
+                <ChevronDown
+                  className={cn(
+                    'h-4 w-4 transition-transform duration-200',
+                    isSettingsSectionExpanded('data') ? 'rotate-0' : '-rotate-90',
+                  )}
+                />
+              </button>
+              <div
+                className={cn(
+                  'grid transition-[grid-template-rows,opacity] duration-300 ease-out',
+                  isSettingsSectionExpanded('data') ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                )}
+              >
+                <div className="min-h-0 overflow-hidden">
+                  <CardContent className="space-y-3 border-t border-border/70 pt-4">
+                    <Button className="w-full sm:w-auto" variant="outline" onClick={handleExportConfig}>
+                      <Download className="mr-2 h-4 w-4" />
+                      Export configuration
+                    </Button>
+                    <input
+                      ref={importInputRef}
+                      className="hidden"
+                      type="file"
+                      accept="application/json,.json"
                       onChange={(event) => {
-                        setTwitterConfig((prev) => ({ ...prev, authToken: event.target.value }));
+                        void handleImportConfig(event);
                       }}
-                      required
                     />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="ct0">Primary CT0</Label>
-                    <Input
-                      id="ct0"
-                      value={twitterConfig.ct0}
-                      onChange={(event) => {
-                        setTwitterConfig((prev) => ({ ...prev, ct0: event.target.value }));
-                      }}
-                      required
-                    />
-                  </div>
-
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div className="space-y-2">
-                      <Label htmlFor="backupAuthToken">Backup Auth Token</Label>
-                      <Input
-                        id="backupAuthToken"
-                        value={twitterConfig.backupAuthToken || ''}
-                        onChange={(event) => {
-                          setTwitterConfig((prev) => ({ ...prev, backupAuthToken: event.target.value }));
-                        }}
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="backupCt0">Backup CT0</Label>
-                      <Input
-                        id="backupCt0"
-                        value={twitterConfig.backupCt0 || ''}
-                        onChange={(event) => {
-                          setTwitterConfig((prev) => ({ ...prev, backupCt0: event.target.value }));
-                        }}
-                      />
-                    </div>
-                  </div>
-
-                  <Button className="w-full" size="sm" type="submit" disabled={isBusy}>
-                    <Save className="mr-2 h-4 w-4" />
-                    Save Twitter Credentials
-                  </Button>
-                </form>
-
-                <form className="space-y-3 border-t border-border pt-6" onSubmit={handleSaveAiConfig}>
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm font-semibold">AI Settings</h3>
-                    <Badge variant={aiConfig.apiKey ? 'success' : 'outline'}>
-                      {aiConfig.apiKey ? 'Configured' : 'Optional'}
-                    </Badge>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="provider">Provider</Label>
-                    <select
-                      className={selectClassName}
-                      id="provider"
-                      value={aiConfig.provider}
-                      onChange={(event) => {
-                        setAiConfig((prev) => ({ ...prev, provider: event.target.value as AIConfig['provider'] }));
+                    <Button
+                      className="w-full sm:w-auto"
+                      variant="outline"
+                      onClick={() => {
+                        importInputRef.current?.click();
                       }}
                     >
-                      <option value="gemini">Google Gemini</option>
-                      <option value="openai">OpenAI / OpenRouter</option>
-                      <option value="anthropic">Anthropic</option>
-                      <option value="custom">Custom</option>
-                    </select>
+                      <Upload className="mr-2 h-4 w-4" />
+                      Import configuration
+                    </Button>
+                    <p className="text-xs text-muted-foreground">
+                      Imports preserve dashboard users and passwords while replacing mappings, provider keys, and
+                      scheduler settings.
+                    </p>
+                  </CardContent>
+                </div>
+              </div>
+            </Card>
+          </section>
+        ) : null
+      ) : null}
+
+      {isAddAccountSheetOpen ? (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/55 p-0 backdrop-blur-sm sm:items-stretch sm:justify-end"
+          onClick={closeAddAccountSheet}
+        >
+          <aside
+            className="flex h-[95vh] w-full max-w-xl flex-col rounded-t-2xl border border-border/80 bg-card shadow-2xl sm:h-full sm:rounded-none sm:rounded-l-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between border-b border-border/70 px-5 py-4">
+              <div>
+                <p className="text-xs uppercase tracking-[0.15em] text-muted-foreground">Add Account</p>
+                <h2 className="text-lg font-semibold">Create Crosspost Mapping</h2>
+              </div>
+              <Button variant="ghost" size="icon" onClick={closeAddAccountSheet} aria-label="Close add account flow">
+                <X className="h-4 w-4" />
+              </Button>
+            </div>
+
+            <div className="border-b border-border/70 px-5 py-3">
+              <div className="flex items-center gap-2">
+                {ADD_ACCOUNT_STEPS.map((label, index) => {
+                  const step = index + 1;
+                  const active = step === addAccountStep;
+                  const complete = step < addAccountStep;
+                  return (
+                    <div key={label} className="flex min-w-0 flex-1 items-center gap-2">
+                      <div
+                        className={cn(
+                          'flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-xs font-semibold',
+                          complete && 'border-foreground bg-foreground text-background',
+                          active && 'border-foreground text-foreground',
+                          !active && !complete && 'border-border text-muted-foreground',
+                        )}
+                      >
+                        {step}
+                      </div>
+                      <span
+                        className={cn(
+                          'truncate text-xs',
+                          active ? 'text-foreground' : complete ? 'text-foreground/90' : 'text-muted-foreground',
+                        )}
+                      >
+                        {label}
+                      </span>
+                      {step < ADD_ACCOUNT_STEP_COUNT ? <div className="h-px flex-1 bg-border/70" /> : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-5 py-4">
+              {addAccountStep === 1 ? (
+                <div className="space-y-4 animate-fade-in">
+                  <div className="space-y-1">
+                    <p className="text-sm font-semibold">Who owns this mapping?</p>
+                    <p className="text-xs text-muted-foreground">Set a label so account rows stay easy to scan.</p>
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="apiKey">API Key</Label>
+                    <Label htmlFor="add-account-owner">Owner</Label>
                     <Input
-                      id="apiKey"
-                      type="password"
-                      value={aiConfig.apiKey || ''}
-                      onChange={(event) => {
-                        setAiConfig((prev) => ({ ...prev, apiKey: event.target.value }));
-                      }}
-                    />
-                  </div>
-                  {aiConfig.provider !== 'gemini' ? (
-                    <>
-                      <div className="space-y-2">
-                        <Label htmlFor="model">Model ID</Label>
-                        <Input
-                          id="model"
-                          value={aiConfig.model || ''}
-                          onChange={(event) => {
-                            setAiConfig((prev) => ({ ...prev, model: event.target.value }));
-                          }}
-                          placeholder="gpt-4o"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label htmlFor="baseUrl">Base URL</Label>
-                        <Input
-                          id="baseUrl"
-                          value={aiConfig.baseUrl || ''}
-                          onChange={(event) => {
-                            setAiConfig((prev) => ({ ...prev, baseUrl: event.target.value }));
-                          }}
-                          placeholder="https://api.example.com/v1"
-                        />
-                      </div>
-                    </>
-                  ) : null}
-
-                  <Button className="w-full" size="sm" type="submit" disabled={isBusy}>
-                    <Bot className="mr-2 h-4 w-4" />
-                    Save AI Settings
-                  </Button>
-                </form>
-
-                <form className="space-y-3 border-t border-border pt-6" onSubmit={handleAddMapping}>
-                  <h3 className="text-sm font-semibold">Add Account Mapping</h3>
-                  <div className="space-y-2">
-                    <Label htmlFor="owner">Owner</Label>
-                    <Input
-                      id="owner"
+                      id="add-account-owner"
                       value={newMapping.owner}
                       onChange={(event) => {
-                        setNewMapping((prev) => ({ ...prev, owner: event.target.value }));
+                        setNewMapping((previous) => ({ ...previous, owner: event.target.value }));
                       }}
-                      required
+                      placeholder="jack"
                     />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>Use Existing Folder (Optional)</Label>
+                    {reusableGroupOptions.length === 0 ? (
+                      <p className="rounded-lg border border-dashed border-border/70 px-3 py-2 text-xs text-muted-foreground">
+                        No folders yet. Create one below or from the Accounts tab.
+                      </p>
+                    ) : (
+                      <div className="flex flex-wrap gap-2">
+                        {reusableGroupOptions.map((group) => {
+                          const selected = getGroupKey(newMapping.groupName) === group.key;
+                          return (
+                            <button
+                              key={`preset-group-${group.key}`}
+                              className={cn(
+                                'inline-flex items-center gap-1 rounded-full border px-3 py-1.5 text-xs transition-colors',
+                                selected
+                                  ? 'border-foreground bg-foreground text-background'
+                                  : 'border-border bg-background text-foreground hover:bg-muted',
+                              )}
+                              onClick={() => applyGroupPresetToNewMapping(group.key)}
+                              type="button"
+                            >
+                              <span>{group.emoji}</span>
+                              <span>{group.name}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                   <div className="grid gap-3 sm:grid-cols-[1fr_auto]">
                     <div className="space-y-2">
-                      <Label htmlFor="groupName">Folder / Group Name</Label>
+                      <Label htmlFor="add-account-group-name">Folder / Group Name (Optional)</Label>
                       <Input
-                        id="groupName"
+                        id="add-account-group-name"
                         value={newMapping.groupName}
                         onChange={(event) => {
-                          setNewMapping((prev) => ({ ...prev, groupName: event.target.value }));
+                          setNewMapping((previous) => ({ ...previous, groupName: event.target.value }));
                         }}
                         placeholder="Gaming, News, Sports..."
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="groupEmoji">Emoji</Label>
+                      <Label htmlFor="add-account-group-emoji">Emoji</Label>
                       <Input
-                        id="groupEmoji"
+                        id="add-account-group-emoji"
                         value={newMapping.groupEmoji}
                         onChange={(event) => {
-                          setNewMapping((prev) => ({ ...prev, groupEmoji: event.target.value }));
+                          setNewMapping((previous) => ({ ...previous, groupEmoji: event.target.value }));
                         }}
-                        placeholder="📁"
                         maxLength={8}
+                        placeholder={DEFAULT_GROUP_EMOJI}
                       />
                     </div>
                   </div>
+                </div>
+              ) : null}
+
+              {addAccountStep === 2 ? (
+                <div className="space-y-4 animate-fade-in">
+                  <div className="space-y-1">
+                    <p className="text-sm font-semibold">Choose Twitter sources</p>
+                    <p className="text-xs text-muted-foreground">
+                      Add one or many usernames. Press Enter or comma to add quickly.
+                    </p>
+                  </div>
                   <div className="space-y-2">
-                    <Label htmlFor="twitterUsernames">Twitter Usernames</Label>
+                    <Label htmlFor="add-account-twitter-usernames">Twitter Usernames</Label>
                     <div className="flex gap-2">
                       <Input
-                        id="twitterUsernames"
+                        id="add-account-twitter-usernames"
                         value={newTwitterInput}
                         onChange={(event) => {
                           setNewTwitterInput(event.target.value);
@@ -2455,11 +2867,10 @@ function App() {
                             addNewTwitterUsername();
                           }
                         }}
-                        placeholder="@accountname (press Enter to add)"
+                        placeholder="@accountname"
                       />
                       <Button
                         variant="outline"
-                        size="sm"
                         type="button"
                         disabled={normalizeTwitterUsername(newTwitterInput).length === 0}
                         onClick={addNewTwitterUsername}
@@ -2467,9 +2878,12 @@ function App() {
                         Add
                       </Button>
                     </div>
-                    <p className="text-xs text-muted-foreground">Press Enter or comma to add multiple handles quickly.</p>
-                    <div className="flex min-h-7 flex-wrap gap-2">
-                      {newTwitterUsers.map((username) => (
+                  </div>
+                  <div className="flex min-h-7 flex-wrap gap-2">
+                    {newTwitterUsers.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">No source usernames added yet.</p>
+                    ) : (
+                      newTwitterUsers.map((username) => (
                         <Badge key={`new-${username}`} variant="secondary" className="gap-1 pr-1">
                           @{username}
                           <button
@@ -2481,89 +2895,103 @@ function App() {
                             ×
                           </button>
                         </Badge>
-                      ))}
-                    </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              ) : null}
+
+              {addAccountStep === 3 ? (
+                <div className="space-y-4 animate-fade-in">
+                  <div className="space-y-1">
+                    <p className="text-sm font-semibold">Target Bluesky account</p>
+                    <p className="text-xs text-muted-foreground">
+                      Use an app password for the destination account.
+                    </p>
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="bskyIdentifier">Bluesky Identifier</Label>
+                    <Label htmlFor="add-account-bsky-identifier">Bluesky Identifier</Label>
                     <Input
-                      id="bskyIdentifier"
+                      id="add-account-bsky-identifier"
                       value={newMapping.bskyIdentifier}
                       onChange={(event) => {
-                        setNewMapping((prev) => ({ ...prev, bskyIdentifier: event.target.value }));
+                        setNewMapping((previous) => ({ ...previous, bskyIdentifier: event.target.value }));
                       }}
-                      required
+                      placeholder="example.bsky.social"
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="bskyPassword">Bluesky App Password</Label>
+                    <Label htmlFor="add-account-bsky-password">Bluesky App Password</Label>
                     <Input
-                      id="bskyPassword"
+                      id="add-account-bsky-password"
                       type="password"
                       value={newMapping.bskyPassword}
                       onChange={(event) => {
-                        setNewMapping((prev) => ({ ...prev, bskyPassword: event.target.value }));
+                        setNewMapping((previous) => ({ ...previous, bskyPassword: event.target.value }));
                       }}
-                      required
                     />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="bskyServiceUrl">Bluesky Service URL</Label>
+                    <Label htmlFor="add-account-bsky-url">Bluesky Service URL</Label>
                     <Input
-                      id="bskyServiceUrl"
+                      id="add-account-bsky-url"
                       value={newMapping.bskyServiceUrl}
                       onChange={(event) => {
-                        setNewMapping((prev) => ({ ...prev, bskyServiceUrl: event.target.value }));
+                        setNewMapping((previous) => ({ ...previous, bskyServiceUrl: event.target.value }));
                       }}
                       placeholder="https://bsky.social"
                     />
                   </div>
+                </div>
+              ) : null}
 
-                  <Button className="w-full" size="sm" type="submit" disabled={isBusy}>
-                    <Plus className="mr-2 h-4 w-4" />
-                    Add Mapping
-                  </Button>
-                </form>
-              </CardContent>
-            </Card>
+              {addAccountStep === 4 ? (
+                <div className="space-y-4 animate-fade-in">
+                  <div className="space-y-1">
+                    <p className="text-sm font-semibold">Review and create</p>
+                    <p className="text-xs text-muted-foreground">Confirm details before saving this mapping.</p>
+                  </div>
+                  <div className="space-y-2 rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
+                    <p>
+                      <span className="font-medium">Owner:</span> {newMapping.owner || '--'}
+                    </p>
+                    <p>
+                      <span className="font-medium">Twitter Sources:</span>{' '}
+                      {newTwitterUsers.length > 0 ? newTwitterUsers.map((username) => `@${username}`).join(', ') : '--'}
+                    </p>
+                    <p>
+                      <span className="font-medium">Bluesky Target:</span> {newMapping.bskyIdentifier || '--'}
+                    </p>
+                    <p>
+                      <span className="font-medium">Folder:</span>{' '}
+                      {newMapping.groupName.trim()
+                        ? `${newMapping.groupEmoji.trim() || DEFAULT_GROUP_EMOJI} ${newMapping.groupName.trim()}`
+                        : `${DEFAULT_GROUP_EMOJI} ${DEFAULT_GROUP_NAME}`}
+                    </p>
+                  </div>
+                </div>
+              ) : null}
+            </div>
 
-            <Card className="animate-slide-up">
-              <CardHeader>
-                <CardTitle>Data Management</CardTitle>
-                <CardDescription>Export/import account and provider config without login credentials.</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <Button className="w-full" variant="outline" onClick={handleExportConfig}>
-                  <Download className="mr-2 h-4 w-4" />
-                  Export configuration
+            <div className="flex items-center justify-between gap-2 border-t border-border/70 px-5 py-4">
+              <Button variant="outline" onClick={retreatAddAccountStep} disabled={addAccountStep === 1 || isBusy}>
+                <ChevronLeft className="mr-2 h-4 w-4" />
+                Back
+              </Button>
+              {addAccountStep < ADD_ACCOUNT_STEP_COUNT ? (
+                <Button onClick={advanceAddAccountStep}>
+                  Next
+                  <ChevronRight className="ml-2 h-4 w-4" />
                 </Button>
-                <input
-                  ref={importInputRef}
-                  className="hidden"
-                  type="file"
-                  accept="application/json,.json"
-                  onChange={(event) => {
-                    void handleImportConfig(event);
-                  }}
-                />
-                <Button
-                  className="w-full"
-                  variant="outline"
-                  onClick={() => {
-                    importInputRef.current?.click();
-                  }}
-                >
-                  <Upload className="mr-2 h-4 w-4" />
-                  Import configuration
+              ) : (
+                <Button onClick={() => void submitNewMapping()} disabled={isBusy}>
+                  {isBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}
+                  Create Account
                 </Button>
-                <p className="text-xs text-muted-foreground">
-                  Imports preserve dashboard users and passwords while replacing mappings, provider keys, and scheduler
-                  settings.
-                </p>
-              </CardContent>
-            </Card>
-          </section>
-        ) : null
+              )}
+            </div>
+          </aside>
+        </div>
       ) : null}
 
       {editingMapping ? (
