@@ -57,3 +57,17 @@ When using npm scripts, pass CLI args after `--`:
 ```bash
 npm run cli -- status
 ```
+
+### Docker: permissions writing `/app/data`
+If the container fails to write `config.json` or `database.sqlite`, ensure `/app/data` is writable by the container process.
+
+For easiest portability, use a named Docker volume:
+
+```bash
+docker volume create tweets2bsky_data
+docker run -d --name tweets-2-bsky -p 3000:3000 -v tweets2bsky_data:/app/data ghcr.io/j4ckxyz/tweets-2-bsky:latest
+```
+
+### Docker: updating image
+In Docker mode, update by pulling a newer image and recreating the container with the same volume.
+`/api/update` / `update.sh` are source-install workflows.

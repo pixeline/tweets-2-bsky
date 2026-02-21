@@ -1,0 +1,12 @@
+.git
+.gitignore
+node_modules
+dist
+web/dist
+data
+processed
+config.json
+.env
+npm-debug.log
+README.md
+TROUBLESHOOTING.md

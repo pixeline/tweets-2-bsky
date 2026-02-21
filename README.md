@@ -51,7 +51,176 @@ Open the printed URL in your browser, then:
 ./install.sh --skip-native-rebuild
 ```
 
-If you prefer full manual setup, skip to [Manual Setup](#manual-setup-technical).
+If you prefer full manual setup, skip to [Manual Setup](#manual-setup-technical). For a portable single-container setup, use [Docker](#docker-single-container-backend--frontend--scheduler).
+
+## Docker (Single-Container, Backend + Frontend + Scheduler)
+
+This repo now includes a single `Dockerfile` that runs:
+
+- the backend API
+- the scheduler/worker loop
+- the built frontend dashboard
+- Chromium (for quote-tweet screenshot fallback support)
+
+The container aims for feature parity with normal installs while giving one-command startup.
+
+### 1) Pull and run (recommended)
+
+After publishing an image (see [Publishing](#publishing-multi-platform-images-linuxamd64--linuxarm64)), run:
+
+```bash
+docker run -d \
+  --name tweets-2-bsky \
+  -p 3000:3000 \
+  -v tweets2bsky_data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/j4ckxyz/tweets-2-bsky:latest
+```
+
+Open `http://localhost:3000`.
+
+PowerShell equivalent:
+
+```powershell
+docker run -d --name tweets-2-bsky -p 3000:3000 -v tweets2bsky_data:/app/data --restart unless-stopped ghcr.io/j4ckxyz/tweets-2-bsky:latest
+```
+
+### 2) Build locally (if you do not want to pull)
+
+```bash
+docker build -t tweets-2-bsky:local .
+
+docker run -d \
+  --name tweets-2-bsky \
+  -p 3000:3000 \
+  -v tweets2bsky_data:/app/data \
+  --restart unless-stopped \
+  tweets-2-bsky:local
+```
+
+### 3) Environment variables
+
+Pass environment values with `-e` or `--env-file` (same values as normal install):
+
+```bash
+docker run -d \
+  --name tweets-2-bsky \
+  -p 3000:3000 \
+  -v tweets2bsky_data:/app/data \
+  --env-file .env \
+  ghcr.io/j4ckxyz/tweets-2-bsky:latest
+```
+
+Common variables:
+
+- `PORT` (default `3000`)
+- `JWT_SECRET` (recommended to set explicitly)
+- `JWT_EXPIRES_IN`
+- `CORS_ALLOWED_ORIGINS`
+- `BSKY_APPVIEW_URL` (optional override)
+
+### 4) Persistent data inside Docker
+
+Store all app state in `/app/data` (mounted via volume):
+
+- `/app/data/config.json` (mappings, users, credentials)
+- `/app/data/database.sqlite`
+- `/app/data/.jwt-secret`
+
+Note: inside the container, `/app/config.json` is linked to `/app/data/config.json` so one volume preserves everything important.
+
+### 5) CLI usage in container
+
+You can run CLI commands without leaving Docker:
+
+```bash
+docker exec -it tweets-2-bsky node dist/cli.js status
+docker exec -it tweets-2-bsky node dist/cli.js run-now
+docker exec -it tweets-2-bsky node dist/cli.js list
+```
+
+### 6) Updating Docker deployments
+
+For Docker installs, update by pulling a newer image and recreating the container with the same volume:
+
+```bash
+docker pull ghcr.io/j4ckxyz/tweets-2-bsky:latest
+docker stop tweets-2-bsky
+docker rm tweets-2-bsky
+docker run -d \
+  --name tweets-2-bsky \
+  -p 3000:3000 \
+  -v tweets2bsky_data:/app/data \
+  --restart unless-stopped \
+  ghcr.io/j4ckxyz/tweets-2-bsky:latest
+```
+
+### 7) Platform support
+
+The Docker build is designed for multi-platform images:
+
+- `linux/amd64` (typical Linux servers, many Windows machines)
+- `linux/arm64` (Apple Silicon Macs, ARM Linux servers)
+
+This means the same image tag can be pulled on Docker Desktop (Windows/macOS) and Linux hosts.
+On Windows, use Docker Desktop in **Linux container** mode.
+
+### Publishing (multi-platform images: linux/amd64 + linux/arm64)
+
+Automatic publishing is included via GitHub Actions:
+
+- `.github/workflows/docker-publish.yml` for GHCR
+- `.github/workflows/docker-publish-dockerhub.yml` for Docker Hub (only runs when Docker Hub secrets are set)
+
+- pushes to `master` or `main` publish fresh multi-arch images and update `:latest`
+- tags like `v2.0.0` publish versioned tags (`:2.0.0`, `:2.0`)
+- manual publish is available with **Actions -> Publish Docker Image -> Run workflow**
+- after first publish, set GHCR package visibility to **Public** so anyone can pull
+
+To enable automatic Docker Hub publishing with GitHub CLI:
+
+```bash
+gh secret set DOCKERHUB_USERNAME --body "<dockerhub-username>"
+gh secret set DOCKERHUB_TOKEN --body "<dockerhub-access-token>"
+```
+
+If you keep your default branch as `master`, users can always pull the newest build with:
+
+```bash
+docker pull ghcr.io/j4ckxyz/tweets-2-bsky:latest
+```
+
+#### Option A: GitHub Container Registry (GHCR)
+
+```bash
+docker login ghcr.io -u <github-username>
+docker buildx create --name t2b-builder --use
+docker buildx inspect --bootstrap
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t ghcr.io/j4ckxyz/tweets-2-bsky:latest \
+  -t ghcr.io/j4ckxyz/tweets-2-bsky:2.0.0 \
+  --push .
+```
+
+Then set the GHCR package visibility to **Public** in GitHub package settings.
+
+#### Option B: Docker Hub
+
+```bash
+docker login
+docker buildx create --name t2b-builder --use
+docker buildx inspect --bootstrap
+
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t <dockerhub-user>/tweets-2-bsky:latest \
+  -t <dockerhub-user>/tweets-2-bsky:2.0.0 \
+  --push .
+```
+
+Once published, users only need `docker pull` + `docker run`.
 
 ## Linux VPS Without Domain (Secure HTTPS via Tailscale)
 
@@ -116,6 +285,7 @@ Optional but recommended:
 - PM2 (for managed background runtime)
 - Chrome/Chromium (used for some quote-tweet screenshot fallbacks)
 - build tools for native modules (`better-sqlite3`) if your platform needs source compilation
+- Docker Desktop / Docker Engine (if using containerized deployment)
 
 ## Manual Setup (Technical)
 
