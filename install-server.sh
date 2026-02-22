@@ -13,6 +13,7 @@ TS_AUTHKEY=""
 TS_HOSTNAME=""
 USE_FUNNEL=0
 INSTALL_ARGS=()
+BUN_BIN=""
 
 usage() {
   cat <<'USAGE'
@@ -51,6 +52,74 @@ require_command() {
   fi
 }
 
+ensure_bun_runtime() {
+  install_latest_bun() {
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL https://bun.sh/install | bash >/dev/null
+      return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+      wget -qO- https://bun.sh/install | bash >/dev/null
+      return 0
+    fi
+
+    echo "❌ Bun is required, and curl/wget is unavailable for auto-install."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  }
+
+  resolve_bun_bin() {
+    if command -v bun >/dev/null 2>&1; then
+      command -v bun
+      return 0
+    fi
+    if [[ -x "${HOME}/.bun/bin/bun" ]]; then
+      printf '%s\n' "${HOME}/.bun/bin/bun"
+      return 0
+    fi
+    return 1
+  }
+
+  if ! BUN_BIN="$(resolve_bun_bin)"; then
+    echo "📦 Bun not found. Installing latest Bun..."
+    install_latest_bun
+    BUN_BIN="$(resolve_bun_bin || true)"
+  fi
+
+  if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
+    echo "❌ Bun could not be resolved."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  fi
+
+  export PATH="$(dirname "$BUN_BIN"):$PATH"
+
+  if ! "$BUN_BIN" upgrade >/dev/null 2>&1; then
+    echo "⚠️  Bun auto-upgrade failed. Reinstalling latest Bun..."
+    install_latest_bun
+    BUN_BIN="$(resolve_bun_bin || true)"
+  fi
+
+  if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
+    echo "❌ Bun could not be resolved after auto-upgrade."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  fi
+
+  export PATH="$(dirname "$BUN_BIN"):$PATH"
+
+  local bun_major
+  bun_major="$($BUN_BIN --version | awk -F. '{print $1}' 2>/dev/null || echo 0)"
+  if [[ "$bun_major" -lt 1 ]]; then
+    echo "❌ Bun 1.x+ is required. Current: $($BUN_BIN --version 2>/dev/null || echo 'unknown')"
+    exit 1
+  fi
+}
+
+run_bun() {
+  "$BUN_BIN" "$@"
+}
+
 is_valid_port() {
   local candidate="$1"
   [[ "$candidate" =~ ^[0-9]+$ ]] || return 1
@@ -59,7 +128,7 @@ is_valid_port() {
 
 is_local_port_free() {
   local port="$1"
-  node -e '
+  run_bun -e '
 const net = require("node:net");
 const port = Number(process.argv[1]);
 const server = net.createServer();
@@ -259,7 +328,7 @@ get_used_tailscale_https_ports() {
     return 0
   fi
 
-  printf '%s' "$json" | node -e '
+  printf '%s' "$json" | run_bun -e '
 const fs = require("node:fs");
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -359,7 +428,7 @@ get_tailscale_dns_name() {
     return 0
   fi
 
-  printf '%s' "$json" | node -e '
+  printf '%s' "$json" | run_bun -e '
 const fs = require("node:fs");
 try {
   const data = JSON.parse(fs.readFileSync(0, "utf8"));
@@ -481,9 +550,8 @@ done
 ensure_linux
 ensure_sudo
 require_command bash
-require_command node
-require_command npm
 require_command git
+ensure_bun_runtime
 
 ensure_local_only_env
 run_app_install

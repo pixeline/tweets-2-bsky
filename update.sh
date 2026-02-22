@@ -28,6 +28,7 @@ UNTRACKED_COUNT=0
 
 BACKUP_SOURCES=()
 BACKUP_PATHS=()
+BUN_BIN=""
 
 usage() {
   cat <<'USAGE'
@@ -43,8 +44,8 @@ Default behavior:
 Options:
   --remote <name>         Git remote to pull from (default: origin or first remote)
   --branch <name>         Git branch to pull (default: current branch or remote HEAD)
-  --skip-install          Skip npm install
-  --skip-build            Skip npm run build
+  --skip-install          Skip bun install
+  --skip-build            Skip bun run build
   --skip-native-rebuild   Skip native-module rebuild checks
   --no-restart            Do not restart process after update
   -h, --help              Show this help
@@ -59,13 +60,72 @@ require_command() {
   fi
 }
 
-check_node_version() {
-  local node_major
-  node_major="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
-  if [[ "$node_major" -lt 22 ]]; then
-    echo "❌ Node.js 22+ is required. Current: $(node -v 2>/dev/null || echo 'unknown')"
+ensure_bun_runtime() {
+  install_latest_bun() {
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL https://bun.sh/install | bash >/dev/null
+      return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+      wget -qO- https://bun.sh/install | bash >/dev/null
+      return 0
+    fi
+
+    echo "❌ Bun is required, and curl/wget is unavailable for auto-install."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  }
+
+  resolve_bun_bin() {
+    if command -v bun >/dev/null 2>&1; then
+      command -v bun
+      return 0
+    fi
+    if [[ -x "${HOME}/.bun/bin/bun" ]]; then
+      printf '%s\n' "${HOME}/.bun/bin/bun"
+      return 0
+    fi
+    return 1
+  }
+
+  if ! BUN_BIN="$(resolve_bun_bin)"; then
+    echo "📦 Bun not found. Installing latest Bun..."
+    install_latest_bun
+    BUN_BIN="$(resolve_bun_bin || true)"
+  fi
+
+  if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
+    echo "❌ Bun could not be resolved."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
     exit 1
   fi
+
+  export PATH="$(dirname "$BUN_BIN"):$PATH"
+
+  if ! "$BUN_BIN" upgrade >/dev/null 2>&1; then
+    echo "⚠️  Bun auto-upgrade failed. Reinstalling latest Bun..."
+    install_latest_bun
+    BUN_BIN="$(resolve_bun_bin || true)"
+  fi
+
+  if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
+    echo "❌ Bun could not be resolved after auto-upgrade."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  fi
+
+  export PATH="$(dirname "$BUN_BIN"):$PATH"
+
+  local bun_major
+  bun_major="$($BUN_BIN --version | awk -F. '{print $1}' 2>/dev/null || echo 0)"
+  if [[ "$bun_major" -lt 1 ]]; then
+    echo "❌ Bun 1.x+ is required. Current: $($BUN_BIN --version 2>/dev/null || echo 'unknown')"
+    exit 1
+  fi
+}
+
+run_bun() {
+  "$BUN_BIN" "$@"
 }
 
 acquire_lock() {
@@ -293,7 +353,7 @@ pull_latest() {
 }
 
 native_module_compatible() {
-  node -e "try{require('better-sqlite3');process.exit(0)}catch(e){console.error(e && e.message ? e.message : e);process.exit(1)}" >/dev/null 2>&1
+  run_bun -e "try{require('better-sqlite3');process.exit(0)}catch(e){console.error(e && e.message ? e.message : e);process.exit(1)}" >/dev/null 2>&1
 }
 
 rebuild_native_modules() {
@@ -306,16 +366,12 @@ rebuild_native_modules() {
   fi
 
   echo "🔧 Native module mismatch detected, rebuilding..."
-  if npm run rebuild:native; then
+  if run_bun run rebuild:native; then
     return 0
   fi
 
-  echo "⚠️  rebuild:native failed, trying npm rebuild better-sqlite3..."
-  if npm rebuild better-sqlite3; then
-    return 0
-  fi
-
-  npm rebuild better-sqlite3 --build-from-source
+  echo "⚠️  rebuild:native failed, forcing fresh Bun install..."
+  run_bun install --force
 }
 
 install_dependencies() {
@@ -324,7 +380,7 @@ install_dependencies() {
   fi
 
   echo "📦 Installing dependencies..."
-  npm install --no-audit --no-fund
+  run_bun install
 }
 
 build_project() {
@@ -333,7 +389,7 @@ build_project() {
   fi
 
   echo "🏗️  Building server + web dashboard..."
-  npm run build
+  run_bun run build
 }
 
 pm2_has_process() {
@@ -358,7 +414,7 @@ nohup_process_running() {
 
   local cmd
   cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$cmd" == *"dist/index.js"* || "$cmd" == *"npm start"* || "$cmd" == *"$APP_NAME"* ]]
+  [[ "$cmd" == *"dist/index.js"* || "$cmd" == *"bun run start"* || "$cmd" == *"bun dist/index.js"* || "$cmd" == *"$APP_NAME"* ]]
 }
 
 restart_runtime() {
@@ -383,10 +439,10 @@ restart_runtime() {
     if [[ "$has_app" -eq 1 && "$has_legacy" -eq 1 ]]; then
       echo "ℹ️  Found both PM2 processes ($APP_NAME and $LEGACY_APP_NAME). Consolidating to $APP_NAME..."
       echo "[pm2] Restarting $APP_NAME with updated environment"
-      pm2 restart "$APP_NAME" --update-env || {
+      pm2 restart "$APP_NAME" --update-env --interpreter "$BUN_BIN" || {
         echo "[pm2] Restart failed. Recreating $APP_NAME"
         pm2 delete "$APP_NAME" || true
-        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env
+        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
       }
       echo "[pm2] Removing duplicate legacy process $LEGACY_APP_NAME"
       pm2 delete "$LEGACY_APP_NAME" || true
@@ -398,10 +454,10 @@ restart_runtime() {
 
     if [[ "$has_app" -eq 1 ]]; then
       echo "[pm2] Restarting $APP_NAME with updated environment"
-      pm2 restart "$APP_NAME" --update-env || {
+      pm2 restart "$APP_NAME" --update-env --interpreter "$BUN_BIN" || {
         echo "⚠️  PM2 restart failed for $APP_NAME. Recreating process..."
         pm2 delete "$APP_NAME" || true
-        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env
+        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
       }
       echo "[pm2] Saving PM2 process list"
       pm2 save || true
@@ -411,10 +467,10 @@ restart_runtime() {
 
     if [[ "$has_legacy" -eq 1 ]]; then
       echo "[pm2] Restarting legacy process $LEGACY_APP_NAME with updated environment"
-      pm2 restart "$LEGACY_APP_NAME" --update-env || {
+      pm2 restart "$LEGACY_APP_NAME" --update-env --interpreter "$BUN_BIN" || {
         echo "⚠️  PM2 restart failed for $LEGACY_APP_NAME. Recreating it..."
         pm2 delete "$LEGACY_APP_NAME" || true
-        pm2 start dist/index.js --name "$LEGACY_APP_NAME" --cwd "$SCRIPT_DIR" --update-env
+        pm2 start dist/index.js --name "$LEGACY_APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
       }
       echo "[pm2] Saving PM2 process list"
       pm2 save || true
@@ -502,9 +558,7 @@ echo "🔄 Tweets-2-Bsky Updater"
 echo "========================="
 
 require_command git
-require_command node
-require_command npm
-check_node_version
+ensure_bun_runtime
 ensure_git_repo
 
 acquire_lock

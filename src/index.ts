@@ -15,7 +15,8 @@ import puppeteer from 'puppeteer-core';
 import sharp from 'sharp';
 import { generateAltText } from './ai-manager.js';
 
-import { getConfig } from './config-manager.js';
+import { getConfig, saveConfig } from './config-manager.js';
+import { applyProfileMirrorSyncState, syncBlueskyProfileFromTwitter } from './profile-mirror.js';
 
 // ESM __dirname equivalent
 const __filename = fileURLToPath(import.meta.url);
@@ -2028,6 +2029,8 @@ async function importHistory(
 // Task management
 const activeTasks = new Map<string, Promise<void>>();
 const DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS = 2 * 60 * 1000;
+const PROFILE_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000;
+let profileSyncStateWriteQueue: Promise<void> = Promise.resolve();
 
 const describeError = (error: unknown): string => {
   if (error instanceof Error) {
@@ -2056,6 +2059,118 @@ const resolveBackfillAccountTimeoutMs = (): number => {
   }
   return DEFAULT_BACKFILL_ACCOUNT_TIMEOUT_MS;
 };
+
+const normalizeMappingHandle = (value: string): string => value.trim().replace(/^@/, '').toLowerCase();
+
+const parseIsoTimestampMs = (value?: string): number | null => {
+  if (!value) {
+    return null;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const isProfileSyncDue = (mapping: AccountMapping): boolean => {
+  const lastSyncMs = parseIsoTimestampMs(mapping.lastProfileSyncAt);
+  if (!lastSyncMs) {
+    return true;
+  }
+  return Date.now() - lastSyncMs >= PROFILE_SYNC_INTERVAL_MS;
+};
+
+const resolveProfileSyncSourceForMapping = (mapping: AccountMapping): string | null => {
+  const candidates = mapping.twitterUsernames.map(normalizeMappingHandle).filter((username) => username.length > 0);
+  if (candidates.length === 0) {
+    return null;
+  }
+  if (candidates.length === 1) {
+    return candidates[0] || null;
+  }
+
+  const selected = normalizeMappingHandle(mapping.profileSyncSourceUsername || '');
+  if (selected && candidates.includes(selected)) {
+    return selected;
+  }
+
+  return null;
+};
+
+const persistProfileSyncResult = (
+  mappingId: string,
+  sourceTwitterUsername: string,
+  updateResult: Awaited<ReturnType<typeof syncBlueskyProfileFromTwitter>>,
+) => {
+  profileSyncStateWriteQueue = profileSyncStateWriteQueue
+    .then(() => {
+      const config = getConfig();
+      const index = config.mappings.findIndex((entry) => entry.id === mappingId);
+      const mapping = config.mappings[index];
+      if (index === -1 || !mapping) {
+        return;
+      }
+
+      config.mappings[index] = applyProfileMirrorSyncState(mapping, sourceTwitterUsername, updateResult);
+      saveConfig(config);
+    })
+    .catch((error) => {
+      console.error(`[Scheduler] Failed persisting profile sync metadata for mapping ${mappingId}:`, error);
+    });
+
+  return profileSyncStateWriteQueue;
+};
+
+async function maybeSyncMappingProfileInBackground(mapping: AccountMapping, dryRun: boolean, logPrefix: string): Promise<void> {
+  if (dryRun) {
+    return;
+  }
+  if (!isProfileSyncDue(mapping)) {
+    return;
+  }
+
+  const sourceTwitterUsername = resolveProfileSyncSourceForMapping(mapping);
+  if (!sourceTwitterUsername) {
+    if (mapping.twitterUsernames.length > 1) {
+      console.warn(
+        `${logPrefix} ⚠️ Skipping automatic profile sync: multi-source mapping requires profileSyncSourceUsername selection.`,
+      );
+    }
+    return;
+  }
+
+  try {
+    console.log(`${logPrefix} 🪞 Running automatic profile sync from @${sourceTwitterUsername}.`);
+    const result = await syncBlueskyProfileFromTwitter({
+      twitterUsername: sourceTwitterUsername,
+      bskyIdentifier: mapping.bskyIdentifier,
+      bskyPassword: mapping.bskyPassword,
+      bskyServiceUrl: mapping.bskyServiceUrl,
+      previousSync: {
+        sourceUsername: mapping.profileSyncSourceUsername,
+        mirroredDisplayName: mapping.lastMirroredDisplayName,
+        mirroredDescription: mapping.lastMirroredDescription,
+        avatarUrl: mapping.lastMirroredAvatarUrl,
+        bannerUrl: mapping.lastMirroredBannerUrl,
+      },
+    });
+
+    Object.assign(mapping, applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result));
+    await persistProfileSyncResult(mapping.id, sourceTwitterUsername, result);
+
+    if (result.skipped) {
+      console.log(`${logPrefix} 🪞 Profile sync skipped (no Twitter profile changes).`);
+      return;
+    }
+
+    if (result.warnings.length > 0) {
+      console.warn(`${logPrefix} ⚠️ Profile sync completed with ${result.warnings.length} warning(s).`);
+      return;
+    }
+
+    console.log(`${logPrefix} ✅ Profile sync completed.`);
+  } catch (error) {
+    console.error(`${logPrefix} ❌ Automatic profile sync failed: ${describeError(error)}`);
+  }
+}
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
   let timeoutHandle: NodeJS.Timeout | undefined;
@@ -2238,6 +2353,8 @@ async function runAccountTask(mapping: AccountMapping, backfillRequest?: Pending
             console.error(`${logPrefix} ❌ Error checking @${twitterUsername}: ${describeError(err)}`);
           }
         }
+
+        await maybeSyncMappingProfileInBackground(mapping, dryRun, logPrefix);
       }
     } catch (err) {
       sourceErrors += 1;

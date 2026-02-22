@@ -16,26 +16,36 @@ If `./update.sh` fails with "Pulling is not possible because you have unmerged f
    ./update.sh
    ```
 
-### PM2 "MODULE_NOT_FOUND" Error
-If you see errors about `npm` not being found in the logs after an update:
+### PM2 interpreter mismatch
+If PM2 logs show command/runtime errors after an update (for example old `npm`/`node` interpreter paths):
 
 1. Run the repair script:
    ```bash
    chmod +x repair_pm2.sh
-   ./repair_pm2.sh
+    ./repair_pm2.sh
+    ```
+
+### `bun: command not found`
+If Bun is missing on a source install host:
+
+1. Run either installer/updater once (they auto-install and auto-upgrade Bun to latest stable):
+   ```bash
+   ./install.sh --no-start
+   # or
+   ./update.sh --no-restart
    ```
 
-### `better-sqlite3` NODE_MODULE_VERSION mismatch
-If startup fails with `ERR_DLOPEN_FAILED` and a `NODE_MODULE_VERSION` mismatch:
+### Native module load failure (`ERR_DLOPEN_FAILED`)
+If startup fails while loading native dependencies:
 
-1. Rebuild native bindings for your active Node version:
+1. Reinstall/rebuild native dependencies with Bun:
    ```bash
-   npm run rebuild:native
+   bun run rebuild:native
    ```
 2. Rebuild and start:
    ```bash
-   npm run build
-   npm start
+   bun run build
+   bun run start
    ```
 
 ### Dashboard appears unstyled / plain text UI
@@ -43,19 +53,19 @@ If the app loads but looks mostly unstyled:
 
 1. Rebuild web assets:
    ```bash
-   npm run build
+   bun run build
    ```
 2. Restart server:
    ```bash
-   npm start
+   bun run start
    ```
 3. Hard refresh browser cache (`Cmd+Shift+R` on macOS).
 
 ### CLI command not recognized
-When using npm scripts, pass CLI args after `--`:
+When using Bun scripts, pass CLI args after `--`:
 
 ```bash
-npm run cli -- status
+bun run cli -- status
 ```
 
 ### Docker: permissions writing `/app/data`

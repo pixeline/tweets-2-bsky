@@ -2,13 +2,6 @@
 
 set -euo pipefail
 
-echo "🔧 Repairing PM2 process environment..."
-
-if ! command -v pm2 >/dev/null 2>&1; then
-  echo "❌ PM2 is not installed or not on PATH."
-  exit 1
-fi
-
 resolve_bun_bin() {
   if command -v bun >/dev/null 2>&1; then
     command -v bun
@@ -40,6 +33,7 @@ install_latest_bun() {
 }
 
 BUN_BIN="$(resolve_bun_bin || true)"
+
 if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
   echo "📦 Bun not found. Installing latest Bun..."
   install_latest_bun
@@ -48,6 +42,7 @@ fi
 
 if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
   echo "❌ Bun could not be resolved after install."
+  echo "   Install Bun manually: https://bun.com/docs/installation"
   exit 1
 fi
 
@@ -59,22 +54,14 @@ fi
 
 if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
   echo "❌ Bun could not be resolved after auto-upgrade."
+  echo "   Install Bun manually: https://bun.com/docs/installation"
   exit 1
 fi
 
-PROCESS_NAME="tweets-2-bsky"
-if pm2 describe "twitter-mirror" >/dev/null 2>&1; then
-  PROCESS_NAME="twitter-mirror"
+bun_major="$($BUN_BIN --version | awk -F. '{print $1}' 2>/dev/null || echo 0)"
+if [[ "$bun_major" -lt 1 ]]; then
+  echo "❌ Bun 1.x+ is required. Current: $($BUN_BIN --version 2>/dev/null || echo 'unknown')"
+  exit 1
 fi
 
-echo "Found process: $PROCESS_NAME"
-echo "Deleting process..."
-pm2 delete "$PROCESS_NAME" || true
-
-echo "Starting process with fresh environment using Bun interpreter..."
-pm2 start dist/index.js --name "$PROCESS_NAME" --interpreter "$BUN_BIN"
-
-echo "Saving PM2 list..."
-pm2 save
-
-echo "✅ Repair complete."
+echo "✅ Bun $($BUN_BIN --version) ready"

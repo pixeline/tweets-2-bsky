@@ -23,6 +23,8 @@ import {
 import { dbService } from './db.js';
 import type { ProcessedTweet } from './db.js';
 import {
+  applyProfileMirrorSyncState,
+  bridgeBlueskyAccountToFediverse,
   fetchTwitterMirrorProfile,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
@@ -120,6 +122,8 @@ interface BskyProfileView {
   handle?: string;
   displayName?: string;
   avatar?: string;
+  description?: string;
+  createdAt?: string;
 }
 
 interface EnrichedPostMedia {
@@ -605,6 +609,8 @@ async function fetchProfilesByActor(actors: string[]): Promise<Record<string, Bs
         handle: typeof profile?.handle === 'string' ? profile.handle : undefined,
         displayName: typeof profile?.displayName === 'string' ? profile.displayName : undefined,
         avatar: typeof profile?.avatar === 'string' ? profile.avatar : undefined,
+        description: typeof profile?.description === 'string' ? profile.description : undefined,
+        createdAt: typeof profile?.createdAt === 'string' ? profile.createdAt : undefined,
       };
 
       const keys = [
@@ -1037,6 +1043,44 @@ const parseTwitterUsernames = (value: unknown): string[] => {
 
   return usernames;
 };
+
+const resolveProfileSyncSourceUsername = (args: {
+  twitterUsernames: string[];
+  requestedSource?: unknown;
+  fallbackSource?: string;
+}): string | undefined => {
+  const twitterUsernames = args.twitterUsernames.map(normalizeActor).filter((username) => username.length > 0);
+  if (twitterUsernames.length === 0) {
+    return undefined;
+  }
+
+  const normalizedRequested =
+    args.requestedSource !== undefined ? normalizeActor(String(args.requestedSource || '')) : undefined;
+  const normalizedFallback = normalizeActor(args.fallbackSource || '');
+
+  let resolved = normalizedRequested;
+  if (!resolved && normalizedFallback && twitterUsernames.includes(normalizedFallback)) {
+    resolved = normalizedFallback;
+  }
+
+  if (resolved && twitterUsernames.includes(resolved)) {
+    return resolved;
+  }
+
+  if (twitterUsernames.length === 1) {
+    return twitterUsernames[0];
+  }
+
+  return undefined;
+};
+
+const getMappingMirrorSyncState = (mapping: AccountMapping) => ({
+  sourceUsername: mapping.profileSyncSourceUsername,
+  mirroredDisplayName: mapping.lastMirroredDisplayName,
+  mirroredDescription: mapping.lastMirroredDescription,
+  avatarUrl: mapping.lastMirroredAvatarUrl,
+  bannerUrl: mapping.lastMirroredBannerUrl,
+});
 
 const getAccessibleGroups = (config: AppConfig, user: AuthenticatedUser) => {
   const allGroups = Array.isArray(config.groups)
@@ -1908,6 +1952,17 @@ app.post('/api/mappings', authenticateToken, (req: any, res) => {
     (ownerUser ? getUserPublicLabel(ownerUser) : getActorPublicLabel(req.user));
   const normalizedGroupName = normalizeGroupName(req.body?.groupName);
   const normalizedGroupEmoji = normalizeGroupEmoji(req.body?.groupEmoji);
+  const profileSyncSourceUsername = resolveProfileSyncSourceUsername({
+    twitterUsernames,
+    requestedSource: req.body?.profileSyncSourceUsername,
+  });
+
+  if (twitterUsernames.length > 1 && !profileSyncSourceUsername) {
+    res.status(400).json({
+      error: 'Select which Twitter source should drive Bluesky profile sync for multi-source mappings.',
+    });
+    return;
+  }
 
   const newMapping: AccountMapping = {
     id: randomUUID(),
@@ -1920,6 +1975,7 @@ app.post('/api/mappings', authenticateToken, (req: any, res) => {
     groupName: normalizedGroupName || undefined,
     groupEmoji: normalizedGroupEmoji || undefined,
     createdByUserId,
+    profileSyncSourceUsername,
   };
 
   ensureGroupExists(config, normalizedGroupName, normalizedGroupEmoji);
@@ -1997,6 +2053,21 @@ app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
       ? normalizeOptionalString(req.body?.owner) || existingMapping.owner
       : existingMapping.owner || (ownerUser ? getUserPublicLabel(ownerUser) : undefined);
 
+  const profileSyncSourceUsername = resolveProfileSyncSourceUsername({
+    twitterUsernames,
+    requestedSource: req.body?.profileSyncSourceUsername,
+    fallbackSource: existingMapping.profileSyncSourceUsername,
+  });
+  const sourceWasExplicitlyProvided = req.body?.profileSyncSourceUsername !== undefined;
+  const usernamesWereUpdated = req.body?.twitterUsernames !== undefined;
+
+  if (twitterUsernames.length > 1 && !profileSyncSourceUsername && (sourceWasExplicitlyProvided || usernamesWereUpdated)) {
+    res.status(400).json({
+      error: 'Select which Twitter source should drive Bluesky profile sync for multi-source mappings.',
+    });
+    return;
+  }
+
   const updatedMapping: AccountMapping = {
     ...existingMapping,
     twitterUsernames,
@@ -2007,6 +2078,7 @@ app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
     groupName: nextGroupName,
     groupEmoji: nextGroupEmoji,
     createdByUserId,
+    profileSyncSourceUsername,
   };
 
   ensureGroupExists(config, nextGroupName, nextGroupEmoji);
@@ -2018,9 +2090,10 @@ app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
 app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async (req: any, res) => {
   const { id } = req.params;
   const config = getConfig();
-  const mapping = config.mappings.find((entry) => entry.id === id);
+  const mappingIndex = config.mappings.findIndex((entry) => entry.id === id);
+  const mapping = config.mappings[mappingIndex];
 
-  if (!mapping) {
+  if (mappingIndex === -1 || !mapping) {
     res.status(404).json({ error: 'Mapping not found' });
     return;
   }
@@ -2030,17 +2103,20 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
     return;
   }
 
-  const requestedSource = normalizeActor(req.body?.sourceTwitterUsername || '');
-  if (
-    requestedSource &&
-    !mapping.twitterUsernames.some((username) => normalizeActor(username) === normalizeActor(requestedSource))
-  ) {
-    res.status(400).json({ error: 'Selected Twitter source is not part of this mapping.' });
-    return;
-  }
+  const sourceTwitterUsername = resolveProfileSyncSourceUsername({
+    twitterUsernames: mapping.twitterUsernames,
+    requestedSource: req.body?.sourceTwitterUsername,
+    fallbackSource: mapping.profileSyncSourceUsername,
+  });
 
-  const sourceTwitterUsername = requestedSource || mapping.twitterUsernames[0];
   if (!sourceTwitterUsername) {
+    if (mapping.twitterUsernames.length > 1) {
+      res.status(400).json({
+        error: 'Select a profile sync source username before syncing this multi-source mapping.',
+      });
+      return;
+    }
+
     res.status(400).json({ error: 'Mapping has no Twitter source usernames.' });
     return;
   }
@@ -2051,10 +2127,15 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
       bskyIdentifier: mapping.bskyIdentifier,
       bskyPassword: mapping.bskyPassword,
       bskyServiceUrl: mapping.bskyServiceUrl,
+      previousSync: getMappingMirrorSyncState(mapping),
     });
 
+    const updatedMapping = applyProfileMirrorSyncState(mapping, sourceTwitterUsername, result);
+    config.mappings[mappingIndex] = updatedMapping;
+    saveConfig(config);
+
     for (const key of [
-      normalizeActor(mapping.bskyIdentifier),
+      normalizeActor(updatedMapping.bskyIdentifier),
       normalizeActor(result.bsky.handle),
       normalizeActor(result.bsky.did),
     ]) {
@@ -2063,9 +2144,41 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
       }
     }
 
-    res.json({ success: true, ...result });
+    res.json({
+      success: true,
+      sourceTwitterUsername,
+      mapping: sanitizeMapping(updatedMapping, createUserLookupById(config), req.user),
+      ...result,
+    });
   } catch (error) {
     res.status(400).json({ error: getErrorMessage(error, 'Failed to sync Bluesky profile from Twitter.') });
+  }
+});
+
+app.post('/api/mappings/:id/bridge-to-fediverse', authenticateToken, async (req: any, res) => {
+  const { id } = req.params;
+  const config = getConfig();
+  const mapping = config.mappings.find((entry) => entry.id === id);
+
+  if (!mapping) {
+    res.status(404).json({ error: 'Mapping not found' });
+    return;
+  }
+
+  if (!canManageMapping(req.user, mapping)) {
+    res.status(403).json({ error: 'You do not have permission to bridge this mapping.' });
+    return;
+  }
+
+  try {
+    const result = await bridgeBlueskyAccountToFediverse({
+      bskyIdentifier: mapping.bskyIdentifier,
+      bskyPassword: mapping.bskyPassword,
+      bskyServiceUrl: mapping.bskyServiceUrl,
+    });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(400).json({ error: getErrorMessage(error, 'Failed to bridge account to the fediverse.') });
   }
 });
 

@@ -42,7 +42,7 @@ If port `3000` is already in use, change only the first port (example: `-p 3001:
 
 ```bash
 docker logs -f tweets-2-bsky
-docker exec -it tweets-2-bsky node dist/cli.js status
+docker exec -it tweets-2-bsky bun dist/cli.js status
 docker stop tweets-2-bsky
 docker start tweets-2-bsky
 ```
@@ -83,6 +83,8 @@ chmod +x install.sh
 
 What this does by default:
 
+- auto-installs Bun (latest stable for your platform) when missing
+- auto-upgrades Bun to latest stable before install/build
 - installs dependencies
 - builds server + web dashboard
 - creates/updates `.env` with sensible defaults (`PORT=3000`, generated `JWT_SECRET` if missing)
@@ -190,9 +192,9 @@ Note: inside the container, `/app/config.json` is linked to `/app/data/config.js
 You can run CLI commands without leaving Docker:
 
 ```bash
-docker exec -it tweets-2-bsky node dist/cli.js status
-docker exec -it tweets-2-bsky node dist/cli.js run-now
-docker exec -it tweets-2-bsky node dist/cli.js list
+docker exec -it tweets-2-bsky bun dist/cli.js status
+docker exec -it tweets-2-bsky bun dist/cli.js run-now
+docker exec -it tweets-2-bsky bun dist/cli.js list
 ```
 
 ### 6) Updating Docker deployments
@@ -338,8 +340,7 @@ Recommended runtime:
 
 If running from source instead of Docker:
 
-- Node.js 22+
-- npm
+- Bun 1.x+ (auto-installed/upgraded by `install.sh` and `update.sh`)
 - git
 
 Optional but recommended for source installs:
@@ -355,9 +356,9 @@ Optional but recommended for source installs:
 ```bash
 git clone https://github.com/j4ckxyz/tweets-2-bsky
 cd tweets-2-bsky
-npm install
-npm run build
-npm start
+bun install
+bun run build
+bun run start
 ```
 
 Open: [http://localhost:3000](http://localhost:3000)
@@ -376,19 +377,19 @@ JWT_SECRET=replace-with-a-strong-random-secret
 EOF
 ```
 
-### Rebuild native modules after Node version changes
+### Rebuild native modules
 
 ```bash
-npm run rebuild:native
-npm run build
+bun run rebuild:native
+bun run build
 ```
 
 ## First-Time Setup via CLI (Alternative to Web Forms)
 
 ```bash
-npm run cli -- setup-twitter
-npm run cli -- add-mapping
-npm run cli -- run-now
+bun run cli -- setup-twitter
+bun run cli -- add-mapping
+bun run cli -- run-now
 ```
 
 `add-mapping` now runs a guided onboarding flow:
@@ -403,61 +404,61 @@ npm run cli -- run-now
 Always invoke CLI commands as:
 
 ```bash
-npm run cli -- <command>
+bun run cli -- <command>
 ```
 
 ### Status and basic operations
 
 ```bash
-npm run cli -- status
-npm run cli -- list
-npm run cli -- recent-activity --limit 20
+bun run cli -- status
+bun run cli -- list
+bun run cli -- recent-activity --limit 20
 ```
 
 ### Credentials and configuration
 
 ```bash
-npm run cli -- setup-twitter
-npm run cli -- setup-ai
-npm run cli -- set-interval 5
+bun run cli -- setup-twitter
+bun run cli -- setup-ai
+bun run cli -- set-interval 5
 ```
 
 ### Mapping management
 
 ```bash
-npm run cli -- add-mapping
-npm run cli -- sync-profile <mapping-id-or-handle> --source <twitter-username>
-npm run cli -- edit-mapping <mapping-id-or-handle>
-npm run cli -- remove <mapping-id-or-handle>
+bun run cli -- add-mapping
+bun run cli -- sync-profile <mapping-id-or-handle> --source <twitter-username>
+bun run cli -- edit-mapping <mapping-id-or-handle>
+bun run cli -- remove <mapping-id-or-handle>
 ```
 
 ### Running syncs
 
 ```bash
-npm run cli -- run-now
-npm run cli -- run-now --dry-run
-npm run cli -- run-now --web
+bun run cli -- run-now
+bun run cli -- run-now --dry-run
+bun run cli -- run-now --web
 ```
 
 ### Backfill and history import
 
 ```bash
-npm run cli -- backfill <mapping-id-or-handle> --limit 50
-npm run cli -- import-history <mapping-id-or-handle> --limit 100
-npm run cli -- clear-cache <mapping-id-or-handle>
+bun run cli -- backfill <mapping-id-or-handle> --limit 50
+bun run cli -- import-history <mapping-id-or-handle> --limit 100
+bun run cli -- clear-cache <mapping-id-or-handle>
 ```
 
 ### Dangerous operation (admin workflow)
 
 ```bash
-npm run cli -- delete-all-posts <mapping-id-or-handle>
+bun run cli -- delete-all-posts <mapping-id-or-handle>
 ```
 
 ### Config export/import
 
 ```bash
-npm run cli -- config-export ./tweets-2-bsky-config.json
-npm run cli -- config-import ./tweets-2-bsky-config.json
+bun run cli -- config-export ./tweets-2-bsky-config.json
+bun run cli -- config-import ./tweets-2-bsky-config.json
 ```
 
 Mapping references accept:
@@ -471,13 +472,13 @@ Mapping references accept:
 Run every 5 minutes:
 
 ```cron
-*/5 * * * * cd /path/to/tweets-2-bsky && /usr/bin/npm run cli -- run-now >> /tmp/tweets-2-bsky.log 2>&1
+*/5 * * * * cd /path/to/tweets-2-bsky && /usr/local/bin/bun run cli -- run-now >> /tmp/tweets-2-bsky.log 2>&1
 ```
 
 Run one backfill once:
 
 ```bash
-npm run cli -- backfill <mapping-id-or-handle> --limit 50
+bun run cli -- backfill <mapping-id-or-handle> --limit 50
 ```
 
 ## Background Runtime Options
@@ -493,7 +494,7 @@ npm run cli -- backfill <mapping-id-or-handle> --limit 50
 ### Option B: manage PM2 directly
 
 ```bash
-pm2 start dist/index.js --name tweets-2-bsky
+pm2 start dist/index.js --name tweets-2-bsky --interpreter bun
 pm2 logs tweets-2-bsky
 pm2 restart tweets-2-bsky --update-env
 pm2 save
@@ -503,7 +504,7 @@ pm2 save
 
 ```bash
 mkdir -p data/runtime
-nohup npm start > data/runtime/tweets-2-bsky.log 2>&1 &
+nohup bun run start > data/runtime/tweets-2-bsky.log 2>&1 &
 echo $! > data/runtime/tweets-2-bsky.pid
 ```
 
@@ -525,8 +526,9 @@ Use:
 
 - stashes local uncommitted changes before pull and restores them after update
 - pulls latest code (supports non-`origin` remotes and detached-head recovery)
+- ensures Bun is installed and upgraded to latest stable
 - installs dependencies
-- rebuilds native modules when Node ABI changed
+- rebuilds native modules when runtime/dependencies changed
 - builds server + web dashboard
 - restarts existing runtime for PM2 **or** nohup mode
 - preserves local `config.json` and `.env` with backup/restore
@@ -584,33 +586,33 @@ Security notes:
 ### Start backend/scheduler from source
 
 ```bash
-npm run dev
+bun run dev
 ```
 
 ### Start Vite web dev server
 
 ```bash
-npm run dev:web
+bun run dev:web
 ```
 
 ### Build and quality checks
 
 ```bash
-npm run build
-npm run typecheck
-npm run lint
+bun run build
+bun run typecheck
+bun run lint
 ```
 
 ## Troubleshooting
 
 See: `TROUBLESHOOTING.md`
 
-Common recovery after changing Node versions:
+Common recovery when native modules fail to load:
 
 ```bash
-npm run rebuild:native
-npm run build
-npm start
+bun run rebuild:native
+bun run build
+bun run start
 ```
 
 ## License

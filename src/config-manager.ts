@@ -55,6 +55,12 @@ export interface AccountMapping {
   groupName?: string;
   groupEmoji?: string;
   createdByUserId?: string;
+  profileSyncSourceUsername?: string;
+  lastProfileSyncAt?: string;
+  lastMirroredDisplayName?: string;
+  lastMirroredDescription?: string;
+  lastMirroredAvatarUrl?: string;
+  lastMirroredBannerUrl?: string;
 }
 
 export interface AccountGroup {
@@ -136,6 +142,20 @@ const normalizeBoolean = (value: unknown, fallback: boolean): boolean => {
     return value;
   }
   return fallback;
+};
+
+const normalizeIsoDateString = (value: unknown): string | undefined => {
+  const normalized = normalizeString(value);
+  if (!normalized) {
+    return undefined;
+  }
+
+  const parsed = Date.parse(normalized);
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+
+  return new Date(parsed).toISOString();
 };
 
 const normalizeUserPermissions = (value: unknown, role: UserRole): UserPermissions => {
@@ -269,6 +289,13 @@ const normalizeMapping = (rawMapping: unknown, users: WebUser[], adminUserId?: s
 
   const owner = normalizeString(record.owner);
   const usernames = normalizeTwitterUsernames(record.twitterUsernames, record.twitterUsername);
+  const profileSyncSourceUsername = normalizeUsername(record.profileSyncSourceUsername);
+  const resolvedProfileSyncSource =
+    profileSyncSourceUsername && usernames.includes(profileSyncSourceUsername)
+      ? profileSyncSourceUsername
+      : usernames.length === 1
+        ? usernames[0]
+        : undefined;
   const explicitCreator = normalizeString(record.createdByUserId) ?? normalizeString(record.ownerUserId);
   const explicitCreatorExists = explicitCreator && users.some((user) => user.id === explicitCreator);
 
@@ -282,6 +309,12 @@ const normalizeMapping = (rawMapping: unknown, users: WebUser[], adminUserId?: s
     owner,
     groupName: normalizeString(record.groupName),
     groupEmoji: normalizeString(record.groupEmoji),
+    profileSyncSourceUsername: resolvedProfileSyncSource,
+    lastProfileSyncAt: normalizeIsoDateString(record.lastProfileSyncAt),
+    lastMirroredDisplayName: normalizeString(record.lastMirroredDisplayName),
+    lastMirroredDescription: normalizeString(record.lastMirroredDescription),
+    lastMirroredAvatarUrl: normalizeString(record.lastMirroredAvatarUrl),
+    lastMirroredBannerUrl: normalizeString(record.lastMirroredBannerUrl),
     createdByUserId:
       (explicitCreatorExists ? explicitCreator : undefined) ?? matchOwnerToUserId(owner, users) ?? adminUserId,
   };

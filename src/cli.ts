@@ -16,6 +16,7 @@ import {
 } from './config-manager.js';
 import { dbService } from './db.js';
 import {
+  applyProfileMirrorSyncState,
   fetchTwitterMirrorProfile,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
@@ -92,18 +93,13 @@ const runCoreCommand = async (args: string[]): Promise<void> => {
     return;
   }
 
-  const tsxBin =
-    process.platform === 'win32'
-      ? path.join(ROOT_DIR, 'node_modules', '.bin', 'tsx.cmd')
-      : path.join(ROOT_DIR, 'node_modules', '.bin', 'tsx');
-
   const sourceEntry = path.join(ROOT_DIR, 'src', 'index.ts');
-  if (fs.existsSync(tsxBin) && fs.existsSync(sourceEntry)) {
-    await spawnAndWait(tsxBin, [sourceEntry, ...args], ROOT_DIR);
+  if (fs.existsSync(sourceEntry)) {
+    await spawnAndWait(process.execPath, [sourceEntry, ...args], ROOT_DIR);
     return;
   }
 
-  throw new Error('Could not find dist/index.js or tsx runtime. Run npm run build first.');
+  throw new Error('Could not find dist/index.js or source runtime entry. Run bun run build first.');
 };
 
 const ensureMapping = async (mappingRef?: string): Promise<AccountMapping | null> => {
@@ -409,6 +405,7 @@ program
       bskyServiceUrl: bskyAnswers.bskyServiceUrl,
       groupName: metadataAnswers.groupName?.trim() || undefined,
       groupEmoji: metadataAnswers.groupEmoji?.trim() || undefined,
+      profileSyncSourceUsername: normalizeHandle(metadataAnswers.mirrorSourceUsername || usernames[0] || ''),
     });
 
     const latestConfig = getConfig();
@@ -436,8 +433,33 @@ program
         bskyIdentifier: createdMapping.bskyIdentifier,
         bskyPassword: createdMapping.bskyPassword,
         bskyServiceUrl: createdMapping.bskyServiceUrl,
+        previousSync: {
+          sourceUsername: createdMapping.profileSyncSourceUsername,
+          mirroredDisplayName: createdMapping.lastMirroredDisplayName,
+          mirroredDescription: createdMapping.lastMirroredDescription,
+          avatarUrl: createdMapping.lastMirroredAvatarUrl,
+          bannerUrl: createdMapping.lastMirroredBannerUrl,
+        },
       });
+
+      const syncedConfig = getConfig();
+      const syncedIndex = syncedConfig.mappings.findIndex((entry) => entry.id === createdMapping.id);
+      if (syncedIndex !== -1) {
+        const current = syncedConfig.mappings[syncedIndex];
+        if (current) {
+          syncedConfig.mappings[syncedIndex] = applyProfileMirrorSyncState(
+            current,
+            metadataAnswers.mirrorSourceUsername,
+            syncResult,
+          );
+          saveConfig(syncedConfig);
+        }
+      }
+
       console.log('Mapping added successfully. Bluesky profile mirror sync completed.');
+      if (syncResult.skipped) {
+        console.log('No profile updates were required (Twitter profile is unchanged).');
+      }
       if (syncResult.warnings.length > 0) {
         console.log('Profile sync warnings:');
         for (const warning of syncResult.warnings) {
@@ -447,7 +469,7 @@ program
     } catch (error) {
       console.log('Mapping added successfully, but automatic profile sync failed.');
       console.log(`Reason: ${error instanceof Error ? error.message : String(error)}`);
-      console.log('Run `npm run cli -- sync-profile` later to retry.');
+      console.log('Run `bun run cli -- sync-profile` later to retry.');
     }
   });
 
@@ -459,16 +481,24 @@ program
     const mapping = await ensureMapping(mappingRef);
     if (!mapping) return;
 
+    const availableSources = mapping.twitterUsernames.map(normalizeHandle).filter((username) => username.length > 0);
     const requestedSource = options?.source ? normalizeHandle(options.source) : '';
-    if (
-      requestedSource &&
-      !mapping.twitterUsernames.some((username) => normalizeHandle(username) === normalizeHandle(requestedSource))
-    ) {
+    if (requestedSource && !availableSources.includes(requestedSource)) {
       console.log(`@${requestedSource} is not part of the selected mapping.`);
       return;
     }
 
-    const sourceTwitterUsername = requestedSource || mapping.twitterUsernames[0];
+    const storedSource = normalizeHandle(mapping.profileSyncSourceUsername || '');
+    const sourceTwitterUsername =
+      requestedSource ||
+      (storedSource && availableSources.includes(storedSource) ? storedSource : '') ||
+      (availableSources.length === 1 ? availableSources[0] : '');
+
+    if (!sourceTwitterUsername && availableSources.length > 1) {
+      console.log('This mapping has multiple Twitter sources. Set profileSyncSourceUsername first with edit-mapping.');
+      return;
+    }
+
     if (!sourceTwitterUsername) {
       console.log('Mapping has no Twitter source usernames.');
       return;
@@ -480,9 +510,29 @@ program
         bskyIdentifier: mapping.bskyIdentifier,
         bskyPassword: mapping.bskyPassword,
         bskyServiceUrl: mapping.bskyServiceUrl,
+        previousSync: {
+          sourceUsername: mapping.profileSyncSourceUsername,
+          mirroredDisplayName: mapping.lastMirroredDisplayName,
+          mirroredDescription: mapping.lastMirroredDescription,
+          avatarUrl: mapping.lastMirroredAvatarUrl,
+          bannerUrl: mapping.lastMirroredBannerUrl,
+        },
       });
 
+      const config = getConfig();
+      const index = config.mappings.findIndex((entry) => entry.id === mapping.id);
+      if (index !== -1) {
+        const current = config.mappings[index];
+        if (current) {
+          config.mappings[index] = applyProfileMirrorSyncState(current, sourceTwitterUsername, result);
+          saveConfig(config);
+        }
+      }
+
       console.log(`Profile sync completed for ${mapping.bskyIdentifier} from @${result.twitterProfile.username}.`);
+      if (result.skipped) {
+        console.log('No profile updates needed (Twitter profile is unchanged).');
+      }
       if (result.warnings.length > 0) {
         console.log('Warnings:');
         for (const warning of result.warnings) {
@@ -549,7 +599,35 @@ program
     const usernames = answers.twitterUsernames
       .split(',')
       .map((username: string) => username.trim())
+      .map((username: string) => normalizeHandle(username))
       .filter((username: string) => username.length > 0);
+
+    if (usernames.length === 0) {
+      console.log('Please provide at least one Twitter username.');
+      return;
+    }
+
+    let profileSyncSourceUsername = normalizeHandle(mapping.profileSyncSourceUsername || '');
+    if (usernames.length === 1) {
+      profileSyncSourceUsername = usernames[0] || '';
+    } else {
+      const currentSource = usernames.includes(profileSyncSourceUsername)
+        ? profileSyncSourceUsername
+        : usernames[0] || '';
+      const sourceAnswer = await inquirer.prompt([
+        {
+          type: 'list',
+          name: 'profileSyncSourceUsername',
+          message: 'Use which Twitter source for profile syncing?',
+          choices: usernames.map((username: string) => ({
+            name: `@${username}`,
+            value: username,
+          })),
+          default: currentSource,
+        },
+      ]);
+      profileSyncSourceUsername = normalizeHandle(String(sourceAnswer.profileSyncSourceUsername || ''));
+    }
 
     const index = config.mappings.findIndex((entry) => entry.id === mapping.id);
     if (index === -1) return;
@@ -565,6 +643,7 @@ program
       bskyServiceUrl: answers.bskyServiceUrl,
       groupName: answers.groupName?.trim() || undefined,
       groupEmoji: answers.groupEmoji?.trim() || undefined,
+      profileSyncSourceUsername: profileSyncSourceUsername || undefined,
     };
 
     if (answers.bskyPassword && answers.bskyPassword.trim().length > 0) {
@@ -591,6 +670,7 @@ program
         id: mapping.id,
         owner: mapping.owner || 'System',
         twitter: mapping.twitterUsernames.join(', '),
+        profileSyncSource: mapping.profileSyncSourceUsername || '--',
         bsky: mapping.bskyIdentifier,
         group: `${mapping.groupEmoji || '📁'} ${mapping.groupName || 'Ungrouped'}`,
         enabled: mapping.enabled,

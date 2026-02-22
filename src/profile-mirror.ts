@@ -1,4 +1,4 @@
-import { BskyAgent } from '@atproto/api';
+import { BskyAgent, RichText } from '@atproto/api';
 import type { BlobRef } from '@atproto/api';
 import { Scraper, type Profile as TwitterProfile } from '@the-convocation/twitter-scraper';
 import axios from 'axios';
@@ -9,7 +9,13 @@ const PROFILE_IMAGE_MAX_BYTES = 1_000_000;
 const PROFILE_IMAGE_TARGET_BYTES = 950 * 1024;
 const DEFAULT_BSKY_SERVICE_URL = 'https://bsky.social';
 const BSKY_SETTINGS_URL = 'https://bsky.app/settings/account';
+const BSKY_PUBLIC_APPVIEW_URL = (process.env.BSKY_PUBLIC_APPVIEW_URL || 'https://public.api.bsky.app').replace(
+  /\/$/,
+  '',
+);
 const MIRROR_SUFFIX = '{UNOFFICIAL}';
+const FEDIVERSE_BRIDGE_HANDLE = 'ap.brid.gy';
+const MIN_BRIDGE_ACCOUNT_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 type ProfileImageKind = 'avatar' | 'banner';
 
@@ -49,7 +55,42 @@ export interface MirrorProfileSyncResult {
   bsky: BlueskyCredentialValidation;
   avatarSynced: boolean;
   bannerSynced: boolean;
+  skipped: boolean;
+  changed: {
+    displayName: boolean;
+    description: boolean;
+    avatar: boolean;
+    banner: boolean;
+  };
   warnings: string[];
+}
+
+export interface ProfileMirrorSyncState {
+  sourceUsername?: string;
+  mirroredDisplayName?: string;
+  mirroredDescription?: string;
+  avatarUrl?: string;
+  bannerUrl?: string;
+}
+
+export interface MappingProfileSyncState {
+  profileSyncSourceUsername?: string;
+  lastProfileSyncAt?: string;
+  lastMirroredDisplayName?: string;
+  lastMirroredDescription?: string;
+  lastMirroredAvatarUrl?: string;
+  lastMirroredBannerUrl?: string;
+}
+
+export interface FediverseBridgeResult {
+  bsky: BlueskyCredentialValidation;
+  bridgedAccountHandle: string;
+  fediverseAddress: string;
+  accountCreatedAt: string;
+  ageDays: number;
+  followedBridgeAccount: boolean;
+  announcementUri: string;
+  announcementCid: string;
 }
 
 const normalizeTwitterUsername = (value: string) => value.trim().replace(/^@/, '').toLowerCase();
@@ -58,6 +99,36 @@ const normalizeOptionalString = (value: unknown): string | undefined => {
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const normalizeMirrorStateUrl = (value?: string): string | undefined => normalizeOptionalString(value);
+
+const toNormalizedMirrorState = (state?: ProfileMirrorSyncState) => ({
+  sourceUsername: normalizeTwitterUsername(state?.sourceUsername || ''),
+  mirroredDisplayName: normalizeOptionalString(state?.mirroredDisplayName),
+  mirroredDescription: normalizeOptionalString(state?.mirroredDescription),
+  avatarUrl: normalizeMirrorStateUrl(state?.avatarUrl),
+  bannerUrl: normalizeMirrorStateUrl(state?.bannerUrl),
+});
+
+const buildMirrorStateFromTwitterProfile = (twitterProfile: TwitterMirrorProfile): ProfileMirrorSyncState => ({
+  sourceUsername: normalizeTwitterUsername(twitterProfile.username),
+  mirroredDisplayName: twitterProfile.mirroredDisplayName,
+  mirroredDescription: twitterProfile.mirroredDescription,
+  avatarUrl: normalizeMirrorStateUrl(twitterProfile.avatarUrl),
+  bannerUrl: normalizeMirrorStateUrl(twitterProfile.bannerUrl),
+});
+
+const hasMirrorStateChanges = (previous: ProfileMirrorSyncState | undefined, next: ProfileMirrorSyncState) => {
+  const normalizedPrevious = toNormalizedMirrorState(previous);
+  const normalizedNext = toNormalizedMirrorState(next);
+
+  return {
+    displayName: normalizedPrevious.mirroredDisplayName !== normalizedNext.mirroredDisplayName,
+    description: normalizedPrevious.mirroredDescription !== normalizedNext.mirroredDescription,
+    avatar: normalizedPrevious.avatarUrl !== normalizedNext.avatarUrl,
+    banner: normalizedPrevious.bannerUrl !== normalizedNext.bannerUrl,
+  };
 };
 
 const normalizeBskyServiceUrl = (value?: string): string => {
@@ -345,6 +416,92 @@ export const validateBlueskyCredentials = async (args: {
   };
 };
 
+export const applyProfileMirrorSyncState = <T extends MappingProfileSyncState>(
+  mapping: T,
+  sourceTwitterUsername: string,
+  result: MirrorProfileSyncResult,
+): T => {
+  const normalizedSource = normalizeTwitterUsername(sourceTwitterUsername);
+  const next: T = {
+    ...mapping,
+    profileSyncSourceUsername: normalizedSource || mapping.profileSyncSourceUsername,
+    lastProfileSyncAt: new Date().toISOString(),
+    lastMirroredDisplayName: result.twitterProfile.mirroredDisplayName,
+    lastMirroredDescription: result.twitterProfile.mirroredDescription,
+  };
+
+  if (result.changed.avatar && result.avatarSynced) {
+    next.lastMirroredAvatarUrl = normalizeMirrorStateUrl(result.twitterProfile.avatarUrl);
+  }
+
+  if (result.changed.banner && result.bannerSynced) {
+    next.lastMirroredBannerUrl = normalizeMirrorStateUrl(result.twitterProfile.bannerUrl);
+  }
+
+  return next;
+};
+
+const fetchPublicProfile = async (actor: string): Promise<{ did: string; handle: string; createdAt?: string }> => {
+  const normalizedActor = normalizeOptionalString(actor);
+  if (!normalizedActor) {
+    throw new Error('Actor is required.');
+  }
+
+  const response = await axios.get(`${BSKY_PUBLIC_APPVIEW_URL}/xrpc/app.bsky.actor.getProfile`, {
+    params: {
+      actor: normalizedActor,
+    },
+    timeout: 15_000,
+  });
+
+  const did = normalizeOptionalString(response.data?.did);
+  const handle = normalizeOptionalString(response.data?.handle);
+  if (!did || !handle) {
+    throw new Error(`Could not resolve Bluesky profile for ${normalizedActor}.`);
+  }
+
+  return {
+    did,
+    handle,
+    createdAt: normalizeOptionalString(response.data?.createdAt),
+  };
+};
+
+const hasFollowRecordForDid = async (agent: BskyAgent, subjectDid: string): Promise<boolean> => {
+  const repo = agent.session?.did;
+  if (!repo) {
+    throw new Error('Missing Bluesky session DID.');
+  }
+
+  let cursor: string | undefined;
+  let pageCount = 0;
+
+  while (pageCount < 200) {
+    pageCount += 1;
+    const response = await agent.com.atproto.repo.listRecords({
+      repo,
+      collection: 'app.bsky.graph.follow',
+      limit: 100,
+      cursor,
+    });
+
+    const records = Array.isArray(response.data.records) ? response.data.records : [];
+    for (const record of records) {
+      const value = record.value as { subject?: string };
+      if (typeof value?.subject === 'string' && value.subject === subjectDid) {
+        return true;
+      }
+    }
+
+    cursor = response.data.cursor;
+    if (!cursor) {
+      break;
+    }
+  }
+
+  return false;
+};
+
 const uploadProfileImage = async (agent: BskyAgent, url: string, kind: ProfileImageKind): Promise<BlobRef> => {
   const response = await axios.get<ArrayBuffer>(url, {
     responseType: 'arraybuffer',
@@ -366,13 +523,28 @@ export const syncBlueskyProfileFromTwitter = async (args: {
   bskyIdentifier: string;
   bskyPassword: string;
   bskyServiceUrl?: string;
+  previousSync?: ProfileMirrorSyncState;
 }): Promise<MirrorProfileSyncResult> => {
   const twitterProfile = await fetchTwitterMirrorProfile(args.twitterUsername);
+  const nextMirrorState = buildMirrorStateFromTwitterProfile(twitterProfile);
+  const changed = hasMirrorStateChanges(args.previousSync, nextMirrorState);
   const bsky = await validateBlueskyCredentials({
     bskyIdentifier: args.bskyIdentifier,
     bskyPassword: args.bskyPassword,
     bskyServiceUrl: args.bskyServiceUrl,
   });
+
+  if (!changed.displayName && !changed.description && !changed.avatar && !changed.banner) {
+    return {
+      twitterProfile,
+      bsky,
+      avatarSynced: false,
+      bannerSynced: false,
+      skipped: true,
+      changed,
+      warnings: [],
+    };
+  }
 
   const agent = new BskyAgent({ service: bsky.serviceUrl });
   await agent.login({
@@ -384,39 +556,116 @@ export const syncBlueskyProfileFromTwitter = async (args: {
   let avatarBlob: BlobRef | undefined;
   let bannerBlob: BlobRef | undefined;
 
-  if (twitterProfile.avatarUrl) {
+  if (changed.avatar && twitterProfile.avatarUrl) {
     try {
       avatarBlob = await uploadProfileImage(agent, twitterProfile.avatarUrl, 'avatar');
     } catch (error) {
       warnings.push(`Avatar sync failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  } else {
+  } else if (changed.avatar) {
     warnings.push('No Twitter avatar found for this profile.');
   }
 
-  if (twitterProfile.bannerUrl) {
+  if (changed.banner && twitterProfile.bannerUrl) {
     try {
       bannerBlob = await uploadProfileImage(agent, twitterProfile.bannerUrl, 'banner');
     } catch (error) {
       warnings.push(`Banner sync failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  } else {
+  } else if (changed.banner) {
     warnings.push('No Twitter banner found for this profile.');
   }
 
-  await agent.upsertProfile((existing) => ({
-    ...(existing || {}),
-    displayName: twitterProfile.mirroredDisplayName,
-    description: twitterProfile.mirroredDescription,
-    ...(avatarBlob ? { avatar: avatarBlob } : {}),
-    ...(bannerBlob ? { banner: bannerBlob } : {}),
-  }));
+  const shouldUpdateProfile =
+    changed.displayName || changed.description || Boolean(avatarBlob) || Boolean(bannerBlob);
+
+  if (shouldUpdateProfile) {
+    await agent.upsertProfile((existing) => ({
+      ...(existing || {}),
+      ...(changed.displayName ? { displayName: twitterProfile.mirroredDisplayName } : {}),
+      ...(changed.description ? { description: twitterProfile.mirroredDescription } : {}),
+      ...(avatarBlob ? { avatar: avatarBlob } : {}),
+      ...(bannerBlob ? { banner: bannerBlob } : {}),
+    }));
+  }
 
   return {
     twitterProfile,
     bsky,
     avatarSynced: Boolean(avatarBlob),
     bannerSynced: Boolean(bannerBlob),
+    skipped: false,
+    changed,
     warnings,
+  };
+};
+
+export const bridgeBlueskyAccountToFediverse = async (args: {
+  bskyIdentifier: string;
+  bskyPassword: string;
+  bskyServiceUrl?: string;
+}): Promise<FediverseBridgeResult> => {
+  const bsky = await validateBlueskyCredentials(args);
+  const accountProfile = await fetchPublicProfile(bsky.did || bsky.handle);
+  const createdAtRaw = normalizeOptionalString(accountProfile.createdAt);
+  if (!createdAtRaw) {
+    throw new Error('Could not determine when this Bluesky account was created.');
+  }
+
+  const createdAtMs = Date.parse(createdAtRaw);
+  if (!Number.isFinite(createdAtMs)) {
+    throw new Error('Invalid Bluesky account creation timestamp.');
+  }
+
+  const ageMs = Date.now() - createdAtMs;
+  if (ageMs < MIN_BRIDGE_ACCOUNT_AGE_MS) {
+    const ageDays = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+    throw new Error(`Account must be at least 7 days old before bridging (currently ${ageDays} day(s)).`);
+  }
+
+  const agent = new BskyAgent({ service: bsky.serviceUrl });
+  await agent.login({
+    identifier: args.bskyIdentifier,
+    password: args.bskyPassword,
+  });
+
+  const bridgeProfile = await fetchPublicProfile(FEDIVERSE_BRIDGE_HANDLE);
+  const alreadyFollowing = await hasFollowRecordForDid(agent, bridgeProfile.did);
+  if (!alreadyFollowing) {
+    const repo = agent.session?.did;
+    if (!repo) {
+      throw new Error('Missing Bluesky session DID.');
+    }
+
+    await agent.com.atproto.repo.createRecord({
+      repo,
+      collection: 'app.bsky.graph.follow',
+      record: {
+        subject: bridgeProfile.did,
+        createdAt: new Date().toISOString(),
+      },
+    });
+  }
+
+  const fediverseAddress = `@${bsky.handle}@bsky.brid.gy`;
+  const text = `This account can now be found on the fediverse at ${fediverseAddress}`;
+  const richText = new RichText({ text });
+  await richText.detectFacets(agent);
+
+  const post = await agent.post({
+    text: richText.text,
+    facets: richText.facets,
+    createdAt: new Date().toISOString(),
+  });
+
+  return {
+    bsky,
+    bridgedAccountHandle: bsky.handle,
+    fediverseAddress,
+    accountCreatedAt: new Date(createdAtMs).toISOString(),
+    ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
+    followedBridgeAccount: !alreadyFollowing,
+    announcementUri: post.uri,
+    announcementCid: post.cid,
   };
 };

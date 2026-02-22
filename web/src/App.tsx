@@ -58,6 +58,12 @@ interface AccountMapping {
   groupEmoji?: string;
   createdByUserId?: string;
   createdByLabel?: string;
+  profileSyncSourceUsername?: string;
+  lastProfileSyncAt?: string;
+  lastMirroredDisplayName?: string;
+  lastMirroredDescription?: string;
+  lastMirroredAvatarUrl?: string;
+  lastMirroredBannerUrl?: string;
   createdByUser?: {
     id: string;
     username?: string;
@@ -176,6 +182,8 @@ interface BskyProfileView {
   handle?: string;
   displayName?: string;
   avatar?: string;
+  description?: string;
+  createdAt?: string;
 }
 
 interface PendingBackfill {
@@ -264,7 +272,16 @@ interface MirrorProfileSyncResult {
   bsky: BlueskyCredentialValidation;
   avatarSynced: boolean;
   bannerSynced: boolean;
+  skipped?: boolean;
+  changed?: {
+    displayName: boolean;
+    description: boolean;
+    avatar: boolean;
+    banner: boolean;
+  };
   warnings: string[];
+  sourceTwitterUsername?: string;
+  mapping?: AccountMapping;
 }
 
 interface BootstrapStatus {
@@ -302,6 +319,7 @@ interface MappingFormState {
   bskyServiceUrl: string;
   groupName: string;
   groupEmoji: string;
+  profileSyncSourceUsername: string;
 }
 
 interface UserFormState {
@@ -331,6 +349,7 @@ const defaultMappingForm = (): MappingFormState => ({
   bskyServiceUrl: 'https://bsky.social',
   groupName: '',
   groupEmoji: '📁',
+  profileSyncSourceUsername: '',
 });
 
 const defaultUserForm = (): UserFormState => ({
@@ -355,6 +374,7 @@ const ADD_ACCOUNT_STEPS = ['Sources', 'Create', 'Bluesky', 'Verify & Create'] as
 const ADD_ACCOUNT_STEP_COUNT = ADD_ACCOUNT_STEPS.length;
 const ACCOUNT_SEARCH_MIN_SCORE = 22;
 const DEFAULT_BACKFILL_LIMIT = 15;
+const FEDIVERSE_BRIDGE_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_USER_PERMISSIONS: UserPermissions = {
   viewAllMappings: false,
   manageOwnMappings: true,
@@ -480,6 +500,22 @@ function normalizeUsername(value: string): string {
 
 function getUserLabel(user?: Pick<AuthUser, 'username' | 'email'>): string {
   return user?.username || user?.email || 'user';
+}
+
+function getProfileAgeMs(createdAt?: string): number | null {
+  if (!createdAt) {
+    return null;
+  }
+  const parsed = Date.parse(createdAt);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return Date.now() - parsed;
+}
+
+function canBridgeToFediverse(createdAt?: string): boolean {
+  const ageMs = getProfileAgeMs(createdAt);
+  return ageMs !== null && ageMs >= FEDIVERSE_BRIDGE_MIN_AGE_MS;
 }
 
 function normalizePermissions(permissions?: Partial<UserPermissions>): UserPermissions {
@@ -736,6 +772,8 @@ function App() {
   const [isMirrorPreviewLoading, setIsMirrorPreviewLoading] = useState(false);
   const [isCredentialValidationBusy, setIsCredentialValidationBusy] = useState(false);
   const [syncingProfileMappingId, setSyncingProfileMappingId] = useState<string | null>(null);
+  const [isSyncAllProfilesBusy, setIsSyncAllProfilesBusy] = useState(false);
+  const [bridgingMappingId, setBridgingMappingId] = useState<string | null>(null);
   const [editForm, setEditForm] = useState<MappingFormState>(defaultMappingForm);
   const [editTwitterUsers, setEditTwitterUsers] = useState<string[]>([]);
   const [editTwitterInput, setEditTwitterInput] = useState('');
@@ -875,6 +913,8 @@ function App() {
     setIsMirrorPreviewLoading(false);
     setIsCredentialValidationBusy(false);
     setSyncingProfileMappingId(null);
+    setIsSyncAllProfilesBusy(false);
+    setBridgingMappingId(null);
     setEditTwitterUsers([]);
     setNewGroupName('');
     setNewGroupEmoji(DEFAULT_GROUP_EMOJI);
@@ -1283,6 +1323,30 @@ function App() {
       setSelectedMirrorSourceUsername(newTwitterUsers[0] || '');
     }
   }, [newTwitterUsers, selectedMirrorSourceUsername]);
+
+  useEffect(() => {
+    if (!editingMapping) {
+      return;
+    }
+
+    const candidates = [...new Set(editTwitterUsers.map(normalizeTwitterUsername).filter((username) => username.length > 0))];
+    const selected = normalizeTwitterUsername(editForm.profileSyncSourceUsername || '');
+    if (candidates.length === 0) {
+      if (editForm.profileSyncSourceUsername !== '') {
+        setEditForm((previous) => ({ ...previous, profileSyncSourceUsername: '' }));
+      }
+      return;
+    }
+
+    if (candidates.includes(selected)) {
+      return;
+    }
+
+    const next = candidates.length === 1 ? candidates[0] || '' : '';
+    if (editForm.profileSyncSourceUsername !== next) {
+      setEditForm((previous) => ({ ...previous, profileSyncSourceUsername: next }));
+    }
+  }, [editForm.profileSyncSourceUsername, editTwitterUsers, editingMapping]);
 
   useEffect(() => {
     setValidatedBskyCredentials(null);
@@ -1967,12 +2031,14 @@ function App() {
     }
   };
 
-  const resolveProfileSyncSource = (mapping: AccountMapping): string | null => {
+  const resolveProfileSyncSource = (mapping: AccountMapping, silent = false): string | null => {
     const candidates = [
       ...new Set(mapping.twitterUsernames.map(normalizeTwitterUsername).filter((value) => value.length > 0)),
     ];
     if (candidates.length === 0) {
-      showNotice('error', 'Mapping has no Twitter source usernames.');
+      if (!silent) {
+        showNotice('error', 'Mapping has no Twitter source usernames.');
+      }
       return null;
     }
 
@@ -1980,45 +2046,47 @@ function App() {
       return candidates[0] || null;
     }
 
-    const typed = window.prompt(
-      `This mapping has multiple Twitter sources. Enter one to mirror from:\n${candidates
-        .map((username) => `@${username}`)
-        .join(', ')}`,
-      candidates[0],
-    );
-
-    if (typed === null) {
-      return null;
-    }
-
-    const selected = normalizeTwitterUsername(typed);
+    const selected = normalizeTwitterUsername(mapping.profileSyncSourceUsername || '');
     if (!selected || !candidates.includes(selected)) {
-      showNotice('error', 'Please enter one of the mapped Twitter usernames.');
+      if (!silent) {
+        showNotice('error', 'Select a profile sync source for this multi-source mapping first.');
+      }
       return null;
     }
 
     return selected;
   };
 
-  const handleSyncProfileFromTwitter = async (mapping: AccountMapping) => {
+  const syncProfileFromTwitterForMapping = async (
+    mapping: AccountMapping,
+    options?: {
+      confirm?: boolean;
+      showNoticeOnResult?: boolean;
+      refreshAfter?: boolean;
+    },
+  ): Promise<{ ok: boolean; skipped: boolean }> => {
     if (!authHeaders) {
-      return;
+      return { ok: false, skipped: false };
     }
     if (!canManageMapping(mapping)) {
-      showNotice('error', 'You do not have permission to update this mapping.');
-      return;
+      if (options?.showNoticeOnResult !== false) {
+        showNotice('error', 'You do not have permission to update this mapping.');
+      }
+      return { ok: false, skipped: false };
     }
 
-    const sourceTwitterUsername = resolveProfileSyncSource(mapping);
+    const sourceTwitterUsername = resolveProfileSyncSource(mapping, options?.showNoticeOnResult === false);
     if (!sourceTwitterUsername) {
-      return;
+      return { ok: false, skipped: false };
     }
 
-    const confirmed = window.confirm(
-      `Sync profile from @${sourceTwitterUsername}? This replaces display name, bio, avatar, and banner and keeps the {UNOFFICIAL} suffix.`,
-    );
-    if (!confirmed) {
-      return;
+    if (options?.confirm !== false) {
+      const confirmed = window.confirm(
+        `Sync profile from @${sourceTwitterUsername}? This updates display name, bio, avatar, and banner only when the Twitter profile changed.`,
+      );
+      if (!confirmed) {
+        return { ok: false, skipped: false };
+      }
     }
 
     setSyncingProfileMappingId(mapping.id);
@@ -2029,21 +2097,204 @@ function App() {
         { headers: authHeaders },
       );
 
-      const warnings = response.data?.warnings || [];
-      if (warnings.length > 0) {
-        showNotice(
-          'info',
-          `Profile synced from @${sourceTwitterUsername} with ${warnings.length} warning(s). First warning: ${warnings[0]}`,
-        );
-      } else {
-        showNotice('success', `Profile synced from @${sourceTwitterUsername}.`);
+      const result = response.data;
+      const warnings = result?.warnings || [];
+      const skipped = Boolean(result?.skipped);
+
+      if (result?.mapping) {
+        setMappings((previous) => previous.map((entry) => (entry.id === mapping.id ? result.mapping || entry : entry)));
+      }
+
+      if (options?.showNoticeOnResult !== false) {
+        if (skipped) {
+          showNotice('info', `No profile changes detected for @${sourceTwitterUsername}.`);
+        } else if (warnings.length > 0) {
+          showNotice(
+            'info',
+            `Profile synced from @${sourceTwitterUsername} with ${warnings.length} warning(s). First warning: ${warnings[0]}`,
+          );
+        } else {
+          showNotice('success', `Profile synced from @${sourceTwitterUsername}.`);
+        }
+      }
+
+      if (options?.refreshAfter !== false) {
+        await fetchData();
+      }
+
+      return { ok: true, skipped };
+    } catch (error) {
+      if (options?.showNoticeOnResult !== false) {
+        handleAuthFailure(error, 'Failed to sync profile from Twitter.');
+      }
+      return { ok: false, skipped: false };
+    } finally {
+      setSyncingProfileMappingId((previous) => (previous === mapping.id ? null : previous));
+    }
+  };
+
+  const handleSyncProfileFromTwitter = async (mapping: AccountMapping) => {
+    await syncProfileFromTwitterForMapping(mapping, {
+      confirm: true,
+      showNoticeOnResult: true,
+      refreshAfter: true,
+    });
+  };
+
+  const handleSyncAllProfilesFromTwitter = async () => {
+    if (!authHeaders) {
+      return;
+    }
+
+    const candidates = accountMappingsForView.filter((mapping) => canManageMapping(mapping));
+    if (candidates.length === 0) {
+      showNotice('info', 'No accounts available for profile sync.');
+      return;
+    }
+
+    const missingSource = candidates.filter(
+      (mapping) => mapping.twitterUsernames.length > 1 && !resolveProfileSyncSource(mapping, true),
+    );
+    if (missingSource.length > 0) {
+      const labels = missingSource
+        .slice(0, 3)
+        .map((mapping) => mapping.bskyIdentifier)
+        .join(', ');
+      const suffix = missingSource.length > 3 ? ` and ${missingSource.length - 3} more` : '';
+      showNotice(
+        'error',
+        `Sync all failed: choose a profile sync source for ${labels}${suffix} before running bulk sync.`,
+      );
+      return;
+    }
+
+    const confirmed = window.confirm(`Sync Twitter profile data for ${candidates.length} account(s), one at a time?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setIsSyncAllProfilesBusy(true);
+    let syncedCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+
+    try {
+      for (const mapping of candidates) {
+        const outcome = await syncProfileFromTwitterForMapping(mapping, {
+          confirm: false,
+          showNoticeOnResult: false,
+          refreshAfter: false,
+        });
+
+        if (!outcome.ok) {
+          failedCount += 1;
+          continue;
+        }
+        if (outcome.skipped) {
+          skippedCount += 1;
+        } else {
+          syncedCount += 1;
+        }
       }
 
       await fetchData();
-    } catch (error) {
-      handleAuthFailure(error, 'Failed to sync profile from Twitter.');
+      showNotice(
+        failedCount > 0 ? 'info' : 'success',
+        `Sync all complete: ${syncedCount} updated, ${skippedCount} unchanged, ${failedCount} failed.`,
+      );
     } finally {
-      setSyncingProfileMappingId((previous) => (previous === mapping.id ? null : previous));
+      setIsSyncAllProfilesBusy(false);
+    }
+  };
+
+  const handleUpdateProfileSyncSource = async (mapping: AccountMapping, selectedSource: string) => {
+    if (!authHeaders) {
+      return;
+    }
+    if (!canManageMapping(mapping)) {
+      showNotice('error', 'You do not have permission to update this mapping.');
+      return;
+    }
+
+    const normalizedSource = normalizeTwitterUsername(selectedSource || '');
+    const sourceExists = mapping.twitterUsernames.some(
+      (username) => normalizeTwitterUsername(username) === normalizedSource,
+    );
+    const nextSource = sourceExists
+      ? normalizedSource
+      : mapping.twitterUsernames.length === 1
+        ? normalizeTwitterUsername(mapping.twitterUsernames[0] || '')
+        : '';
+
+    if (mapping.twitterUsernames.length > 1 && !nextSource) {
+      showNotice('error', 'Select one of the mapped Twitter usernames as the profile sync source.');
+      return;
+    }
+
+    try {
+      await axios.put(
+        `/api/mappings/${mapping.id}`,
+        {
+          profileSyncSourceUsername: nextSource,
+        },
+        { headers: authHeaders },
+      );
+
+      setMappings((previous) =>
+        previous.map((entry) =>
+          entry.id === mapping.id
+            ? {
+                ...entry,
+                profileSyncSourceUsername: nextSource || undefined,
+              }
+            : entry,
+        ),
+      );
+
+      showNotice('success', `Profile sync source set to @${nextSource}.`);
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to update profile sync source.');
+    }
+  };
+
+  const handleBridgeToFediverse = async (mapping: AccountMapping) => {
+    if (!authHeaders) {
+      return;
+    }
+    if (!canManageMapping(mapping)) {
+      showNotice('error', 'You do not have permission to bridge this mapping.');
+      return;
+    }
+
+    const profile = getProfileForActor(mapping.bskyIdentifier);
+    if (!canBridgeToFediverse(profile?.createdAt)) {
+      showNotice('error', 'This Bluesky account must be at least 7 days old before bridging.');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Bridge ${mapping.bskyIdentifier} to the fediverse now? This follows @ap.brid.gy and posts the bridge announcement.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setBridgingMappingId(mapping.id);
+    try {
+      const response = await axios.post<{ fediverseAddress?: string }>(
+        `/api/mappings/${mapping.id}/bridge-to-fediverse`,
+        {},
+        { headers: authHeaders },
+      );
+      showNotice(
+        'success',
+        `Fediverse bridge enabled: ${response.data?.fediverseAddress || `@${mapping.bskyIdentifier}@bsky.brid.gy`}`,
+      );
+      await fetchRecentActivity();
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to bridge this account to the fediverse.');
+    } finally {
+      setBridgingMappingId((previous) => (previous === mapping.id ? null : previous));
     }
   };
 
@@ -2427,6 +2678,7 @@ function App() {
           bskyServiceUrl: newMapping.bskyServiceUrl.trim(),
           groupName: newMapping.groupName.trim(),
           groupEmoji: newMapping.groupEmoji.trim(),
+          profileSyncSourceUsername: sourceTwitterUsername,
         },
         { headers: authHeaders },
       );
@@ -2531,6 +2783,8 @@ function App() {
       bskyServiceUrl: mapping.bskyServiceUrl || 'https://bsky.social',
       groupName: mapping.groupName || '',
       groupEmoji: mapping.groupEmoji || '📁',
+      profileSyncSourceUsername:
+        mapping.profileSyncSourceUsername || (mapping.twitterUsernames.length === 1 ? mapping.twitterUsernames[0] || '' : ''),
     });
     setEditTwitterUsers(mapping.twitterUsernames);
     setEditTwitterInput('');
@@ -2551,6 +2805,21 @@ function App() {
       return;
     }
 
+    const normalizedProfileSyncSource = normalizeTwitterUsername(editForm.profileSyncSourceUsername || '');
+    const hasSourceInMapping = editTwitterUsers.some(
+      (username) => normalizeTwitterUsername(username) === normalizedProfileSyncSource,
+    );
+    const profileSyncSourceUsername = hasSourceInMapping
+      ? normalizedProfileSyncSource
+      : editTwitterUsers.length === 1
+        ? normalizeTwitterUsername(editTwitterUsers[0] || '')
+        : '';
+
+    if (editTwitterUsers.length > 1 && !profileSyncSourceUsername) {
+      showNotice('error', 'Select which Twitter source should sync this Bluesky profile.');
+      return;
+    }
+
     setIsBusy(true);
 
     try {
@@ -2564,6 +2833,7 @@ function App() {
           bskyServiceUrl: editForm.bskyServiceUrl.trim(),
           groupName: editForm.groupName.trim(),
           groupEmoji: editForm.groupEmoji.trim(),
+          profileSyncSourceUsername,
         },
         { headers: authHeaders },
       );
@@ -3254,6 +3524,17 @@ function App() {
                       Add account
                     </Button>
                   ) : null}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)}
+                    onClick={() => {
+                      void handleSyncAllProfilesFromTwitter();
+                    }}
+                  >
+                    {isSyncAllProfilesBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                    Sync all
+                  </Button>
                   <Badge variant="outline">{accountMappingsForView.length} configured</Badge>
                 </div>
               </div>
@@ -3435,6 +3716,11 @@ function App() {
                                       const profile = getProfileForActor(mapping.bskyIdentifier);
                                       const profileHandle = profile?.handle || mapping.bskyIdentifier;
                                       const profileName = profile?.displayName || profileHandle;
+                                      const profileBio = profile?.description?.trim() || '';
+                                      const profileUrl = `https://bsky.app/profile/${profileHandle}`;
+                                      const canManageThisMapping = canManageMapping(mapping);
+                                      const canUseFediverseBridge = canBridgeToFediverse(profile?.createdAt);
+                                      const bridging = bridgingMappingId === mapping.id;
                                       const mappingGroup = getMappingGroupMeta(mapping);
                                       const syncingProfile = syncingProfileMappingId === mapping.id;
 
@@ -3482,9 +3768,29 @@ function App() {
                                               )}
                                               <div className="min-w-0">
                                                 <p className="truncate text-sm font-medium">{profileName}</p>
-                                                <p className="truncate font-mono text-xs text-muted-foreground">
+                                                <a
+                                                  className="inline-flex max-w-full items-center truncate font-mono text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                                                  href={profileUrl}
+                                                  target="_blank"
+                                                  rel="noreferrer"
+                                                  title={`Open @${profileHandle} on Bluesky`}
+                                                >
                                                   {profileHandle}
-                                                </p>
+                                                  <ArrowUpRight className="ml-1 h-3 w-3 shrink-0" />
+                                                </a>
+                                                {profileBio ? (
+                                                  <p
+                                                    className="mt-1 overflow-hidden text-xs text-muted-foreground"
+                                                    style={{
+                                                      display: '-webkit-box',
+                                                      WebkitLineClamp: 2,
+                                                      WebkitBoxOrient: 'vertical',
+                                                    }}
+                                                    title={profileBio}
+                                                  >
+                                                    {profileBio}
+                                                  </p>
+                                                ) : null}
                                               </div>
                                             </div>
                                           </td>
@@ -3504,7 +3810,12 @@ function App() {
                                               <select
                                                 className={cn(selectClassName, 'h-9 w-44 px-2 py-1 text-xs')}
                                                 value={mappingGroup.key}
-                                                disabled={!canManageMapping(mapping) || !canManageGroupsPermission}
+                                                disabled={
+                                                  !canManageThisMapping ||
+                                                  !canManageGroupsPermission ||
+                                                  isSyncAllProfilesBusy ||
+                                                  Boolean(syncingProfileMappingId)
+                                                }
                                                 onChange={(event) => {
                                                   void handleAssignMappingGroup(mapping, event.target.value);
                                                 }}
@@ -3523,8 +3834,29 @@ function App() {
                                                     </option>
                                                   ))}
                                               </select>
-                                              {canManageMapping(mapping) ? (
+                                              {canManageThisMapping ? (
                                                 <>
+                                                  {mapping.twitterUsernames.length > 1 ? (
+                                                    <select
+                                                      className={cn(selectClassName, 'h-9 w-44 px-2 py-1 text-xs')}
+                                                      value={mapping.profileSyncSourceUsername || ''}
+                                                      disabled={
+                                                        isSyncAllProfilesBusy ||
+                                                        Boolean(syncingProfileMappingId) ||
+                                                        Boolean(bridgingMappingId)
+                                                      }
+                                                      onChange={(event) => {
+                                                        void handleUpdateProfileSyncSource(mapping, event.target.value);
+                                                      }}
+                                                    >
+                                                      <option value="">Select sync source</option>
+                                                      {mapping.twitterUsernames.map((username) => (
+                                                        <option key={`sync-source-${mapping.id}-${username}`} value={username}>
+                                                          @{username}
+                                                        </option>
+                                                      ))}
+                                                    </select>
+                                                  ) : null}
                                                   <Button
                                                     variant="outline"
                                                     size="sm"
@@ -3535,7 +3867,11 @@ function App() {
                                                   <Button
                                                     variant="outline"
                                                     size="sm"
-                                                    disabled={Boolean(syncingProfileMappingId)}
+                                                    disabled={
+                                                      Boolean(syncingProfileMappingId) ||
+                                                      isSyncAllProfilesBusy ||
+                                                      Boolean(bridgingMappingId)
+                                                    }
                                                     onClick={() => {
                                                       void handleSyncProfileFromTwitter(mapping);
                                                     }}
@@ -3547,11 +3883,33 @@ function App() {
                                                     )}
                                                     Sync Profile
                                                   </Button>
+                                                  {canUseFediverseBridge ? (
+                                                    <Button
+                                                      variant="outline"
+                                                      size="sm"
+                                                      disabled={
+                                                        Boolean(bridgingMappingId) ||
+                                                        Boolean(syncingProfileMappingId) ||
+                                                        isSyncAllProfilesBusy
+                                                      }
+                                                      onClick={() => {
+                                                        void handleBridgeToFediverse(mapping);
+                                                      }}
+                                                    >
+                                                      {bridging ? (
+                                                        <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                                                      ) : (
+                                                        <Repeat2 className="mr-1 h-4 w-4" />
+                                                      )}
+                                                      Bridge to Fediverse
+                                                    </Button>
+                                                  ) : null}
                                                   {canQueueBackfillsPermission ? (
                                                     <>
                                                       <Button
                                                         variant="outline"
                                                         size="sm"
+                                                        disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
                                                         onClick={() => {
                                                           void requestBackfill(mapping.id, 'normal');
                                                         }}
@@ -3562,6 +3920,7 @@ function App() {
                                                         <Button
                                                           variant="ghost"
                                                           size="sm"
+                                                          disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
                                                           onClick={() => {
                                                             void cancelQueuedBackfill(mapping.id);
                                                           }}
@@ -3573,6 +3932,7 @@ function App() {
                                                         <Button
                                                           variant="subtle"
                                                           size="sm"
+                                                          disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
                                                           onClick={() => {
                                                             void requestBackfill(mapping.id, 'reset');
                                                           }}
@@ -3586,6 +3946,7 @@ function App() {
                                                     <Button
                                                       variant="destructive"
                                                       size="sm"
+                                                      disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
                                                       onClick={() => {
                                                         void handleDeleteAllPosts(mapping.id);
                                                       }}
@@ -3595,10 +3956,11 @@ function App() {
                                                   ) : null}
                                                 </>
                                               ) : null}
-                                              {canManageMapping(mapping) ? (
+                                              {canManageThisMapping ? (
                                                 <Button
                                                   variant="ghost"
                                                   size="sm"
+                                                  disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
                                                   onClick={() => {
                                                     void handleDeleteMapping(mapping.id);
                                                   }}
@@ -5439,6 +5801,29 @@ function App() {
                     }}
                     required
                   />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="edit-profile-sync-source">Profile Sync Source</Label>
+                  <select
+                    id="edit-profile-sync-source"
+                    className={selectClassName}
+                    value={editForm.profileSyncSourceUsername}
+                    onChange={(event) => {
+                      setEditForm((previous) => ({ ...previous, profileSyncSourceUsername: event.target.value }));
+                    }}
+                  >
+                    {editTwitterUsers.length > 1 ? <option value="">Select source username</option> : null}
+                    {editTwitterUsers.map((username) => (
+                      <option key={`edit-sync-source-${username}`} value={username}>
+                        @{username}
+                      </option>
+                    ))}
+                  </select>
+                  {editTwitterUsers.length > 1 ? (
+                    <p className="text-xs text-muted-foreground">
+                      Required when multiple Twitter usernames map to one Bluesky account.
+                    </p>
+                  ) : null}
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="edit-bskyPassword">New App Password (optional)</Label>

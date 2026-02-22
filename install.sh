@@ -25,6 +25,7 @@ APP_PORT=""
 APP_HOST=""
 ACTIVE_RUNNER=""
 CREATED_JWT_SECRET=0
+BUN_BIN=""
 
 usage() {
   cat <<'USAGE'
@@ -46,8 +47,8 @@ Options:
   --nohup                  Force nohup runner
   --port <number>          Set or override PORT in .env
   --host <bind-host>       Set or override HOST in .env (for example 127.0.0.1)
-  --skip-install           Skip npm install
-  --skip-build             Skip npm run build
+  --skip-install           Skip bun install
+  --skip-build             Skip bun run build
   --skip-native-rebuild    Skip native-module compatibility rebuild checks
   -h, --help               Show this help
 USAGE
@@ -67,13 +68,72 @@ is_valid_port() {
   (( candidate >= 1 && candidate <= 65535 ))
 }
 
-check_node_version() {
-  local node_major
-  node_major="$(node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0)"
-  if [[ "$node_major" -lt 22 ]]; then
-    echo "Node.js 22+ is required. Current: $(node -v 2>/dev/null || echo 'unknown')"
+ensure_bun_runtime() {
+  install_latest_bun() {
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL https://bun.sh/install | bash >/dev/null
+      return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+      wget -qO- https://bun.sh/install | bash >/dev/null
+      return 0
+    fi
+
+    echo "❌ Bun is required, and curl/wget is unavailable for auto-install."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  }
+
+  resolve_bun_bin() {
+    if command -v bun >/dev/null 2>&1; then
+      command -v bun
+      return 0
+    fi
+    if [[ -x "${HOME}/.bun/bin/bun" ]]; then
+      printf '%s\n' "${HOME}/.bun/bin/bun"
+      return 0
+    fi
+    return 1
+  }
+
+  if ! BUN_BIN="$(resolve_bun_bin)"; then
+    echo "📦 Bun not found. Installing latest Bun..."
+    install_latest_bun
+    BUN_BIN="$(resolve_bun_bin || true)"
+  fi
+
+  if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
+    echo "❌ Bun could not be resolved."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
     exit 1
   fi
+
+  export PATH="$(dirname "$BUN_BIN"):$PATH"
+
+  if ! "$BUN_BIN" upgrade >/dev/null 2>&1; then
+    echo "⚠️  Bun auto-upgrade failed. Reinstalling latest Bun..."
+    install_latest_bun
+    BUN_BIN="$(resolve_bun_bin || true)"
+  fi
+
+  if [[ -z "$BUN_BIN" || ! -x "$BUN_BIN" ]]; then
+    echo "❌ Bun could not be resolved after auto-upgrade."
+    echo "   Install Bun manually: https://bun.com/docs/installation"
+    exit 1
+  fi
+
+  export PATH="$(dirname "$BUN_BIN"):$PATH"
+
+  local bun_major
+  bun_major="$($BUN_BIN --version | awk -F. '{print $1}' 2>/dev/null || echo 0)"
+  if [[ "$bun_major" -lt 1 ]]; then
+    echo "❌ Bun 1.x+ is required. Current: $($BUN_BIN --version 2>/dev/null || echo 'unknown')"
+    exit 1
+  fi
+}
+
+run_bun() {
+  "$BUN_BIN" "$@"
 }
 
 acquire_lock() {
@@ -164,7 +224,7 @@ ensure_env_defaults() {
   existing_secret="$(get_env_value JWT_SECRET)"
   if [[ -z "$existing_secret" ]]; then
     local generated_secret
-    generated_secret="$(node -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
+    generated_secret="$(run_bun -e "console.log(require('crypto').randomBytes(32).toString('hex'))")"
     upsert_env_value JWT_SECRET "$generated_secret"
     CREATED_JWT_SECRET=1
   fi
@@ -172,28 +232,24 @@ ensure_env_defaults() {
 
 ensure_node_modules_present() {
   if [[ ! -d "$SCRIPT_DIR/node_modules" ]]; then
-    echo "node_modules not found. Run ./install.sh (without --start-only) first."
+    echo "Dependencies not found. Run ./install.sh (without --start-only) first."
     exit 1
   fi
 }
 
 native_module_compatible() {
-  node -e "try{require('better-sqlite3');process.exit(0)}catch(e){console.error(e && e.message ? e.message : e);process.exit(1)}" >/dev/null 2>&1
+  run_bun -e "try{require('better-sqlite3');process.exit(0)}catch(e){console.error(e && e.message ? e.message : e);process.exit(1)}" >/dev/null 2>&1
 }
 
 run_native_rebuild() {
-  echo "Verifying native modules for Node $(node -v)..."
+  echo "Verifying native modules for Bun $($BUN_BIN --version)..."
 
-  if npm run rebuild:native; then
+  if run_bun run rebuild:native; then
     return 0
   fi
 
-  echo "rebuild:native failed. Falling back to direct better-sqlite3 rebuild..."
-  if npm rebuild better-sqlite3; then
-    return 0
-  fi
-
-  npm rebuild better-sqlite3 --build-from-source
+  echo "rebuild:native failed. Forcing fresh Bun install..."
+  run_bun install --force
 }
 
 ensure_native_compatibility() {
@@ -205,12 +261,12 @@ ensure_native_compatibility() {
     return 0
   fi
 
-  echo "Detected native module mismatch (likely from Node version change)."
+  echo "Detected native module mismatch (likely from runtime/dependency change)."
   run_native_rebuild
 
   if ! native_module_compatible; then
     echo "Native module validation still failed after rebuild."
-    echo "Try reinstalling dependencies: rm -rf node_modules package-lock.json && npm install"
+    echo "Try reinstalling dependencies: rm -rf node_modules bun.lock && bun install"
     exit 1
   fi
 }
@@ -218,14 +274,14 @@ ensure_native_compatibility() {
 ensure_build_artifacts() {
   if [[ ! -f "$SCRIPT_DIR/dist/index.js" ]]; then
     echo "Build output not found (dist/index.js). Running build now."
-    npm run build
+    run_bun run build
   fi
 }
 
 install_and_build() {
   if [[ "$DO_INSTALL" -eq 1 ]]; then
     echo "Installing dependencies"
-    npm install --no-audit --no-fund
+    run_bun install
   fi
 
   ensure_node_modules_present
@@ -233,7 +289,7 @@ install_and_build() {
 
   if [[ "$DO_BUILD" -eq 1 ]]; then
     echo "Building server and web app"
-    npm run build
+    run_bun run build
   fi
 }
 
@@ -241,7 +297,7 @@ pid_looks_like_app() {
   local pid="$1"
   local cmd
   cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$cmd" == *"dist/index.js"* || "$cmd" == *"npm start"* || "$cmd" == *"$APP_NAME"* ]]
+  [[ "$cmd" == *"dist/index.js"* || "$cmd" == *"bun run start"* || "$cmd" == *"bun dist/index.js"* || "$cmd" == *"$APP_NAME"* ]]
 }
 
 stop_pid_gracefully() {
@@ -327,7 +383,7 @@ start_with_nohup() {
   stop_nohup_if_running >/dev/null 2>&1 || true
 
   echo "Starting with nohup"
-  nohup npm start >> "$LOG_FILE" 2>&1 &
+  nohup "$BUN_BIN" run start >> "$LOG_FILE" 2>&1 &
   echo "$!" > "$PID_FILE"
 
   local pid
@@ -351,10 +407,14 @@ start_with_pm2() {
 
   if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
     echo "[pm2] Restarting existing process with updated env: $APP_NAME"
-    pm2 restart "$APP_NAME" --update-env
+    pm2 restart "$APP_NAME" --update-env --interpreter "$BUN_BIN" || {
+      echo "[pm2] Restart failed, recreating process with Bun interpreter"
+      pm2 delete "$APP_NAME" || true
+      pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
+    }
   else
     echo "[pm2] Starting new process: $APP_NAME (cwd=$SCRIPT_DIR, script=dist/index.js)"
-    pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env
+    pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
   fi
 
   echo "[pm2] Saving PM2 process list"
@@ -398,7 +458,7 @@ wait_for_web() {
         return 0
       fi
     else
-      if node -e "const http=require('http');const req=http.get('$url',res=>{process.exit(res.statusCode && res.statusCode < 500 ? 0 : 1)});req.setTimeout(1500,()=>{req.destroy();process.exit(1)});req.on('error',()=>process.exit(1));" >/dev/null 2>&1; then
+      if run_bun -e "const http=require('http');const req=http.get('$url',res=>{process.exit(res.statusCode && res.statusCode < 500 ? 0 : 1)});req.setTimeout(1500,()=>{req.destroy();process.exit(1)});req.on('error',()=>process.exit(1));" >/dev/null 2>&1; then
         return 0
       fi
     fi
@@ -578,9 +638,7 @@ case "$ACTION" in
     ;;
 esac
 
-require_command node
-require_command npm
-check_node_version
+ensure_bun_runtime
 
 acquire_lock
 trap cleanup EXIT

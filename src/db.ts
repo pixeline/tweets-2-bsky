@@ -1,7 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import Database from 'better-sqlite3';
+
+interface DbStatement {
+  get: (...params: any[]) => unknown;
+  all: (...params: any[]) => unknown[];
+  run: (...params: any[]) => unknown;
+}
+
+interface DbLike {
+  prepare: (sql: string) => DbStatement;
+  exec: (sql: string) => unknown;
+  transaction: <T extends (...args: any[]) => any>(fn: T) => T;
+  pragma?: (sql: string) => unknown;
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,28 +23,45 @@ if (!fs.existsSync(DB_DIR)) {
   fs.mkdirSync(DB_DIR);
 }
 
-const db = new Database(path.join(DB_DIR, 'database.sqlite'));
+const DB_PATH = path.join(DB_DIR, 'database.sqlite');
+
+const db: DbLike = await (async () => {
+  if (typeof process.versions.bun === 'string') {
+    const bunSqliteSpecifier = 'bun:sqlite';
+    const sqliteModule = (await import(bunSqliteSpecifier)) as {
+      Database: new (filename: string) => DbLike;
+    };
+    return new sqliteModule.Database(DB_PATH) as unknown as DbLike;
+  }
+
+  const betterSqliteModule = await import('better-sqlite3');
+  return new betterSqliteModule.default(DB_PATH) as unknown as DbLike;
+})();
 
 // Enable WAL mode for better concurrency
-db.pragma('journal_mode = WAL');
+if (typeof db.pragma === 'function') {
+  db.pragma('journal_mode = WAL');
+} else {
+  db.exec('PRAGMA journal_mode = WAL;');
+}
 
 // --- Migration Support ---
 const tableInfo = db.prepare('PRAGMA table_info(processed_tweets)').all() as any[];
 
 if (tableInfo.length > 0) {
-  let schemaChanged = false;
+  const schemaChanged = false;
   const hasBskyIdentifier = tableInfo.some((col) => col.name === 'bsky_identifier');
   const hasTweetText = tableInfo.some((col) => col.name === 'tweet_text');
   const hasTailUri = tableInfo.some((col) => col.name === 'bsky_tail_uri');
 
   if (!hasBskyIdentifier || !hasTweetText || !hasTailUri) {
     console.log('🔄 Upgrading database schema...');
-    
+
     // SQLite doesn't support easy PK changes, so we recreate the table if identifier is missing
     // Or if we just need to add a column, we can do ALTER TABLE if it's not the PK.
     // However, since we might need to do both or one, let's just do the full migration pattern
     // to be safe and consistent.
-    
+
     db.transaction(() => {
       // 1. Rename existing table
       db.exec(`ALTER TABLE processed_tweets RENAME TO processed_tweets_old;`);
@@ -59,16 +88,16 @@ if (tableInfo.length > 0) {
       // 3. Migrate data
       // Handle the case where the old table might not have had bsky_identifier
       const oldColumns = tableInfo.map((c) => c.name);
-      
+
       // Construct the SELECT part based on available old columns
       // If old table didn't have bsky_identifier, we default to 'unknown'
       const identifierSelect = oldColumns.includes('bsky_identifier') ? 'bsky_identifier' : "'unknown'";
-      
-      // If old table didn't have tweet_text, we default to NULL
-      const textSelect = oldColumns.includes('tweet_text') ? 'tweet_text' : "NULL";
 
-      const tailUriSelect = oldColumns.includes('bsky_tail_uri') ? 'bsky_tail_uri' : "NULL";
-      const tailCidSelect = oldColumns.includes('bsky_tail_cid') ? 'bsky_tail_cid' : "NULL";
+      // If old table didn't have tweet_text, we default to NULL
+      const textSelect = oldColumns.includes('tweet_text') ? 'tweet_text' : 'NULL';
+
+      const tailUriSelect = oldColumns.includes('bsky_tail_uri') ? 'bsky_tail_uri' : 'NULL';
+      const tailCidSelect = oldColumns.includes('bsky_tail_cid') ? 'bsky_tail_cid' : 'NULL';
 
       db.exec(`
         INSERT INTO processed_tweets (
@@ -288,7 +317,7 @@ export const dbService = {
       bsky_tail_uri: row.bsky_tail_uri,
       bsky_tail_cid: row.bsky_tail_cid,
       status: row.status,
-      created_at: row.created_at
+      created_at: row.created_at,
     };
   },
 
@@ -322,7 +351,7 @@ export const dbService = {
         uri: row.bsky_uri,
         cid: row.bsky_cid,
         root: row.bsky_root_uri ? { uri: row.bsky_root_uri, cid: row.bsky_root_cid } : undefined,
-        tail: (row.bsky_tail_uri && row.bsky_tail_cid) ? { uri: row.bsky_tail_uri, cid: row.bsky_tail_cid } : undefined,
+        tail: row.bsky_tail_uri && row.bsky_tail_cid ? { uri: row.bsky_tail_uri, cid: row.bsky_tail_cid } : undefined,
         migrated: row.status === 'migrated',
         skipped: row.status === 'skipped',
       };
@@ -339,9 +368,9 @@ export const dbService = {
         uri: row.bsky_uri,
         cid: row.bsky_cid,
         root: row.bsky_root_uri ? { uri: row.bsky_root_uri, cid: row.bsky_root_cid } : undefined,
-        tail: (row.bsky_tail_uri && row.bsky_tail_cid) ? { uri: row.bsky_tail_uri, cid: row.bsky_tail_cid } : undefined,
+        tail: row.bsky_tail_uri && row.bsky_tail_cid ? { uri: row.bsky_tail_uri, cid: row.bsky_tail_cid } : undefined,
         migrated: row.status === 'migrated',
-        skipped: row.status === 'skipped'
+        skipped: row.status === 'skipped',
       };
     }
     return map;
