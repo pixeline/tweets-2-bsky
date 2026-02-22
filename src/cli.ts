@@ -492,12 +492,8 @@ program
     const sourceTwitterUsername =
       requestedSource ||
       (storedSource && availableSources.includes(storedSource) ? storedSource : '') ||
-      (availableSources.length === 1 ? availableSources[0] : '');
-
-    if (!sourceTwitterUsername && availableSources.length > 1) {
-      console.log('This mapping has multiple Twitter sources. Set profileSyncSourceUsername first with edit-mapping.');
-      return;
-    }
+      availableSources[0] ||
+      '';
 
     if (!sourceTwitterUsername) {
       console.log('Mapping has no Twitter source usernames.');

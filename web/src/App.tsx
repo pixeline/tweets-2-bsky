@@ -1493,7 +1493,7 @@ function App() {
       return;
     }
 
-    const next = candidates.length === 1 ? candidates[0] || '' : '';
+    const next = candidates[0] || '';
     if (editForm.profileSyncSourceUsername !== next) {
       setEditForm((previous) => ({ ...previous, profileSyncSourceUsername: next }));
     }
@@ -2236,19 +2236,16 @@ function App() {
       return null;
     }
 
-    if (candidates.length === 1) {
-      return candidates[0] || null;
-    }
-
     const selected = normalizeTwitterUsername(mapping.profileSyncSourceUsername || '');
-    if (!selected || !candidates.includes(selected)) {
-      if (!silent) {
-        showNotice('error', 'Select a profile sync source for this multi-source mapping first.');
-      }
-      return null;
+    if (selected && candidates.includes(selected)) {
+      return selected;
     }
 
-    return selected;
+    if (!silent && candidates.length > 1) {
+      showNotice('info', `Using @${candidates[0] || ''} as the default profile sync source.`);
+    }
+
+    return candidates[0] || null;
   };
 
   const syncProfileFromTwitterForMapping = async (
@@ -2350,22 +2347,6 @@ function App() {
       return;
     }
 
-    const missingSource = candidates.filter(
-      (mapping) => mapping.twitterUsernames.length > 1 && !resolveProfileSyncSource(mapping, true),
-    );
-    if (missingSource.length > 0) {
-      const labels = missingSource
-        .slice(0, 3)
-        .map((mapping) => mapping.bskyIdentifier)
-        .join(', ');
-      const suffix = missingSource.length > 3 ? ` and ${missingSource.length - 3} more` : '';
-      showNotice(
-        'error',
-        `Sync all failed: choose a profile sync source for ${labels}${suffix} before running bulk sync.`,
-      );
-      return;
-    }
-
     const confirmed = window.confirm(`Sync Twitter profile data for ${candidates.length} account(s), one at a time?`);
     if (!confirmed) {
       return;
@@ -2418,16 +2399,7 @@ function App() {
     const sourceExists = mapping.twitterUsernames.some(
       (username) => normalizeTwitterUsername(username) === normalizedSource,
     );
-    const nextSource = sourceExists
-      ? normalizedSource
-      : mapping.twitterUsernames.length === 1
-        ? normalizeTwitterUsername(mapping.twitterUsernames[0] || '')
-        : '';
-
-    if (mapping.twitterUsernames.length > 1 && !nextSource) {
-      showNotice('error', 'Select one of the mapped Twitter usernames as the profile sync source.');
-      return;
-    }
+    const nextSource = sourceExists ? normalizedSource : normalizeTwitterUsername(mapping.twitterUsernames[0] || '');
 
     try {
       await axios.put(
@@ -3143,9 +3115,7 @@ function App() {
       bskyServiceUrl: mapping.bskyServiceUrl || 'https://bsky.social',
       groupName: mapping.groupName || '',
       groupEmoji: mapping.groupEmoji || '📁',
-      profileSyncSourceUsername:
-        mapping.profileSyncSourceUsername ||
-        (mapping.twitterUsernames.length === 1 ? mapping.twitterUsernames[0] || '' : ''),
+      profileSyncSourceUsername: mapping.profileSyncSourceUsername || mapping.twitterUsernames[0] || '',
     });
     setEditTwitterUsers(mapping.twitterUsernames);
     setEditTwitterInput('');
@@ -3172,14 +3142,7 @@ function App() {
     );
     const profileSyncSourceUsername = hasSourceInMapping
       ? normalizedProfileSyncSource
-      : editTwitterUsers.length === 1
-        ? normalizeTwitterUsername(editTwitterUsers[0] || '')
-        : '';
-
-    if (editTwitterUsers.length > 1 && !profileSyncSourceUsername) {
-      showNotice('error', 'Select which Twitter source should sync this Bluesky profile.');
-      return;
-    }
+      : normalizeTwitterUsername(editTwitterUsers[0] || '');
 
     setIsBusy(true);
 

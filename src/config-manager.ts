@@ -293,9 +293,7 @@ const normalizeMapping = (rawMapping: unknown, users: WebUser[], adminUserId?: s
   const resolvedProfileSyncSource =
     profileSyncSourceUsername && usernames.includes(profileSyncSourceUsername)
       ? profileSyncSourceUsername
-      : usernames.length === 1
-        ? usernames[0]
-        : undefined;
+      : usernames[0];
   const explicitCreator = normalizeString(record.createdByUserId) ?? normalizeString(record.ownerUserId);
   const explicitCreatorExists = explicitCreator && users.some((user) => user.id === explicitCreator);
 

@@ -1242,11 +1242,7 @@ const resolveProfileSyncSourceUsername = (args: {
     return resolved;
   }
 
-  if (twitterUsernames.length === 1) {
-    return twitterUsernames[0];
-  }
-
-  return undefined;
+  return twitterUsernames[0];
 };
 
 const getMappingMirrorSyncState = (mapping: AccountMapping) => ({
@@ -2132,13 +2128,6 @@ app.post('/api/mappings', authenticateToken, (req: any, res) => {
     requestedSource: req.body?.profileSyncSourceUsername,
   });
 
-  if (twitterUsernames.length > 1 && !profileSyncSourceUsername) {
-    res.status(400).json({
-      error: 'Select which Twitter source should drive Bluesky profile sync for multi-source mappings.',
-    });
-    return;
-  }
-
   const newMapping: AccountMapping = {
     id: randomUUID(),
     twitterUsernames,
@@ -2233,19 +2222,6 @@ app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
     requestedSource: req.body?.profileSyncSourceUsername,
     fallbackSource: existingMapping.profileSyncSourceUsername,
   });
-  const sourceWasExplicitlyProvided = req.body?.profileSyncSourceUsername !== undefined;
-  const usernamesWereUpdated = req.body?.twitterUsernames !== undefined;
-
-  if (
-    twitterUsernames.length > 1 &&
-    !profileSyncSourceUsername &&
-    (sourceWasExplicitlyProvided || usernamesWereUpdated)
-  ) {
-    res.status(400).json({
-      error: 'Select which Twitter source should drive Bluesky profile sync for multi-source mappings.',
-    });
-    return;
-  }
 
   const updatedMapping: AccountMapping = {
     ...existingMapping,
@@ -2289,13 +2265,6 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
   });
 
   if (!sourceTwitterUsername) {
-    if (mapping.twitterUsernames.length > 1) {
-      res.status(400).json({
-        error: 'Select a profile sync source username before syncing this multi-source mapping.',
-      });
-      return;
-    }
-
     res.status(400).json({ error: 'Mapping has no Twitter source usernames.' });
     return;
   }
