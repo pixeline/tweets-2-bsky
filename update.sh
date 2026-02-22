@@ -20,6 +20,8 @@ DO_NATIVE_REBUILD=1
 DO_RESTART=1
 REMOTE_OVERRIDE=""
 BRANCH_OVERRIDE=""
+ORIGINAL_ARGS=("$@")
+UPDATE_SH_REEXECED="${UPDATE_SH_REEXECED:-0}"
 
 STASH_REF=""
 STASH_CREATED=0
@@ -29,6 +31,7 @@ UNTRACKED_COUNT=0
 BACKUP_SOURCES=()
 BACKUP_PATHS=()
 BUN_BIN=""
+ORIGINAL_SCRIPT_CHECKSUM=""
 
 usage() {
   cat <<'USAGE'
@@ -126,6 +129,27 @@ ensure_bun_runtime() {
 
 run_bun() {
   "$BUN_BIN" "$@"
+}
+
+compute_file_checksum() {
+  local file="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+    return 0
+  fi
+
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+    return 0
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | awk '{print $NF}'
+    return 0
+  fi
+
+  return 1
 }
 
 acquire_lock() {
@@ -352,6 +376,30 @@ pull_latest() {
   fi
 }
 
+reexec_with_latest_updater_if_changed() {
+  if [[ "$UPDATE_SH_REEXECED" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$ORIGINAL_SCRIPT_CHECKSUM" ]]; then
+    return 0
+  fi
+
+  local current_checksum
+  current_checksum="$(compute_file_checksum "$SCRIPT_DIR/update.sh" 2>/dev/null || true)"
+  if [[ -z "$current_checksum" || "$current_checksum" == "$ORIGINAL_SCRIPT_CHECKSUM" ]]; then
+    return 0
+  fi
+
+  echo "♻️  update.sh was updated during pull. Restarting updater with newest logic..."
+
+  restore_stash_if_needed
+  trap - EXIT
+  cleanup
+
+  UPDATE_SH_REEXECED=1 exec bash "$SCRIPT_DIR/update.sh" "${ORIGINAL_ARGS[@]}"
+}
+
 native_module_compatible() {
   run_bun -e "try{require('better-sqlite3');process.exit(0)}catch(e){console.error(e && e.message ? e.message : e);process.exit(1)}" >/dev/null 2>&1
 }
@@ -555,6 +603,8 @@ require_command git
 ensure_bun_runtime
 ensure_git_repo
 
+ORIGINAL_SCRIPT_CHECKSUM="$(compute_file_checksum "$SCRIPT_DIR/update.sh" 2>/dev/null || true)"
+
 acquire_lock
 trap cleanup EXIT
 
@@ -568,6 +618,7 @@ remote="$(resolve_remote)"
 branch="$(resolve_branch "$remote")"
 
 pull_latest "$remote" "$branch"
+reexec_with_latest_updater_if_changed
 install_dependencies
 rebuild_native_modules
 build_project
