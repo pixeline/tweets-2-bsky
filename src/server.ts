@@ -26,6 +26,7 @@ import {
   applyProfileMirrorSyncState,
   bridgeBlueskyAccountToFediverse,
   fetchTwitterMirrorProfile,
+  getFediverseBridgeStatus,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
 } from './profile-mirror.js';
@@ -58,6 +59,7 @@ const APPVIEW_POST_CHUNK_SIZE = 10;
 const APPVIEW_PROFILE_CHUNK_SIZE = 25;
 const APPVIEW_MAX_ATTEMPTS = 2;
 const APPVIEW_RETRY_DELAY_MS = 700;
+const FEDIVERSE_BRIDGE_STATUS_CHUNK_SIZE = 5;
 
 function loadPersistedJwtSecret(): string | undefined {
   if (!fs.existsSync(JWT_SECRET_FILE_PATH)) {
@@ -124,6 +126,12 @@ interface BskyProfileView {
   avatar?: string;
   description?: string;
   createdAt?: string;
+}
+
+interface FediverseBridgeStatusView {
+  bridged: boolean;
+  checkedAt: string;
+  error?: string;
 }
 
 interface EnrichedPostMedia {
@@ -1042,6 +1050,28 @@ const parseTwitterUsernames = (value: unknown): string[] => {
   }
 
   return usernames;
+};
+
+const parseMappingIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const candidate of value) {
+    if (typeof candidate !== 'string') {
+      continue;
+    }
+    const normalized = candidate.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    ids.push(normalized);
+  }
+
+  return ids;
 };
 
 const resolveProfileSyncSourceUsername = (args: {
@@ -2061,7 +2091,11 @@ app.put('/api/mappings/:id', authenticateToken, (req: any, res) => {
   const sourceWasExplicitlyProvided = req.body?.profileSyncSourceUsername !== undefined;
   const usernamesWereUpdated = req.body?.twitterUsernames !== undefined;
 
-  if (twitterUsernames.length > 1 && !profileSyncSourceUsername && (sourceWasExplicitlyProvided || usernamesWereUpdated)) {
+  if (
+    twitterUsernames.length > 1 &&
+    !profileSyncSourceUsername &&
+    (sourceWasExplicitlyProvided || usernamesWereUpdated)
+  ) {
     res.status(400).json({
       error: 'Select which Twitter source should drive Bluesky profile sync for multi-source mappings.',
     });
@@ -2180,6 +2214,72 @@ app.post('/api/mappings/:id/bridge-to-fediverse', authenticateToken, async (req:
   } catch (error) {
     res.status(400).json({ error: getErrorMessage(error, 'Failed to bridge account to the fediverse.') });
   }
+});
+
+app.post('/api/mappings/fediverse-bridge-status', authenticateToken, async (req: any, res) => {
+  const config = getConfig();
+  const visibleMappings = getVisibleMappings(config, req.user);
+  const visibleMappingsById = new Map(visibleMappings.map((mapping) => [mapping.id, mapping] as const));
+
+  const requestedIds = parseMappingIds(req.body?.mappingIds);
+  const idsToCheck = (requestedIds.length > 0 ? requestedIds : visibleMappings.map((mapping) => mapping.id))
+    .filter((id) => visibleMappingsById.has(id))
+    .slice(0, 200);
+
+  if (idsToCheck.length === 0) {
+    res.json({});
+    return;
+  }
+
+  const statuses: Record<string, FediverseBridgeStatusView> = {};
+  for (const chunk of chunkArray(idsToCheck, FEDIVERSE_BRIDGE_STATUS_CHUNK_SIZE)) {
+    const chunkResults = await Promise.all(
+      chunk.map(async (id) => {
+        const mapping = visibleMappingsById.get(id);
+        if (!mapping) {
+          return {
+            id,
+            status: {
+              bridged: false,
+              checkedAt: new Date().toISOString(),
+              error: 'Mapping not visible to current user.',
+            } satisfies FediverseBridgeStatusView,
+          };
+        }
+
+        try {
+          const result = await getFediverseBridgeStatus({
+            bskyIdentifier: mapping.bskyIdentifier,
+            bskyPassword: mapping.bskyPassword,
+            bskyServiceUrl: mapping.bskyServiceUrl,
+          });
+
+          return {
+            id,
+            status: {
+              bridged: result.bridged,
+              checkedAt: new Date().toISOString(),
+            } satisfies FediverseBridgeStatusView,
+          };
+        } catch (error) {
+          return {
+            id,
+            status: {
+              bridged: false,
+              checkedAt: new Date().toISOString(),
+              error: getErrorMessage(error, 'Failed to check fediverse bridge status.'),
+            } satisfies FediverseBridgeStatusView,
+          };
+        }
+      }),
+    );
+
+    for (const result of chunkResults) {
+      statuses[result.id] = result.status;
+    }
+  }
+
+  res.json(statuses);
 });
 
 app.delete('/api/mappings/:id', authenticateToken, (req: any, res) => {

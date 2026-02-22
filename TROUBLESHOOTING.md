@@ -17,13 +17,30 @@ If `./update.sh` fails with "Pulling is not possible because you have unmerged f
    ```
 
 ### PM2 interpreter mismatch
-If PM2 logs show command/runtime errors after an update (for example old `npm`/`node` interpreter paths):
+If PM2 logs show command/runtime errors after an update (for example stale interpreter paths):
+
+Common error signature:
+
+```text
+TypeError: require() async module ".../dist/index.js" is unsupported. use "await import()" instead.
+```
 
 1. Run the repair script:
    ```bash
    chmod +x repair_pm2.sh
-    ./repair_pm2.sh
-    ```
+   ./repair_pm2.sh
+   ```
+2. If needed, manually recreate PM2 with Bun as the process command:
+   ```bash
+   pm2 delete tweets-2-bsky || true
+   pm2 delete twitter-mirror || true
+   pm2 start "$HOME/.bun/bin/bun" --name tweets-2-bsky --cwd "$PWD" -- dist/index.js
+   pm2 save
+   ```
+3. Old crash lines remain in PM2 logs until log rotation/flush. Clear them if needed:
+   ```bash
+   pm2 flush
+   ```
 
 ### `bun: command not found`
 If Bun is missing on a source install host:

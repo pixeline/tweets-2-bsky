@@ -406,16 +406,13 @@ start_with_pm2() {
   fi
 
   if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-    echo "[pm2] Restarting existing process with updated env: $APP_NAME"
-    pm2 restart "$APP_NAME" --update-env --interpreter "$BUN_BIN" || {
-      echo "[pm2] Restart failed, recreating process with Bun interpreter"
-      pm2 delete "$APP_NAME" || true
-      pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
-    }
+    echo "[pm2] Recreating existing process with Bun binary launcher: $APP_NAME"
+    pm2 delete "$APP_NAME" || true
   else
     echo "[pm2] Starting new process: $APP_NAME (cwd=$SCRIPT_DIR, script=dist/index.js)"
-    pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
   fi
+
+  pm2 start "$BUN_BIN" --name "$APP_NAME" --cwd "$SCRIPT_DIR" --update-env -- dist/index.js
 
   echo "[pm2] Saving PM2 process list"
   pm2 save || true

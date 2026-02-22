@@ -397,6 +397,12 @@ pm2_has_process() {
   command -v pm2 >/dev/null 2>&1 && pm2 describe "$name" >/dev/null 2>&1
 }
 
+start_pm2_process_with_bun() {
+  local name="$1"
+  pm2 delete "$name" >/dev/null 2>&1 || true
+  pm2 start "$BUN_BIN" --name "$name" --cwd "$SCRIPT_DIR" --update-env -- dist/index.js
+}
+
 nohup_process_running() {
   if [[ ! -f "$PID_FILE" ]]; then
     return 1
@@ -438,12 +444,8 @@ restart_runtime() {
 
     if [[ "$has_app" -eq 1 && "$has_legacy" -eq 1 ]]; then
       echo "ℹ️  Found both PM2 processes ($APP_NAME and $LEGACY_APP_NAME). Consolidating to $APP_NAME..."
-      echo "[pm2] Restarting $APP_NAME with updated environment"
-      pm2 restart "$APP_NAME" --update-env --interpreter "$BUN_BIN" || {
-        echo "[pm2] Restart failed. Recreating $APP_NAME"
-        pm2 delete "$APP_NAME" || true
-        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
-      }
+      echo "[pm2] Recreating $APP_NAME with Bun binary launcher"
+      start_pm2_process_with_bun "$APP_NAME"
       echo "[pm2] Removing duplicate legacy process $LEGACY_APP_NAME"
       pm2 delete "$LEGACY_APP_NAME" || true
       echo "[pm2] Saving PM2 process list"
@@ -453,12 +455,8 @@ restart_runtime() {
     fi
 
     if [[ "$has_app" -eq 1 ]]; then
-      echo "[pm2] Restarting $APP_NAME with updated environment"
-      pm2 restart "$APP_NAME" --update-env --interpreter "$BUN_BIN" || {
-        echo "⚠️  PM2 restart failed for $APP_NAME. Recreating process..."
-        pm2 delete "$APP_NAME" || true
-        pm2 start dist/index.js --name "$APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
-      }
+      echo "[pm2] Recreating $APP_NAME with Bun binary launcher"
+      start_pm2_process_with_bun "$APP_NAME"
       echo "[pm2] Saving PM2 process list"
       pm2 save || true
       echo "✅ Restarted PM2 process: $APP_NAME"
@@ -466,12 +464,8 @@ restart_runtime() {
     fi
 
     if [[ "$has_legacy" -eq 1 ]]; then
-      echo "[pm2] Restarting legacy process $LEGACY_APP_NAME with updated environment"
-      pm2 restart "$LEGACY_APP_NAME" --update-env --interpreter "$BUN_BIN" || {
-        echo "⚠️  PM2 restart failed for $LEGACY_APP_NAME. Recreating it..."
-        pm2 delete "$LEGACY_APP_NAME" || true
-        pm2 start dist/index.js --name "$LEGACY_APP_NAME" --cwd "$SCRIPT_DIR" --interpreter "$BUN_BIN" --update-env
-      }
+      echo "[pm2] Recreating legacy process $LEGACY_APP_NAME with Bun binary launcher"
+      start_pm2_process_with_bun "$LEGACY_APP_NAME"
       echo "[pm2] Saving PM2 process list"
       pm2 save || true
       echo "✅ Restarted PM2 process: $LEGACY_APP_NAME"

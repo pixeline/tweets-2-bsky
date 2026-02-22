@@ -494,10 +494,29 @@ bun run cli -- backfill <mapping-id-or-handle> --limit 50
 ### Option B: manage PM2 directly
 
 ```bash
-pm2 start dist/index.js --name tweets-2-bsky --interpreter bun
+pm2 start "$HOME/.bun/bin/bun" --name tweets-2-bsky --cwd "$PWD" -- dist/index.js
 pm2 logs tweets-2-bsky
 pm2 restart tweets-2-bsky --update-env
 pm2 save
+```
+
+Do not use `--interpreter bun` with `dist/index.js` on PM2 installs that cannot `require()` async ESM modules. Use Bun as the process command instead (example above).
+
+### PM2 migration help (older manual installs)
+
+If you manually created PM2 processes on older versions, migrate once to the Bun binary launcher:
+
+```bash
+pm2 delete tweets-2-bsky || true
+pm2 delete twitter-mirror || true
+pm2 start "$HOME/.bun/bin/bun" --name tweets-2-bsky --cwd "$PWD" -- dist/index.js
+pm2 save
+```
+
+If your existing process must keep the legacy name:
+
+```bash
+pm2 start "$HOME/.bun/bin/bun" --name twitter-mirror --cwd "$PWD" -- dist/index.js
 ```
 
 ### Option C: no PM2 (nohup)
@@ -531,6 +550,7 @@ Use:
 - rebuilds native modules when runtime/dependencies changed
 - builds server + web dashboard
 - restarts existing runtime for PM2 **or** nohup mode
+- normalizes PM2 runtime to Bun binary launcher mode (avoids Bun interpreter crash loops on some PM2 builds)
 - preserves local `config.json` and `.env` with backup/restore
 
 Useful update flags:

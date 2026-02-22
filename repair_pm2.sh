@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 echo "🔧 Repairing PM2 process environment..."
 
 if ! command -v pm2 >/dev/null 2>&1; then
@@ -71,8 +74,8 @@ echo "Found process: $PROCESS_NAME"
 echo "Deleting process..."
 pm2 delete "$PROCESS_NAME" || true
 
-echo "Starting process with fresh environment using Bun interpreter..."
-pm2 start dist/index.js --name "$PROCESS_NAME" --interpreter "$BUN_BIN"
+echo "Starting process with fresh environment using Bun binary launcher..."
+pm2 start "$BUN_BIN" --name "$PROCESS_NAME" --cwd "$SCRIPT_DIR" --update-env -- dist/index.js
 
 echo "Saving PM2 list..."
 pm2 save

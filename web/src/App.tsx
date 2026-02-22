@@ -186,6 +186,12 @@ interface BskyProfileView {
   createdAt?: string;
 }
 
+interface FediverseBridgeStatusView {
+  bridged: boolean;
+  checkedAt: string;
+  error?: string;
+}
+
 interface PendingBackfill {
   id: string;
   limit?: number;
@@ -774,6 +780,10 @@ function App() {
   const [syncingProfileMappingId, setSyncingProfileMappingId] = useState<string | null>(null);
   const [isSyncAllProfilesBusy, setIsSyncAllProfilesBusy] = useState(false);
   const [bridgingMappingId, setBridgingMappingId] = useState<string | null>(null);
+  const [isBridgeAllBusy, setIsBridgeAllBusy] = useState(false);
+  const [fediverseBridgeStatusByMappingId, setFediverseBridgeStatusByMappingId] = useState<
+    Record<string, FediverseBridgeStatusView>
+  >({});
   const [editForm, setEditForm] = useState<MappingFormState>(defaultMappingForm);
   const [editTwitterUsers, setEditTwitterUsers] = useState<string[]>([]);
   const [editTwitterInput, setEditTwitterInput] = useState('');
@@ -829,6 +839,8 @@ function App() {
   const postsSearchRequestRef = useRef(0);
   const statusRequestRef = useRef(0);
   const statusMutationRef = useRef(0);
+  const fediverseBridgeStatusByMappingIdRef = useRef<Record<string, FediverseBridgeStatusView>>({});
+  const bridgeStatusFetchRef = useRef<Promise<Record<string, FediverseBridgeStatusView> | null> | null>(null);
 
   const isAdmin = me?.isAdmin ?? false;
   const effectivePermissions = useMemo<UserPermissions>(() => normalizePermissions(me?.permissions), [me?.permissions]);
@@ -842,6 +854,11 @@ function App() {
   const authHeaders = useMemo(() => (token ? { Authorization: `Bearer ${token}` } : undefined), [token]);
 
   useEffect(() => {
+    const debugApiLogging = window.localStorage.getItem('debug-api') === '1';
+    if (!debugApiLogging) {
+      return;
+    }
+
     const requestInterceptor = axios.interceptors.request.use((config) => {
       console.debug('[tweets-2-bsky:web] api-request', {
         method: config.method?.toUpperCase(),
@@ -915,6 +932,8 @@ function App() {
     setSyncingProfileMappingId(null);
     setIsSyncAllProfilesBusy(false);
     setBridgingMappingId(null);
+    setIsBridgeAllBusy(false);
+    setFediverseBridgeStatusByMappingId({});
     setEditTwitterUsers([]);
     setNewGroupName('');
     setNewGroupEmoji(DEFAULT_GROUP_EMOJI);
@@ -950,6 +969,10 @@ function App() {
     },
     [handleLogout, showNotice],
   );
+
+  useEffect(() => {
+    fediverseBridgeStatusByMappingIdRef.current = fediverseBridgeStatusByMappingId;
+  }, [fediverseBridgeStatusByMappingId]);
 
   const fetchBootstrapStatus = useCallback(async () => {
     try {
@@ -1062,15 +1085,15 @@ function App() {
   }, [authHeaders, handleAuthFailure, isAdmin]);
 
   const fetchProfiles = useCallback(
-    async (actors: string[]) => {
+    async (actors: string[]): Promise<Record<string, BskyProfileView> | null> => {
       if (!authHeaders) {
-        return;
+        return null;
       }
 
       const normalizedActors = [...new Set(actors.map(normalizeTwitterUsername).filter((actor) => actor.length > 0))];
       if (normalizedActors.length === 0) {
         setProfilesByActor({});
-        return;
+        return {};
       }
 
       try {
@@ -1079,76 +1102,164 @@ function App() {
           { actors: normalizedActors },
           { headers: authHeaders },
         );
-        setProfilesByActor(response.data || {});
+        const nextProfiles = response.data || {};
+        setProfilesByActor(nextProfiles);
+        return nextProfiles;
       } catch (error) {
         handleAuthFailure(error, 'Failed to resolve Bluesky profiles.');
+        return null;
       }
     },
     [authHeaders, handleAuthFailure],
   );
 
-  const fetchData = useCallback(async () => {
-    if (!authHeaders) {
-      return;
-    }
-
-    try {
-      const [meResponse, mappingsResponse, groupsResponse] = await Promise.all([
-        axios.get<AuthUser>('/api/me', { headers: authHeaders }),
-        axios.get<AccountMapping[]>('/api/mappings', { headers: authHeaders }),
-        axios.get<AccountGroup[]>('/api/groups', { headers: authHeaders }),
-      ]);
-
-      const profile = meResponse.data;
-      const mappingData = Array.isArray(mappingsResponse.data) ? mappingsResponse.data : [];
-      const groupData = Array.isArray(groupsResponse.data) ? groupsResponse.data : [];
-      setMe({
-        ...profile,
-        permissions: normalizePermissions(profile.permissions),
-      });
-      setMappings(mappingData);
-      setGroups(groupData);
-      setEmailForm((previous) => ({
-        ...previous,
-        currentEmail: profile.email || '',
-      }));
-      const versionResponse = await axios.get<RuntimeVersionInfo>('/api/version', { headers: authHeaders });
-      setRuntimeVersion(versionResponse.data);
-
-      if (profile.isAdmin) {
-        const [twitterResponse, aiResponse, updateStatusResponse, usersResponse] = await Promise.all([
-          axios.get<TwitterConfig>('/api/twitter-config', { headers: authHeaders }),
-          axios.get<AIConfig>('/api/ai-config', { headers: authHeaders }),
-          axios.get<UpdateStatusInfo>('/api/update-status', { headers: authHeaders }),
-          axios.get<ManagedUser[]>('/api/admin/users', { headers: authHeaders }),
-        ]);
-
-        setTwitterConfig({
-          authToken: twitterResponse.data.authToken || '',
-          ct0: twitterResponse.data.ct0 || '',
-          backupAuthToken: twitterResponse.data.backupAuthToken || '',
-          backupCt0: twitterResponse.data.backupCt0 || '',
-        });
-
-        setAiConfig({
-          provider: aiResponse.data.provider || 'gemini',
-          apiKey: aiResponse.data.apiKey || '',
-          model: aiResponse.data.model || '',
-          baseUrl: aiResponse.data.baseUrl || '',
-        });
-        setUpdateStatus(updateStatusResponse.data);
-        setManagedUsers(Array.isArray(usersResponse.data) ? usersResponse.data : []);
-      } else {
-        setUpdateStatus(null);
-        setManagedUsers([]);
+  const fetchFediverseBridgeStatuses = useCallback(
+    async (
+      mappingData: AccountMapping[],
+      options?: {
+        force?: boolean;
+      },
+    ): Promise<Record<string, FediverseBridgeStatusView> | null> => {
+      if (!authHeaders) {
+        return null;
       }
 
-      await Promise.all([fetchStatus(), fetchRecentActivity(), fetchEnrichedPosts()]);
-      await fetchProfiles(mappingData.map((mapping) => mapping.bskyIdentifier));
-    } catch (error) {
-      handleAuthFailure(error, 'Failed to load dashboard data.');
-    }
-  }, [authHeaders, fetchEnrichedPosts, fetchProfiles, fetchRecentActivity, fetchStatus, handleAuthFailure]);
+      const mappingIds = [...new Set(mappingData.map((mapping) => mapping.id).filter((id) => id.length > 0))];
+      if (mappingIds.length === 0) {
+        setFediverseBridgeStatusByMappingId({});
+        return {};
+      }
+
+      if (!options?.force && bridgeStatusFetchRef.current) {
+        return bridgeStatusFetchRef.current;
+      }
+
+      const request = (async () => {
+        try {
+          const response = await axios.post<Record<string, FediverseBridgeStatusView>>(
+            '/api/mappings/fediverse-bridge-status',
+            { mappingIds },
+            { headers: authHeaders },
+          );
+          const nextStatuses = response.data || {};
+          setFediverseBridgeStatusByMappingId((previous) => {
+            const next = { ...previous };
+            for (const id of mappingIds) {
+              delete next[id];
+            }
+            for (const [id, status] of Object.entries(nextStatuses)) {
+              next[id] = status;
+            }
+            return next;
+          });
+          return nextStatuses;
+        } catch (error) {
+          if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
+            handleLogout();
+            return null;
+          }
+          console.warn('Failed to fetch fediverse bridge statuses.', error);
+          return null;
+        } finally {
+          bridgeStatusFetchRef.current = null;
+        }
+      })();
+
+      bridgeStatusFetchRef.current = request;
+      return request;
+    },
+    [authHeaders, handleLogout],
+  );
+
+  const fetchData = useCallback(
+    async (options?: { refreshBridgeStatuses?: boolean }) => {
+      if (!authHeaders) {
+        return;
+      }
+
+      try {
+        const [meResponse, mappingsResponse, groupsResponse] = await Promise.all([
+          axios.get<AuthUser>('/api/me', { headers: authHeaders }),
+          axios.get<AccountMapping[]>('/api/mappings', { headers: authHeaders }),
+          axios.get<AccountGroup[]>('/api/groups', { headers: authHeaders }),
+        ]);
+
+        const profile = meResponse.data;
+        const mappingData = Array.isArray(mappingsResponse.data) ? mappingsResponse.data : [];
+        const groupData = Array.isArray(groupsResponse.data) ? groupsResponse.data : [];
+        setMe({
+          ...profile,
+          permissions: normalizePermissions(profile.permissions),
+        });
+        setMappings(mappingData);
+        setGroups(groupData);
+        setEmailForm((previous) => ({
+          ...previous,
+          currentEmail: profile.email || '',
+        }));
+        const versionResponse = await axios.get<RuntimeVersionInfo>('/api/version', { headers: authHeaders });
+        setRuntimeVersion(versionResponse.data);
+
+        if (profile.isAdmin) {
+          const [twitterResponse, aiResponse, updateStatusResponse, usersResponse] = await Promise.all([
+            axios.get<TwitterConfig>('/api/twitter-config', { headers: authHeaders }),
+            axios.get<AIConfig>('/api/ai-config', { headers: authHeaders }),
+            axios.get<UpdateStatusInfo>('/api/update-status', { headers: authHeaders }),
+            axios.get<ManagedUser[]>('/api/admin/users', { headers: authHeaders }),
+          ]);
+
+          setTwitterConfig({
+            authToken: twitterResponse.data.authToken || '',
+            ct0: twitterResponse.data.ct0 || '',
+            backupAuthToken: twitterResponse.data.backupAuthToken || '',
+            backupCt0: twitterResponse.data.backupCt0 || '',
+          });
+
+          setAiConfig({
+            provider: aiResponse.data.provider || 'gemini',
+            apiKey: aiResponse.data.apiKey || '',
+            model: aiResponse.data.model || '',
+            baseUrl: aiResponse.data.baseUrl || '',
+          });
+          setUpdateStatus(updateStatusResponse.data);
+          setManagedUsers(Array.isArray(usersResponse.data) ? usersResponse.data : []);
+        } else {
+          setUpdateStatus(null);
+          setManagedUsers([]);
+        }
+
+        const mappingIds = new Set(mappingData.map((mapping) => mapping.id));
+        setFediverseBridgeStatusByMappingId((previous) => {
+          const next = Object.fromEntries(
+            Object.entries(previous).filter(([mappingId]) => mappingIds.has(mappingId)),
+          ) as Record<string, FediverseBridgeStatusView>;
+          return next;
+        });
+
+        await Promise.all([fetchStatus(), fetchRecentActivity(), fetchEnrichedPosts()]);
+
+        void fetchProfiles(mappingData.map((mapping) => mapping.bskyIdentifier));
+
+        const shouldRefreshBridgeStatuses =
+          options?.refreshBridgeStatuses === true ||
+          mappingData.some((mapping) => fediverseBridgeStatusByMappingIdRef.current[mapping.id] === undefined);
+        if (shouldRefreshBridgeStatuses) {
+          void fetchFediverseBridgeStatuses(mappingData, { force: options?.refreshBridgeStatuses === true });
+        }
+      } catch (error) {
+        handleAuthFailure(error, 'Failed to load dashboard data.');
+      }
+    },
+    [
+      authHeaders,
+      fetchEnrichedPosts,
+      fetchFediverseBridgeStatuses,
+      fetchProfiles,
+      fetchRecentActivity,
+      fetchStatus,
+      handleAuthFailure,
+    ],
+  );
 
   useEffect(() => {
     localStorage.setItem('theme-mode', themeMode);
@@ -1210,7 +1321,7 @@ function App() {
       return;
     }
 
-    void fetchData();
+    void fetchData({ refreshBridgeStatuses: true });
   }, [token, fetchBootstrapStatus, fetchData]);
 
   useEffect(() => {
@@ -1224,24 +1335,36 @@ function App() {
       return;
     }
 
+    const statusPollIntervalMs = activeTab === 'accounts' ? 7000 : 3000;
+    const shouldPollActivity = activeTab === 'overview' || activeTab === 'activity';
+    const shouldPollPosts = activeTab === 'overview' || activeTab === 'posts';
+
     const statusInterval = window.setInterval(() => {
       void fetchStatus();
-    }, 2000);
+    }, statusPollIntervalMs);
 
-    const activityInterval = window.setInterval(() => {
-      void fetchRecentActivity();
-    }, 7000);
+    const activityInterval = shouldPollActivity
+      ? window.setInterval(() => {
+          void fetchRecentActivity();
+        }, 7000)
+      : null;
 
-    const postsInterval = window.setInterval(() => {
-      void fetchEnrichedPosts();
-    }, 12000);
+    const postsInterval = shouldPollPosts
+      ? window.setInterval(() => {
+          void fetchEnrichedPosts();
+        }, 12000)
+      : null;
 
     return () => {
       window.clearInterval(statusInterval);
-      window.clearInterval(activityInterval);
-      window.clearInterval(postsInterval);
+      if (activityInterval !== null) {
+        window.clearInterval(activityInterval);
+      }
+      if (postsInterval !== null) {
+        window.clearInterval(postsInterval);
+      }
     };
-  }, [token, fetchEnrichedPosts, fetchRecentActivity, fetchStatus]);
+  }, [activeTab, token, fetchEnrichedPosts, fetchRecentActivity, fetchStatus]);
 
   useEffect(() => {
     if (!token) {
@@ -1261,7 +1384,7 @@ function App() {
   }, [token, isAdmin, fetchRuntimeVersion, fetchUpdateStatus]);
 
   useEffect(() => {
-    if (!status?.nextCheckTime) {
+    if (activeTab !== 'overview' || !status?.nextCheckTime) {
       setCountdown('--');
       return;
     }
@@ -1284,7 +1407,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [status?.nextCheckTime]);
+  }, [activeTab, status?.nextCheckTime]);
 
   useEffect(() => {
     return () => {
@@ -1329,7 +1452,9 @@ function App() {
       return;
     }
 
-    const candidates = [...new Set(editTwitterUsers.map(normalizeTwitterUsername).filter((username) => username.length > 0))];
+    const candidates = [
+      ...new Set(editTwitterUsers.map(normalizeTwitterUsername).filter((username) => username.length > 0)),
+    ];
     const selected = normalizeTwitterUsername(editForm.profileSyncSourceUsername || '');
     if (candidates.length === 0) {
       if (editForm.profileSyncSourceUsername !== '') {
@@ -1439,6 +1564,37 @@ function App() {
     }
     return mappings.filter((mapping) => mapping.createdByUserId === accountsCreatorFilter);
   }, [accountsCreatorFilter, isAdmin, mappings]);
+  const bridgedMappingsForView = useMemo(
+    () =>
+      [...accountMappingsForView]
+        .filter((mapping) => fediverseBridgeStatusByMappingId[mapping.id]?.bridged === true)
+        .sort((a, b) => a.bskyIdentifier.localeCompare(b.bskyIdentifier)),
+    [accountMappingsForView, fediverseBridgeStatusByMappingId],
+  );
+  const bridgeEligibleUnbridgedMappings = useMemo(
+    () =>
+      accountMappingsForView
+        .filter(
+          (mapping) =>
+            canManageAllMappings ||
+            (canManageOwnMappings && (!mapping.createdByUserId || mapping.createdByUserId === me?.id)),
+        )
+        .filter((mapping) => {
+          if (fediverseBridgeStatusByMappingId[mapping.id]?.bridged === true) {
+            return false;
+          }
+          const profile = profilesByActor[normalizeTwitterUsername(mapping.bskyIdentifier)];
+          return canBridgeToFediverse(profile?.createdAt);
+        }),
+    [
+      accountMappingsForView,
+      canManageAllMappings,
+      canManageOwnMappings,
+      fediverseBridgeStatusByMappingId,
+      me?.id,
+      profilesByActor,
+    ],
+  );
   const groupedMappings = useMemo(() => {
     const groups = new Map<string, { key: string; name: string; emoji: string; mappings: AccountMapping[] }>();
     for (const option of groupOptions) {
@@ -2024,6 +2180,14 @@ function App() {
     try {
       await axios.delete(`/api/mappings/${mappingId}`, { headers: authHeaders });
       setMappings((prev) => prev.filter((mapping) => mapping.id !== mappingId));
+      setFediverseBridgeStatusByMappingId((previous) => {
+        if (!(mappingId in previous)) {
+          return previous;
+        }
+        const next = { ...previous };
+        delete next[mappingId];
+        return next;
+      });
       showNotice('success', 'Mapping deleted.');
       await fetchData();
     } catch (error) {
@@ -2145,6 +2309,10 @@ function App() {
     if (!authHeaders) {
       return;
     }
+    if (isBridgeAllBusy) {
+      showNotice('info', 'Bridge-all is currently running. Please wait.');
+      return;
+    }
 
     const candidates = accountMappingsForView.filter((mapping) => canManageMapping(mapping));
     if (candidates.length === 0) {
@@ -2257,26 +2425,46 @@ function App() {
     }
   };
 
-  const handleBridgeToFediverse = async (mapping: AccountMapping) => {
+  const bridgeMappingToFediverse = async (
+    mapping: AccountMapping,
+    options?: {
+      confirm?: boolean;
+      showNoticeOnResult?: boolean;
+    },
+  ): Promise<{ ok: boolean; newlyBridged: boolean; skippedAsAlreadyBridged?: boolean }> => {
     if (!authHeaders) {
-      return;
+      return { ok: false, newlyBridged: false };
     }
     if (!canManageMapping(mapping)) {
-      showNotice('error', 'You do not have permission to bridge this mapping.');
-      return;
+      if (options?.showNoticeOnResult !== false) {
+        showNotice('error', 'You do not have permission to bridge this mapping.');
+      }
+      return { ok: false, newlyBridged: false };
+    }
+
+    const knownStatus = fediverseBridgeStatusByMappingId[mapping.id];
+    if (knownStatus?.bridged === true) {
+      if (options?.showNoticeOnResult !== false) {
+        showNotice('info', `${mapping.bskyIdentifier} is already bridged.`);
+      }
+      return { ok: true, newlyBridged: false, skippedAsAlreadyBridged: true };
     }
 
     const profile = getProfileForActor(mapping.bskyIdentifier);
     if (!canBridgeToFediverse(profile?.createdAt)) {
-      showNotice('error', 'This Bluesky account must be at least 7 days old before bridging.');
-      return;
+      if (options?.showNoticeOnResult !== false) {
+        showNotice('error', 'This Bluesky account must be at least 7 days old before bridging.');
+      }
+      return { ok: false, newlyBridged: false };
     }
 
-    const confirmed = window.confirm(
-      `Bridge ${mapping.bskyIdentifier} to the fediverse now? This follows @ap.brid.gy and posts the bridge announcement.`,
-    );
-    if (!confirmed) {
-      return;
+    if (options?.confirm !== false) {
+      const confirmed = window.confirm(
+        `Bridge ${mapping.bskyIdentifier} to the fediverse now? This follows @ap.brid.gy and posts the bridge announcement.`,
+      );
+      if (!confirmed) {
+        return { ok: false, newlyBridged: false };
+      }
     }
 
     setBridgingMappingId(mapping.id);
@@ -2286,15 +2474,128 @@ function App() {
         {},
         { headers: authHeaders },
       );
-      showNotice(
-        'success',
-        `Fediverse bridge enabled: ${response.data?.fediverseAddress || `@${mapping.bskyIdentifier}@bsky.brid.gy`}`,
-      );
-      await fetchRecentActivity();
+      setFediverseBridgeStatusByMappingId((previous) => ({
+        ...previous,
+        [mapping.id]: {
+          bridged: true,
+          checkedAt: new Date().toISOString(),
+        },
+      }));
+
+      if (options?.showNoticeOnResult !== false) {
+        showNotice(
+          'success',
+          `Fediverse bridge enabled: ${response.data?.fediverseAddress || `@${mapping.bskyIdentifier}@bsky.brid.gy`}`,
+        );
+      }
+
+      return { ok: true, newlyBridged: true };
     } catch (error) {
-      handleAuthFailure(error, 'Failed to bridge this account to the fediverse.');
+      if (options?.showNoticeOnResult !== false) {
+        handleAuthFailure(error, 'Failed to bridge this account to the fediverse.');
+      }
+      return { ok: false, newlyBridged: false };
     } finally {
       setBridgingMappingId((previous) => (previous === mapping.id ? null : previous));
+    }
+  };
+
+  const handleBridgeToFediverse = async (mapping: AccountMapping) => {
+    const outcome = await bridgeMappingToFediverse(mapping, {
+      confirm: true,
+      showNoticeOnResult: true,
+    });
+    if (outcome.ok && outcome.newlyBridged) {
+      await fetchRecentActivity();
+    }
+  };
+
+  const handleBridgeAllEligible = async () => {
+    if (!authHeaders) {
+      return;
+    }
+    if (isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)) {
+      showNotice('info', 'Profile sync is currently running. Please wait before bridge-all.');
+      return;
+    }
+
+    const manageable = accountMappingsForView.filter((mapping) => canManageMapping(mapping));
+    if (manageable.length === 0) {
+      showNotice('info', 'No accounts available for fediverse bridge.');
+      return;
+    }
+
+    const refreshedStatuses = await fetchFediverseBridgeStatuses(manageable, { force: true });
+    const refreshedProfiles = await fetchProfiles(manageable.map((mapping) => mapping.bskyIdentifier));
+    const statusLookup = {
+      ...fediverseBridgeStatusByMappingId,
+      ...(refreshedStatuses || {}),
+    };
+    const profileLookup = {
+      ...profilesByActor,
+      ...(refreshedProfiles || {}),
+    };
+
+    const alreadyBridged = manageable.filter((mapping) => statusLookup[mapping.id]?.bridged === true);
+    const eligible = manageable.filter((mapping) => {
+      if (statusLookup[mapping.id]?.bridged === true) {
+        return false;
+      }
+      const profile = profileLookup[normalizeTwitterUsername(mapping.bskyIdentifier)];
+      return canBridgeToFediverse(profile?.createdAt);
+    });
+
+    if (eligible.length === 0) {
+      showNotice(
+        'info',
+        alreadyBridged.length > 0
+          ? 'No new accounts to bridge. Eligible accounts are already bridged.'
+          : 'No eligible unbridged accounts found (accounts must be at least 7 days old).',
+      );
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Bridge ${eligible.length} eligible unbridged account(s) now? This follows @ap.brid.gy and posts the bridge announcement for each account.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsBridgeAllBusy(true);
+    const newlyBridgedLabels: string[] = [];
+    let failedCount = 0;
+
+    try {
+      for (const mapping of eligible) {
+        const outcome = await bridgeMappingToFediverse(mapping, {
+          confirm: false,
+          showNoticeOnResult: false,
+        });
+        if (outcome.ok && outcome.newlyBridged) {
+          newlyBridgedLabels.push(`@${mapping.bskyIdentifier}`);
+        } else {
+          failedCount += 1;
+        }
+      }
+
+      if (newlyBridgedLabels.length > 0) {
+        await fetchRecentActivity();
+      }
+
+      const preview = newlyBridgedLabels.slice(0, 6).join(', ');
+      const more = newlyBridgedLabels.length > 6 ? ` +${newlyBridgedLabels.length - 6} more` : '';
+      const summary =
+        newlyBridgedLabels.length > 0
+          ? `Newly bridged (${newlyBridgedLabels.length}): ${preview}${more}.`
+          : 'No new accounts were bridged.';
+
+      showNotice(
+        failedCount > 0 ? 'info' : 'success',
+        `${summary} Already bridged: ${alreadyBridged.length}. Failed: ${failedCount}.`,
+      );
+    } finally {
+      setIsBridgeAllBusy(false);
     }
   };
 
@@ -2784,7 +3085,8 @@ function App() {
       groupName: mapping.groupName || '',
       groupEmoji: mapping.groupEmoji || '📁',
       profileSyncSourceUsername:
-        mapping.profileSyncSourceUsername || (mapping.twitterUsernames.length === 1 ? mapping.twitterUsernames[0] || '' : ''),
+        mapping.profileSyncSourceUsername ||
+        (mapping.twitterUsernames.length === 1 ? mapping.twitterUsernames[0] || '' : ''),
     });
     setEditTwitterUsers(mapping.twitterUsernames);
     setEditTwitterInput('');
@@ -3527,13 +3829,32 @@ function App() {
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)}
+                    disabled={isSyncAllProfilesBusy || isBridgeAllBusy || Boolean(syncingProfileMappingId)}
                     onClick={() => {
                       void handleSyncAllProfilesFromTwitter();
                     }}
                   >
-                    {isSyncAllProfilesBusy ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+                    {isSyncAllProfilesBusy ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="mr-2 h-4 w-4" />
+                    )}
                     Sync all
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={isBridgeAllBusy || isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)}
+                    onClick={() => {
+                      void handleBridgeAllEligible();
+                    }}
+                  >
+                    {isBridgeAllBusy ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Link2 className="mr-2 h-4 w-4" />
+                    )}
+                    Bridge all
                   </Button>
                   <Badge variant="outline">{accountMappingsForView.length} configured</Badge>
                 </div>
@@ -3632,6 +3953,39 @@ function App() {
                 </div>
               </div>
 
+              <div className="rounded-lg border border-border/70 bg-muted/20 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Fediverse Bridge
+                    </p>
+                    <p className="text-sm text-muted-foreground">
+                      {bridgedMappingsForView.length} bridged - {bridgeEligibleUnbridgedMappings.length} eligible to
+                      bridge now
+                    </p>
+                  </div>
+                  <Badge variant="outline">{bridgedMappingsForView.length} bridged</Badge>
+                </div>
+                {bridgedMappingsForView.length > 0 ? (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {bridgedMappingsForView.slice(0, 24).map((mapping) => {
+                      const profile = getProfileForActor(mapping.bskyIdentifier);
+                      const handle = profile?.handle || mapping.bskyIdentifier;
+                      return (
+                        <Badge key={`bridged-list-${mapping.id}`} variant="success">
+                          <Link2 className="mr-1 h-3 w-3" />@{handle}
+                        </Badge>
+                      );
+                    })}
+                    {bridgedMappingsForView.length > 24 ? (
+                      <Badge variant="outline">+{bridgedMappingsForView.length - 24} more</Badge>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-xs text-muted-foreground">No bridged accounts yet.</p>
+                )}
+              </div>
+
               {filteredGroupedMappings.length === 0 ? (
                 <div className="rounded-lg border border-dashed border-border/70 p-6 text-center text-sm text-muted-foreground">
                   {normalizedAccountsQuery ? 'No accounts matched this search.' : 'No mappings yet.'}
@@ -3720,6 +4074,8 @@ function App() {
                                       const profileUrl = `https://bsky.app/profile/${profileHandle}`;
                                       const canManageThisMapping = canManageMapping(mapping);
                                       const canUseFediverseBridge = canBridgeToFediverse(profile?.createdAt);
+                                      const bridgeStatus = fediverseBridgeStatusByMappingId[mapping.id];
+                                      const isFediverseBridged = bridgeStatus?.bridged === true;
                                       const bridging = bridgingMappingId === mapping.id;
                                       const mappingGroup = getMappingGroupMeta(mapping);
                                       const syncingProfile = syncingProfileMappingId === mapping.id;
@@ -3795,15 +4151,23 @@ function App() {
                                             </div>
                                           </td>
                                           <td className="px-2 py-3 align-top">
-                                            {active ? (
-                                              <Badge variant="warning">Backfilling</Badge>
-                                            ) : queued ? (
-                                              <Badge variant="warning">
-                                                Queued {queuePosition ? `#${queuePosition}` : ''}
-                                              </Badge>
-                                            ) : (
-                                              <Badge variant="success">Active</Badge>
-                                            )}
+                                            <div className="flex flex-wrap items-center gap-1.5">
+                                              {active ? (
+                                                <Badge variant="warning">Backfilling</Badge>
+                                              ) : queued ? (
+                                                <Badge variant="warning">
+                                                  Queued {queuePosition ? `#${queuePosition}` : ''}
+                                                </Badge>
+                                              ) : (
+                                                <Badge variant="success">Active</Badge>
+                                              )}
+                                              {isFediverseBridged ? (
+                                                <Badge variant="success">
+                                                  <Link2 className="mr-1 h-3 w-3" />
+                                                  Bridged
+                                                </Badge>
+                                              ) : null}
+                                            </div>
                                           </td>
                                           <td className="px-2 py-3 align-top">
                                             <div className="flex flex-wrap justify-end gap-1">
@@ -3813,6 +4177,7 @@ function App() {
                                                 disabled={
                                                   !canManageThisMapping ||
                                                   !canManageGroupsPermission ||
+                                                  isBridgeAllBusy ||
                                                   isSyncAllProfilesBusy ||
                                                   Boolean(syncingProfileMappingId)
                                                 }
@@ -3841,6 +4206,7 @@ function App() {
                                                       className={cn(selectClassName, 'h-9 w-44 px-2 py-1 text-xs')}
                                                       value={mapping.profileSyncSourceUsername || ''}
                                                       disabled={
+                                                        isBridgeAllBusy ||
                                                         isSyncAllProfilesBusy ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         Boolean(bridgingMappingId)
@@ -3851,7 +4217,10 @@ function App() {
                                                     >
                                                       <option value="">Select sync source</option>
                                                       {mapping.twitterUsernames.map((username) => (
-                                                        <option key={`sync-source-${mapping.id}-${username}`} value={username}>
+                                                        <option
+                                                          key={`sync-source-${mapping.id}-${username}`}
+                                                          value={username}
+                                                        >
                                                           @{username}
                                                         </option>
                                                       ))}
@@ -3860,6 +4229,7 @@ function App() {
                                                   <Button
                                                     variant="outline"
                                                     size="sm"
+                                                    disabled={isBridgeAllBusy || Boolean(syncingProfileMappingId)}
                                                     onClick={() => startEditMapping(mapping)}
                                                   >
                                                     Edit
@@ -3868,6 +4238,7 @@ function App() {
                                                     variant="outline"
                                                     size="sm"
                                                     disabled={
+                                                      isBridgeAllBusy ||
                                                       Boolean(syncingProfileMappingId) ||
                                                       isSyncAllProfilesBusy ||
                                                       Boolean(bridgingMappingId)
@@ -3883,11 +4254,12 @@ function App() {
                                                     )}
                                                     Sync Profile
                                                   </Button>
-                                                  {canUseFediverseBridge ? (
+                                                  {canUseFediverseBridge && !isFediverseBridged ? (
                                                     <Button
                                                       variant="outline"
                                                       size="sm"
                                                       disabled={
+                                                        isBridgeAllBusy ||
                                                         Boolean(bridgingMappingId) ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         isSyncAllProfilesBusy
@@ -3909,7 +4281,11 @@ function App() {
                                                       <Button
                                                         variant="outline"
                                                         size="sm"
-                                                        disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
+                                                        disabled={
+                                                          isBridgeAllBusy ||
+                                                          Boolean(syncingProfileMappingId) ||
+                                                          isSyncAllProfilesBusy
+                                                        }
                                                         onClick={() => {
                                                           void requestBackfill(mapping.id, 'normal');
                                                         }}
@@ -3920,7 +4296,11 @@ function App() {
                                                         <Button
                                                           variant="ghost"
                                                           size="sm"
-                                                          disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
+                                                          disabled={
+                                                            isBridgeAllBusy ||
+                                                            Boolean(syncingProfileMappingId) ||
+                                                            isSyncAllProfilesBusy
+                                                          }
                                                           onClick={() => {
                                                             void cancelQueuedBackfill(mapping.id);
                                                           }}
@@ -3932,7 +4312,11 @@ function App() {
                                                         <Button
                                                           variant="subtle"
                                                           size="sm"
-                                                          disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
+                                                          disabled={
+                                                            isBridgeAllBusy ||
+                                                            Boolean(syncingProfileMappingId) ||
+                                                            isSyncAllProfilesBusy
+                                                          }
                                                           onClick={() => {
                                                             void requestBackfill(mapping.id, 'reset');
                                                           }}
@@ -3946,7 +4330,11 @@ function App() {
                                                     <Button
                                                       variant="destructive"
                                                       size="sm"
-                                                      disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
+                                                      disabled={
+                                                        isBridgeAllBusy ||
+                                                        Boolean(syncingProfileMappingId) ||
+                                                        isSyncAllProfilesBusy
+                                                      }
                                                       onClick={() => {
                                                         void handleDeleteAllPosts(mapping.id);
                                                       }}
@@ -3960,7 +4348,11 @@ function App() {
                                                 <Button
                                                   variant="ghost"
                                                   size="sm"
-                                                  disabled={Boolean(syncingProfileMappingId) || isSyncAllProfilesBusy}
+                                                  disabled={
+                                                    isBridgeAllBusy ||
+                                                    Boolean(syncingProfileMappingId) ||
+                                                    isSyncAllProfilesBusy
+                                                  }
                                                   onClick={() => {
                                                     void handleDeleteMapping(mapping.id);
                                                   }}

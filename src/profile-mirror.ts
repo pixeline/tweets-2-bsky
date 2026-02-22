@@ -93,6 +93,12 @@ export interface FediverseBridgeResult {
   announcementCid: string;
 }
 
+export interface FediverseBridgeStatusResult {
+  bsky: BlueskyCredentialValidation;
+  bridgeAccountHandle: string;
+  bridged: boolean;
+}
+
 const normalizeTwitterUsername = (value: string) => value.trim().replace(/^@/, '').toLowerCase();
 
 const normalizeOptionalString = (value: unknown): string | undefined => {
@@ -389,11 +395,11 @@ export const fetchTwitterMirrorProfile = async (inputUsername: string): Promise<
   throw new Error('Failed to fetch Twitter profile.');
 };
 
-export const validateBlueskyCredentials = async (args: {
+const loginBlueskyAgent = async (args: {
   bskyIdentifier: string;
   bskyPassword: string;
   bskyServiceUrl?: string;
-}): Promise<BlueskyCredentialValidation> => {
+}): Promise<{ agent: BskyAgent; credentials: BlueskyCredentialValidation }> => {
   const identifier = normalizeOptionalString(args.bskyIdentifier);
   const password = normalizeOptionalString(args.bskyPassword);
   if (!identifier || !password) {
@@ -406,14 +412,27 @@ export const validateBlueskyCredentials = async (args: {
 
   const sessionResponse = await agent.com.atproto.server.getSession();
   const session = sessionResponse.data;
+
   return {
-    did: session.did,
-    handle: session.handle,
-    email: session.email,
-    emailConfirmed: Boolean(session.emailConfirmed),
-    serviceUrl,
-    settingsUrl: BSKY_SETTINGS_URL,
+    agent,
+    credentials: {
+      did: session.did,
+      handle: session.handle,
+      email: session.email,
+      emailConfirmed: Boolean(session.emailConfirmed),
+      serviceUrl,
+      settingsUrl: BSKY_SETTINGS_URL,
+    },
   };
+};
+
+export const validateBlueskyCredentials = async (args: {
+  bskyIdentifier: string;
+  bskyPassword: string;
+  bskyServiceUrl?: string;
+}): Promise<BlueskyCredentialValidation> => {
+  const { credentials } = await loginBlueskyAgent(args);
+  return credentials;
 };
 
 export const applyProfileMirrorSyncState = <T extends MappingProfileSyncState>(
@@ -502,6 +521,23 @@ const hasFollowRecordForDid = async (agent: BskyAgent, subjectDid: string): Prom
   return false;
 };
 
+export const getFediverseBridgeStatus = async (args: {
+  bskyIdentifier: string;
+  bskyPassword: string;
+  bskyServiceUrl?: string;
+}): Promise<FediverseBridgeStatusResult> => {
+  const { agent, credentials } = await loginBlueskyAgent(args);
+
+  const bridgeProfile = await fetchPublicProfile(FEDIVERSE_BRIDGE_HANDLE);
+  const bridged = await hasFollowRecordForDid(agent, bridgeProfile.did);
+
+  return {
+    bsky: credentials,
+    bridgeAccountHandle: bridgeProfile.handle,
+    bridged,
+  };
+};
+
 const uploadProfileImage = async (agent: BskyAgent, url: string, kind: ProfileImageKind): Promise<BlobRef> => {
   const response = await axios.get<ArrayBuffer>(url, {
     responseType: 'arraybuffer',
@@ -576,8 +612,7 @@ export const syncBlueskyProfileFromTwitter = async (args: {
     warnings.push('No Twitter banner found for this profile.');
   }
 
-  const shouldUpdateProfile =
-    changed.displayName || changed.description || Boolean(avatarBlob) || Boolean(bannerBlob);
+  const shouldUpdateProfile = changed.displayName || changed.description || Boolean(avatarBlob) || Boolean(bannerBlob);
 
   if (shouldUpdateProfile) {
     await agent.upsertProfile((existing) => ({
@@ -605,7 +640,7 @@ export const bridgeBlueskyAccountToFediverse = async (args: {
   bskyPassword: string;
   bskyServiceUrl?: string;
 }): Promise<FediverseBridgeResult> => {
-  const bsky = await validateBlueskyCredentials(args);
+  const { agent, credentials: bsky } = await loginBlueskyAgent(args);
   const accountProfile = await fetchPublicProfile(bsky.did || bsky.handle);
   const createdAtRaw = normalizeOptionalString(accountProfile.createdAt);
   if (!createdAtRaw) {
@@ -622,12 +657,6 @@ export const bridgeBlueskyAccountToFediverse = async (args: {
     const ageDays = Math.floor(ageMs / (24 * 60 * 60 * 1000));
     throw new Error(`Account must be at least 7 days old before bridging (currently ${ageDays} day(s)).`);
   }
-
-  const agent = new BskyAgent({ service: bsky.serviceUrl });
-  await agent.login({
-    identifier: args.bskyIdentifier,
-    password: args.bskyPassword,
-  });
 
   const bridgeProfile = await fetchPublicProfile(FEDIVERSE_BRIDGE_HANDLE);
   const alreadyFollowing = await hasFollowRecordForDid(agent, bridgeProfile.did);
