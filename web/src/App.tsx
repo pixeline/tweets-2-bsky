@@ -11,6 +11,7 @@ import {
   Heart,
   History,
   LayoutDashboard,
+  Link2,
   Loader2,
   LogOut,
   MessageCircle,
@@ -1240,9 +1241,7 @@ function App() {
 
         void fetchProfiles(mappingData.map((mapping) => mapping.bskyIdentifier));
 
-        const shouldRefreshBridgeStatuses =
-          options?.refreshBridgeStatuses === true ||
-          mappingData.some((mapping) => fediverseBridgeStatusByMappingIdRef.current[mapping.id] === undefined);
+        const shouldRefreshBridgeStatuses = options?.refreshBridgeStatuses === true;
         if (shouldRefreshBridgeStatuses) {
           void fetchFediverseBridgeStatuses(mappingData, { force: options?.refreshBridgeStatuses === true });
         }
@@ -1321,8 +1320,29 @@ function App() {
       return;
     }
 
-    void fetchData({ refreshBridgeStatuses: true });
+    void fetchData();
   }, [token, fetchBootstrapStatus, fetchData]);
+
+  useEffect(() => {
+    if (!token || activeTab !== 'accounts' || mappings.length === 0) {
+      return;
+    }
+
+    const hasMissingStatuses = mappings.some(
+      (mapping) => fediverseBridgeStatusByMappingIdRef.current[mapping.id] === undefined,
+    );
+    if (!hasMissingStatuses) {
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      void fetchFediverseBridgeStatuses(mappings, { force: true });
+    }, 150);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [activeTab, fetchFediverseBridgeStatuses, mappings, token]);
 
   useEffect(() => {
     if (!bootstrapOpen && authView === 'register') {

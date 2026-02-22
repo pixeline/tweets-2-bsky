@@ -9,12 +9,7 @@ function describeTarget(target: EventTarget | null): string {
   const id = target.id ? `#${target.id}` : '';
   const className =
     typeof target.className === 'string' && target.className.trim().length > 0
-      ? `.${target.className
-          .trim()
-          .split(/\s+/)
-          .filter(Boolean)
-          .slice(0, 3)
-          .join('.')}`
+      ? `.${target.className.trim().split(/\s+/).filter(Boolean).slice(0, 3).join('.')}`
       : '';
 
   return `${tagName}${id}${className}`;
@@ -29,7 +24,11 @@ function eventToPayload(event: Event): Record<string, unknown> {
     path: window.location.pathname,
   };
 
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement
+  ) {
     payload.name = target.name || undefined;
     payload.value = target.value;
   }
@@ -44,6 +43,11 @@ function eventToPayload(event: Event): Record<string, unknown> {
 }
 
 export function setupBrowserDebugLogging(): void {
+  const enabled = window.localStorage.getItem('debug-browser-events') === '1';
+  if (!enabled) {
+    return;
+  }
+
   const events = ['click', 'change', 'input', 'submit'];
 
   events.forEach((eventName) => {

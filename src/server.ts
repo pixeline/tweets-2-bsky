@@ -59,7 +59,7 @@ const APPVIEW_POST_CHUNK_SIZE = 10;
 const APPVIEW_PROFILE_CHUNK_SIZE = 25;
 const APPVIEW_MAX_ATTEMPTS = 2;
 const APPVIEW_RETRY_DELAY_MS = 700;
-const FEDIVERSE_BRIDGE_STATUS_CHUNK_SIZE = 5;
+const FEDIVERSE_BRIDGE_STATUS_CHUNK_SIZE = 2;
 
 function loadPersistedJwtSecret(): string | undefined {
   if (!fs.existsSync(JWT_SECRET_FILE_PATH)) {
