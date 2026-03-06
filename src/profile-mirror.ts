@@ -13,9 +13,10 @@ const BSKY_PUBLIC_APPVIEW_URL = (process.env.BSKY_PUBLIC_APPVIEW_URL || 'https:/
   /\/$/,
   '',
 );
-const MIRROR_SUFFIX = '{UNOFFICIAL}';
+const MIRROR_SUFFIX = '{bot}';
 const FEDIVERSE_BRIDGE_HANDLE = 'ap.brid.gy';
 const MIN_BRIDGE_ACCOUNT_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const BOT_SELF_LABEL_VALUE = 'bot';
 
 type ProfileImageKind = 'avatar' | 'banner';
 
@@ -99,6 +100,12 @@ export interface FediverseBridgeStatusResult {
   bridged: boolean;
 }
 
+export interface EnsureBotSelfLabelResult {
+  bsky: BlueskyCredentialValidation;
+  updated: boolean;
+  hasBotLabel: true;
+}
+
 const normalizeTwitterUsername = (value: string) => value.trim().replace(/^@/, '').toLowerCase();
 
 const normalizeOptionalString = (value: unknown): string | undefined => {
@@ -108,6 +115,31 @@ const normalizeOptionalString = (value: unknown): string | undefined => {
 };
 
 const normalizeMirrorStateUrl = (value?: string): string | undefined => normalizeOptionalString(value);
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
+
+const normalizeSelfLabelValues = (value: unknown): Array<Record<string, unknown>> => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const entries: Array<Record<string, unknown>> = [];
+  for (const item of value) {
+    if (!isRecord(item)) {
+      continue;
+    }
+    const normalizedVal = normalizeOptionalString(item.val);
+    if (!normalizedVal) {
+      continue;
+    }
+    entries.push({
+      ...item,
+      val: normalizedVal,
+    });
+  }
+
+  return entries;
+};
 
 const toNormalizedMirrorState = (state?: ProfileMirrorSyncState) => ({
   sourceUsername: normalizeTwitterUsername(state?.sourceUsername || ''),
@@ -435,6 +467,75 @@ export const validateBlueskyCredentials = async (args: {
   return credentials;
 };
 
+export const ensureBlueskyBotSelfLabel = async (args: {
+  bskyIdentifier: string;
+  bskyPassword: string;
+  bskyServiceUrl?: string;
+}): Promise<EnsureBotSelfLabelResult> => {
+  const { agent, credentials } = await loginBlueskyAgent(args);
+  const repo = agent.session?.did || credentials.did;
+  if (!repo) {
+    throw new Error('Missing Bluesky session DID.');
+  }
+
+  let existingProfileRecord: Record<string, unknown> = {
+    $type: 'app.bsky.actor.profile',
+  };
+
+  try {
+    const response = await agent.com.atproto.repo.getRecord({
+      repo,
+      collection: 'app.bsky.actor.profile',
+      rkey: 'self',
+    });
+    if (isRecord(response.data?.value)) {
+      existingProfileRecord = { ...response.data.value };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const looksLikeMissingRecord = /not found|record.*not.*found|could not locate/i.test(message);
+    if (!looksLikeMissingRecord) {
+      throw error;
+    }
+  }
+
+  const existingLabels = isRecord(existingProfileRecord.labels) ? existingProfileRecord.labels : undefined;
+  const existingValues = normalizeSelfLabelValues(existingLabels?.values);
+  const alreadyHasBotLabel = existingValues.some(
+    (entry) => normalizeOptionalString(entry.val)?.toLowerCase() === BOT_SELF_LABEL_VALUE,
+  );
+  if (alreadyHasBotLabel) {
+    return {
+      bsky: credentials,
+      updated: false,
+      hasBotLabel: true,
+    };
+  }
+
+  const nextValues = [...existingValues, { val: BOT_SELF_LABEL_VALUE }];
+  const nextProfileRecord: Record<string, unknown> = {
+    ...existingProfileRecord,
+    $type: 'app.bsky.actor.profile',
+    labels: {
+      $type: 'com.atproto.label.defs#selfLabels',
+      values: nextValues,
+    },
+  };
+
+  await agent.com.atproto.repo.putRecord({
+    repo,
+    collection: 'app.bsky.actor.profile',
+    rkey: 'self',
+    record: nextProfileRecord,
+  });
+
+  return {
+    bsky: credentials,
+    updated: true,
+    hasBotLabel: true,
+  };
+};
+
 export const applyProfileMirrorSyncState = <T extends MappingProfileSyncState>(
   mapping: T,
   sourceTwitterUsername: string,
@@ -445,9 +546,15 @@ export const applyProfileMirrorSyncState = <T extends MappingProfileSyncState>(
     ...mapping,
     profileSyncSourceUsername: normalizedSource || mapping.profileSyncSourceUsername,
     lastProfileSyncAt: new Date().toISOString(),
-    lastMirroredDisplayName: result.twitterProfile.mirroredDisplayName,
-    lastMirroredDescription: result.twitterProfile.mirroredDescription,
   };
+
+  if (result.changed.displayName) {
+    next.lastMirroredDisplayName = result.twitterProfile.mirroredDisplayName;
+  }
+
+  if (result.changed.description) {
+    next.lastMirroredDescription = result.twitterProfile.mirroredDescription;
+  }
 
   if (result.changed.avatar && result.avatarSynced) {
     next.lastMirroredAvatarUrl = normalizeMirrorStateUrl(result.twitterProfile.avatarUrl);
@@ -560,10 +667,17 @@ export const syncBlueskyProfileFromTwitter = async (args: {
   bskyPassword: string;
   bskyServiceUrl?: string;
   previousSync?: ProfileMirrorSyncState;
+  syncDescription?: boolean;
 }): Promise<MirrorProfileSyncResult> => {
   const twitterProfile = await fetchTwitterMirrorProfile(args.twitterUsername);
   const nextMirrorState = buildMirrorStateFromTwitterProfile(twitterProfile);
-  const changed = hasMirrorStateChanges(args.previousSync, nextMirrorState);
+  const rawChanged = hasMirrorStateChanges(args.previousSync, nextMirrorState);
+  const changed = {
+    displayName: rawChanged.displayName,
+    description: (args.syncDescription ?? true) ? rawChanged.description : false,
+    avatar: rawChanged.avatar,
+    banner: rawChanged.banner,
+  };
   const bsky = await validateBlueskyCredentials({
     bskyIdentifier: args.bskyIdentifier,
     bskyPassword: args.bskyPassword,

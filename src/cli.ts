@@ -17,6 +17,7 @@ import {
 import { dbService } from './db.js';
 import {
   applyProfileMirrorSyncState,
+  ensureBlueskyBotSelfLabel,
   fetchTwitterMirrorProfile,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
@@ -425,6 +426,34 @@ program
     if (!createdMapping) {
       console.log('Mapping added, but could not locate it for automatic profile sync.');
       return;
+    }
+
+    try {
+      const botLabelResult = await ensureBlueskyBotSelfLabel({
+        bskyIdentifier: createdMapping.bskyIdentifier,
+        bskyPassword: createdMapping.bskyPassword,
+        bskyServiceUrl: createdMapping.bskyServiceUrl,
+      });
+      const labeledConfig = getConfig();
+      const labeledIndex = labeledConfig.mappings.findIndex((entry) => entry.id === createdMapping.id);
+      if (labeledIndex !== -1) {
+        const current = labeledConfig.mappings[labeledIndex];
+        if (current && !current.hasBotLabel) {
+          current.hasBotLabel = true;
+          saveConfig(labeledConfig);
+        }
+      }
+      if (botLabelResult.updated) {
+        console.log('Applied Bluesky bot self-label.');
+      } else {
+        console.log('Bluesky bot self-label already present.');
+      }
+    } catch (error) {
+      console.log(
+        `Warning: failed to apply Bluesky bot self-label automatically: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
 
     try {

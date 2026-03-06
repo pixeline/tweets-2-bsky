@@ -25,6 +25,7 @@ import type { ProcessedTweet } from './db.js';
 import {
   applyProfileMirrorSyncState,
   bridgeBlueskyAccountToFediverse,
+  ensureBlueskyBotSelfLabel,
   fetchTwitterMirrorProfile,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
@@ -2082,7 +2083,7 @@ app.post('/api/onboarding/bsky-credentials', authenticateToken, async (req: any,
   }
 });
 
-app.post('/api/mappings', authenticateToken, (req: any, res) => {
+app.post('/api/mappings', authenticateToken, async (req: any, res) => {
   if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
     res.status(403).json({ error: 'You do not have permission to create mappings.' });
     return;
@@ -2140,11 +2141,40 @@ app.post('/api/mappings', authenticateToken, (req: any, res) => {
     groupEmoji: normalizedGroupEmoji || undefined,
     createdByUserId,
     profileSyncSourceUsername,
+    hasBotLabel: false,
   };
 
   ensureGroupExists(config, normalizedGroupName, normalizedGroupEmoji);
   config.mappings.push(newMapping);
   saveConfig(config);
+
+  try {
+    const labelResult = await ensureBlueskyBotSelfLabel({
+      bskyIdentifier: newMapping.bskyIdentifier,
+      bskyPassword: newMapping.bskyPassword,
+      bskyServiceUrl: newMapping.bskyServiceUrl,
+    });
+
+    if (labelResult.hasBotLabel && !newMapping.hasBotLabel) {
+      newMapping.hasBotLabel = true;
+      saveConfig(config);
+    }
+
+    for (const key of [
+      normalizeActor(newMapping.bskyIdentifier),
+      normalizeActor(labelResult.bsky.handle),
+      normalizeActor(labelResult.bsky.did),
+    ]) {
+      if (key) {
+        profileCache.delete(key);
+      }
+    }
+  } catch (error) {
+    console.warn(
+      `[mapping:${newMapping.id}] Failed to apply Bluesky bot self-label during mapping creation: ${getErrorMessage(error)}`,
+    );
+  }
+
   res.json(sanitizeMapping(newMapping, createUserLookupById(config), req.user));
 });
 
@@ -2301,6 +2331,85 @@ app.post('/api/mappings/:id/sync-profile-from-twitter', authenticateToken, async
   } catch (error) {
     res.status(400).json({ error: getErrorMessage(error, 'Failed to sync Bluesky profile from Twitter.') });
   }
+});
+
+app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res) => {
+  if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to update mappings.' });
+    return;
+  }
+
+  const config = getConfig();
+  const usersById = createUserLookupById(config);
+  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) => canManageMapping(req.user, mapping));
+  const requestedIds = parseMappingIds(req.body?.mappingIds);
+  const requestedIdSet = requestedIds.length > 0 ? new Set(requestedIds) : null;
+  const targets = requestedIdSet
+    ? manageableMappings.filter((mapping) => requestedIdSet.has(mapping.id))
+    : manageableMappings;
+
+  if (targets.length === 0) {
+    res.status(400).json({ error: 'No manageable mappings available for bot label update.' });
+    return;
+  }
+
+  let labeled = 0;
+  let alreadyLabeled = 0;
+  let failed = 0;
+  let changed = false;
+  const failedMappings: Array<{ id: string; bskyIdentifier: string; error: string }> = [];
+
+  for (const mapping of targets) {
+    try {
+      const result = await ensureBlueskyBotSelfLabel({
+        bskyIdentifier: mapping.bskyIdentifier,
+        bskyPassword: mapping.bskyPassword,
+        bskyServiceUrl: mapping.bskyServiceUrl,
+      });
+
+      if (result.updated) {
+        labeled += 1;
+      } else {
+        alreadyLabeled += 1;
+      }
+
+      if (!mapping.hasBotLabel) {
+        mapping.hasBotLabel = true;
+        changed = true;
+      }
+
+      for (const key of [
+        normalizeActor(mapping.bskyIdentifier),
+        normalizeActor(result.bsky.handle),
+        normalizeActor(result.bsky.did),
+      ]) {
+        if (key) {
+          profileCache.delete(key);
+        }
+      }
+    } catch (error) {
+      failed += 1;
+      failedMappings.push({
+        id: mapping.id,
+        bskyIdentifier: mapping.bskyIdentifier,
+        error: getErrorMessage(error, 'Failed to update bot label.'),
+      });
+    }
+  }
+
+  if (changed) {
+    saveConfig(config);
+  }
+
+  res.json({
+    success: true,
+    total: targets.length,
+    labeled,
+    alreadyLabeled,
+    failed,
+    failedMappings,
+    mappings: targets.map((mapping) => sanitizeMapping(mapping, usersById, req.user)),
+  });
 });
 
 app.post('/api/mappings/:id/bridge-to-fediverse', authenticateToken, async (req: any, res) => {

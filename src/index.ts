@@ -2136,6 +2136,7 @@ async function maybeSyncMappingProfileInBackground(mapping: AccountMapping, dryR
       bskyIdentifier: mapping.bskyIdentifier,
       bskyPassword: mapping.bskyPassword,
       bskyServiceUrl: mapping.bskyServiceUrl,
+      syncDescription: false,
       previousSync: {
         sourceUsername: mapping.profileSyncSourceUsername,
         mirroredDisplayName: mapping.lastMirroredDisplayName,

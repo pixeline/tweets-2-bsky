@@ -65,6 +65,7 @@ interface AccountMapping {
   lastMirroredDescription?: string;
   lastMirroredAvatarUrl?: string;
   lastMirroredBannerUrl?: string;
+  hasBotLabel?: boolean;
   createdByUser?: {
     id: string;
     username?: string;
@@ -289,6 +290,20 @@ interface MirrorProfileSyncResult {
   warnings: string[];
   sourceTwitterUsername?: string;
   mapping?: AccountMapping;
+}
+
+interface BulkBotLabelAllResult {
+  success: boolean;
+  total: number;
+  labeled: number;
+  alreadyLabeled: number;
+  failed: number;
+  failedMappings?: Array<{
+    id: string;
+    bskyIdentifier: string;
+    error: string;
+  }>;
+  mappings?: AccountMapping[];
 }
 
 interface BootstrapStatus {
@@ -780,6 +795,7 @@ function App() {
   const [isCredentialValidationBusy, setIsCredentialValidationBusy] = useState(false);
   const [syncingProfileMappingId, setSyncingProfileMappingId] = useState<string | null>(null);
   const [isSyncAllProfilesBusy, setIsSyncAllProfilesBusy] = useState(false);
+  const [isBotLabelAllBusy, setIsBotLabelAllBusy] = useState(false);
   const [bridgingMappingId, setBridgingMappingId] = useState<string | null>(null);
   const [isBridgeAllBusy, setIsBridgeAllBusy] = useState(false);
   const [bridgeAllProgress, setBridgeAllProgress] = useState<{
@@ -1590,6 +1606,10 @@ function App() {
     }
     return mappings.filter((mapping) => mapping.createdByUserId === accountsCreatorFilter);
   }, [accountsCreatorFilter, isAdmin, mappings]);
+  const botLabeledMappingsForView = useMemo(
+    () => accountMappingsForView.filter((mapping) => mapping.hasBotLabel === true),
+    [accountMappingsForView],
+  );
   const bridgedMappingsForView = useMemo(
     () =>
       [...accountMappingsForView]
@@ -2386,6 +2406,51 @@ function App() {
     }
   };
 
+  const handleAddBotLabelToAllAccounts = async () => {
+    if (!authHeaders) {
+      return;
+    }
+    if (isBotLabelAllBusy || isBridgeAllBusy || isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)) {
+      showNotice('info', 'Profile or bridge actions are running. Please wait.');
+      return;
+    }
+
+    const candidates = accountMappingsForView.filter((mapping) => canManageMapping(mapping));
+    if (candidates.length === 0) {
+      showNotice('info', 'No accounts available for bot label update.');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Add Bluesky automated-account bot label to ${candidates.length} account(s)? This appends the bot self-label to each app.bsky.actor.profile record.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsBotLabelAllBusy(true);
+    try {
+      const response = await axios.post<BulkBotLabelAllResult>(
+        '/api/mappings/bot-label-all',
+        { mappingIds: candidates.map((mapping) => mapping.id) },
+        { headers: authHeaders },
+      );
+      const result = response.data;
+      await fetchData();
+      const firstFailure = result.failedMappings?.[0];
+      showNotice(
+        result.failed > 0 ? 'info' : 'success',
+        `Bot label update complete: ${result.labeled} added, ${result.alreadyLabeled} already labeled, ${result.failed} failed.${
+          firstFailure ? ` First failure: ${firstFailure.bskyIdentifier} (${firstFailure.error})` : ''
+        }`,
+      );
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to add bot labels to accounts.');
+    } finally {
+      setIsBotLabelAllBusy(false);
+    }
+  };
+
   const handleUpdateProfileSyncSource = async (mapping: AccountMapping, selectedSource: string) => {
     if (!authHeaders) {
       return;
@@ -3024,6 +3089,7 @@ function App() {
       );
 
       const warnings = syncResponse.data.warnings || [];
+      const botLabelApplied = createResponse.data.hasBotLabel === true;
 
       setNewMapping(defaultMappingForm());
       setNewTwitterUsers([]);
@@ -3034,9 +3100,19 @@ function App() {
       setIsAddAccountSheetOpen(false);
       setAddAccountStep(1);
       if (warnings.length > 0) {
-        showNotice('info', `Account mapping added. Profile mirrored with ${warnings.length} warning(s).`);
+        showNotice(
+          'info',
+          `Account mapping added. Profile mirrored with ${warnings.length} warning(s).${
+            botLabelApplied ? '' : ' Bot label was not applied automatically; use the bulk bot-label button in Accounts.'
+          }`,
+        );
       } else {
-        showNotice('success', 'Account mapping added and Bluesky profile mirrored from Twitter.');
+        showNotice(
+          botLabelApplied ? 'success' : 'info',
+          `Account mapping added and Bluesky profile mirrored from Twitter.${
+            botLabelApplied ? '' : ' Bot label was not applied automatically; use the bulk bot-label button in Accounts.'
+          }`,
+        );
       }
       await fetchData();
     } catch (error) {
@@ -3748,11 +3824,19 @@ function App() {
 
       {activeTab === 'overview' ? (
         <section className="space-y-6 animate-fade-in">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <Card className="animate-slide-up">
               <CardContent className="p-4">
                 <p className="text-xs uppercase tracking-wide text-muted-foreground">Mapped Accounts</p>
                 <p className="mt-2 text-2xl font-semibold">{mappings.length}</p>
+              </CardContent>
+            </Card>
+            <Card className="animate-slide-up">
+              <CardContent className="p-4">
+                <p className="text-xs uppercase tracking-wide text-muted-foreground">Bot-Labeled</p>
+                <p className="mt-2 text-2xl font-semibold">
+                  {mappings.filter((mapping) => mapping.hasBotLabel === true).length}
+                </p>
               </CardContent>
             </Card>
             <Card className="animate-slide-up">
@@ -3851,7 +3935,9 @@ function App() {
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={isSyncAllProfilesBusy || isBridgeAllBusy || Boolean(syncingProfileMappingId)}
+                    disabled={
+                      isSyncAllProfilesBusy || isBridgeAllBusy || isBotLabelAllBusy || Boolean(syncingProfileMappingId)
+                    }
                     onClick={() => {
                       void handleSyncAllProfilesFromTwitter();
                     }}
@@ -3866,7 +3952,9 @@ function App() {
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={isBridgeAllBusy || isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)}
+                    disabled={
+                      isBridgeAllBusy || isSyncAllProfilesBusy || isBotLabelAllBusy || Boolean(syncingProfileMappingId)
+                    }
                     onClick={() => {
                       void handleBridgeAllEligible();
                     }}
@@ -3880,6 +3968,23 @@ function App() {
                       ? `Bridging ${bridgeAllProgress.completed}/${bridgeAllProgress.total}`
                       : 'Bridge all'}
                   </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={
+                      isBotLabelAllBusy || isBridgeAllBusy || isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)
+                    }
+                    onClick={() => {
+                      void handleAddBotLabelToAllAccounts();
+                    }}
+                  >
+                    {isBotLabelAllBusy ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <Bot className="mr-2 h-4 w-4" />
+                    )}
+                    Add automated account label to all accounts
+                  </Button>
                   {isBridgeAllBusy && bridgeAllProgress ? (
                     <Badge variant="outline" className="max-w-[280px] truncate">
                       {bridgeAllProgress.currentHandle
@@ -3888,6 +3993,7 @@ function App() {
                     </Badge>
                   ) : null}
                   <Badge variant="outline">{accountMappingsForView.length} configured</Badge>
+                  <Badge variant="outline">{botLabeledMappingsForView.length} bot-labeled</Badge>
                 </div>
               </div>
             </CardHeader>
@@ -4198,6 +4304,12 @@ function App() {
                                                   Bridged
                                                 </Badge>
                                               ) : null}
+                                              {mapping.hasBotLabel ? (
+                                                <Badge variant="outline">
+                                                  <Bot className="mr-1 h-3 w-3" />
+                                                  Bot
+                                                </Badge>
+                                              ) : null}
                                             </div>
                                           </td>
                                           <td className="px-2 py-3 align-top">
@@ -4209,6 +4321,7 @@ function App() {
                                                   !canManageThisMapping ||
                                                   !canManageGroupsPermission ||
                                                   isBridgeAllBusy ||
+                                                  isBotLabelAllBusy ||
                                                   isSyncAllProfilesBusy ||
                                                   Boolean(syncingProfileMappingId)
                                                 }
@@ -4238,6 +4351,7 @@ function App() {
                                                       value={mapping.profileSyncSourceUsername || ''}
                                                       disabled={
                                                         isBridgeAllBusy ||
+                                                        isBotLabelAllBusy ||
                                                         isSyncAllProfilesBusy ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         Boolean(bridgingMappingId)
@@ -4260,7 +4374,9 @@ function App() {
                                                   <Button
                                                     variant="outline"
                                                     size="sm"
-                                                    disabled={isBridgeAllBusy || Boolean(syncingProfileMappingId)}
+                                                    disabled={
+                                                      isBridgeAllBusy || isBotLabelAllBusy || Boolean(syncingProfileMappingId)
+                                                    }
                                                     onClick={() => startEditMapping(mapping)}
                                                   >
                                                     Edit
@@ -4270,6 +4386,7 @@ function App() {
                                                     size="sm"
                                                     disabled={
                                                       isBridgeAllBusy ||
+                                                      isBotLabelAllBusy ||
                                                       Boolean(syncingProfileMappingId) ||
                                                       isSyncAllProfilesBusy ||
                                                       Boolean(bridgingMappingId)
@@ -4291,6 +4408,7 @@ function App() {
                                                       size="sm"
                                                       disabled={
                                                         isBridgeAllBusy ||
+                                                        isBotLabelAllBusy ||
                                                         Boolean(bridgingMappingId) ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         isSyncAllProfilesBusy
@@ -4314,6 +4432,7 @@ function App() {
                                                         size="sm"
                                                         disabled={
                                                           isBridgeAllBusy ||
+                                                          isBotLabelAllBusy ||
                                                           Boolean(syncingProfileMappingId) ||
                                                           isSyncAllProfilesBusy
                                                         }
@@ -4329,6 +4448,7 @@ function App() {
                                                           size="sm"
                                                           disabled={
                                                             isBridgeAllBusy ||
+                                                            isBotLabelAllBusy ||
                                                             Boolean(syncingProfileMappingId) ||
                                                             isSyncAllProfilesBusy
                                                           }
@@ -4345,6 +4465,7 @@ function App() {
                                                           size="sm"
                                                           disabled={
                                                             isBridgeAllBusy ||
+                                                            isBotLabelAllBusy ||
                                                             Boolean(syncingProfileMappingId) ||
                                                             isSyncAllProfilesBusy
                                                           }
@@ -4363,6 +4484,7 @@ function App() {
                                                       size="sm"
                                                       disabled={
                                                         isBridgeAllBusy ||
+                                                        isBotLabelAllBusy ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         isSyncAllProfilesBusy
                                                       }
@@ -4381,6 +4503,7 @@ function App() {
                                                   size="sm"
                                                   disabled={
                                                     isBridgeAllBusy ||
+                                                    isBotLabelAllBusy ||
                                                     Boolean(syncingProfileMappingId) ||
                                                     isSyncAllProfilesBusy
                                                   }
@@ -5986,7 +6109,8 @@ function App() {
                   <div className="space-y-1">
                     <p className="text-sm font-semibold">Verify email and create mapping</p>
                     <p className="text-xs text-muted-foreground">
-                      Verify email in Bluesky, then create mapping to auto-sync name, bio, avatar, and banner.
+                      Verify email in Bluesky, then create mapping to auto-sync name, bio, avatar, and banner, and
+                      apply the Bluesky bot self-label.
                     </p>
                   </div>
                   <div className="space-y-2 rounded-lg border border-border/70 bg-muted/30 p-3 text-sm">
