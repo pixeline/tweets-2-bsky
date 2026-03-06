@@ -26,6 +26,7 @@ import {
   applyProfileMirrorSyncState,
   bridgeBlueskyAccountToFediverse,
   ensureBlueskyBotSelfLabel,
+  ensureBlueskyDisplayNameBotSuffix,
   fetchTwitterMirrorProfile,
   syncBlueskyProfileFromTwitter,
   validateBlueskyCredentials,
@@ -2406,6 +2407,85 @@ app.post('/api/mappings/bot-label-all', authenticateToken, async (req: any, res)
     total: targets.length,
     labeled,
     alreadyLabeled,
+    failed,
+    failedMappings,
+    mappings: targets.map((mapping) => sanitizeMapping(mapping, usersById, req.user)),
+  });
+});
+
+app.post('/api/mappings/append-bot-name-all', authenticateToken, async (req: any, res) => {
+  if (!canManageOwnMappings(req.user) && !canManageAllMappings(req.user)) {
+    res.status(403).json({ error: 'You do not have permission to update mappings.' });
+    return;
+  }
+
+  const config = getConfig();
+  const usersById = createUserLookupById(config);
+  const manageableMappings = getVisibleMappings(config, req.user).filter((mapping) => canManageMapping(req.user, mapping));
+  const requestedIds = parseMappingIds(req.body?.mappingIds);
+  const requestedIdSet = requestedIds.length > 0 ? new Set(requestedIds) : null;
+  const targets = requestedIdSet
+    ? manageableMappings.filter((mapping) => requestedIdSet.has(mapping.id))
+    : manageableMappings;
+
+  if (targets.length === 0) {
+    res.status(400).json({ error: 'No manageable mappings available for display-name update.' });
+    return;
+  }
+
+  let appended = 0;
+  let alreadyAppended = 0;
+  let failed = 0;
+  let changed = false;
+  const failedMappings: Array<{ id: string; bskyIdentifier: string; error: string }> = [];
+
+  for (const mapping of targets) {
+    try {
+      const result = await ensureBlueskyDisplayNameBotSuffix({
+        bskyIdentifier: mapping.bskyIdentifier,
+        bskyPassword: mapping.bskyPassword,
+        bskyServiceUrl: mapping.bskyServiceUrl,
+      });
+
+      if (result.updated) {
+        appended += 1;
+      } else {
+        alreadyAppended += 1;
+      }
+
+      if (mapping.lastMirroredDisplayName !== result.displayName) {
+        mapping.lastMirroredDisplayName = result.displayName;
+        changed = true;
+      }
+
+      for (const key of [
+        normalizeActor(mapping.bskyIdentifier),
+        normalizeActor(result.bsky.handle),
+        normalizeActor(result.bsky.did),
+      ]) {
+        if (key) {
+          profileCache.delete(key);
+        }
+      }
+    } catch (error) {
+      failed += 1;
+      failedMappings.push({
+        id: mapping.id,
+        bskyIdentifier: mapping.bskyIdentifier,
+        error: getErrorMessage(error, 'Failed to append display-name suffix.'),
+      });
+    }
+  }
+
+  if (changed) {
+    saveConfig(config);
+  }
+
+  res.json({
+    success: true,
+    total: targets.length,
+    appended,
+    alreadyAppended,
     failed,
     failedMappings,
     mappings: targets.map((mapping) => sanitizeMapping(mapping, usersById, req.user)),

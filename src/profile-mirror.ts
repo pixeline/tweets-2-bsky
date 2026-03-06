@@ -106,6 +106,12 @@ export interface EnsureBotSelfLabelResult {
   hasBotLabel: true;
 }
 
+export interface EnsureDisplayNameBotSuffixResult {
+  bsky: BlueskyCredentialValidation;
+  updated: boolean;
+  displayName: string;
+}
+
 const normalizeTwitterUsername = (value: string) => value.trim().replace(/^@/, '').toLowerCase();
 
 const normalizeOptionalString = (value: unknown): string | undefined => {
@@ -533,6 +539,65 @@ export const ensureBlueskyBotSelfLabel = async (args: {
     bsky: credentials,
     updated: true,
     hasBotLabel: true,
+  };
+};
+
+export const ensureBlueskyDisplayNameBotSuffix = async (args: {
+  bskyIdentifier: string;
+  bskyPassword: string;
+  bskyServiceUrl?: string;
+}): Promise<EnsureDisplayNameBotSuffixResult> => {
+  const { agent, credentials } = await loginBlueskyAgent(args);
+  const repo = agent.session?.did || credentials.did;
+  if (!repo) {
+    throw new Error('Missing Bluesky session DID.');
+  }
+
+  let existingProfileRecord: Record<string, unknown> = {
+    $type: 'app.bsky.actor.profile',
+  };
+
+  try {
+    const response = await agent.com.atproto.repo.getRecord({
+      repo,
+      collection: 'app.bsky.actor.profile',
+      rkey: 'self',
+    });
+    if (isRecord(response.data?.value)) {
+      existingProfileRecord = { ...response.data.value };
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const looksLikeMissingRecord = /not found|record.*not.*found|could not locate/i.test(message);
+    if (!looksLikeMissingRecord) {
+      throw error;
+    }
+  }
+
+  const currentDisplayName = normalizeOptionalString(existingProfileRecord.displayName);
+  const nextDisplayName = buildMirroredDisplayName(currentDisplayName, credentials.handle);
+  const currentNormalized = normalizeWhitespace(currentDisplayName || '');
+  const updated = currentNormalized !== nextDisplayName;
+
+  if (updated) {
+    const nextProfileRecord: Record<string, unknown> = {
+      ...existingProfileRecord,
+      $type: 'app.bsky.actor.profile',
+      displayName: nextDisplayName,
+    };
+
+    await agent.com.atproto.repo.putRecord({
+      repo,
+      collection: 'app.bsky.actor.profile',
+      rkey: 'self',
+      record: nextProfileRecord,
+    });
+  }
+
+  return {
+    bsky: credentials,
+    updated,
+    displayName: nextDisplayName,
   };
 };
 

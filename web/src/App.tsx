@@ -44,6 +44,7 @@ type ThemeMode = 'system' | 'light' | 'dark';
 type AuthView = 'login' | 'register';
 type DashboardTab = 'overview' | 'accounts' | 'posts' | 'activity' | 'settings';
 type SettingsSection = 'account' | 'users' | 'twitter' | 'ai' | 'data';
+type BulkAccountsAction = 'sync_profiles' | 'bridge_all' | 'apply_bot_label' | 'append_bot_name';
 
 type AppState = 'idle' | 'checking' | 'backfilling' | 'pacing' | 'processing';
 
@@ -306,6 +307,20 @@ interface BulkBotLabelAllResult {
   mappings?: AccountMapping[];
 }
 
+interface BulkAppendBotNameAllResult {
+  success: boolean;
+  total: number;
+  appended: number;
+  alreadyAppended: number;
+  failed: number;
+  failedMappings?: Array<{
+    id: string;
+    bskyIdentifier: string;
+    error: string;
+  }>;
+  mappings?: AccountMapping[];
+}
+
 interface BootstrapStatus {
   bootstrapOpen: boolean;
 }
@@ -395,6 +410,7 @@ const TAB_PATHS: Record<DashboardTab, string> = {
 const ADD_ACCOUNT_STEPS = ['Sources', 'Create', 'Bluesky', 'Verify & Create'] as const;
 const ADD_ACCOUNT_STEP_COUNT = ADD_ACCOUNT_STEPS.length;
 const ACCOUNT_SEARCH_MIN_SCORE = 22;
+const ACCOUNT_ROWS_BATCH_SIZE = 40;
 const DEFAULT_BACKFILL_LIMIT = 15;
 const FEDIVERSE_BRIDGE_MIN_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_USER_PERMISSIONS: UserPermissions = {
@@ -796,6 +812,7 @@ function App() {
   const [syncingProfileMappingId, setSyncingProfileMappingId] = useState<string | null>(null);
   const [isSyncAllProfilesBusy, setIsSyncAllProfilesBusy] = useState(false);
   const [isBotLabelAllBusy, setIsBotLabelAllBusy] = useState(false);
+  const [isAppendBotNameAllBusy, setIsAppendBotNameAllBusy] = useState(false);
   const [bridgingMappingId, setBridgingMappingId] = useState<string | null>(null);
   const [isBridgeAllBusy, setIsBridgeAllBusy] = useState(false);
   const [bridgeAllProgress, setBridgeAllProgress] = useState<{
@@ -828,6 +845,10 @@ function App() {
   });
   const [accountsViewMode, setAccountsViewMode] = useState<'grouped' | 'global'>('grouped');
   const [accountsSearchQuery, setAccountsSearchQuery] = useState('');
+  const [accountsBulkAction, setAccountsBulkAction] = useState<BulkAccountsAction>('sync_profiles');
+  const [visibleRowsByGroupKey, setVisibleRowsByGroupKey] = useState<Record<string, number>>({});
+  const [showAccountAvatars, setShowAccountAvatars] = useState(false);
+  const [showAccountBios, setShowAccountBios] = useState(false);
   const [postsGroupFilter, setPostsGroupFilter] = useState('all');
   const [postsSearchQuery, setPostsSearchQuery] = useState('');
   const [localPostSearchResults, setLocalPostSearchResults] = useState<LocalPostSearchResult[]>([]);
@@ -1610,6 +1631,13 @@ function App() {
     () => accountMappingsForView.filter((mapping) => mapping.hasBotLabel === true),
     [accountMappingsForView],
   );
+  const isAnyBulkAccountsActionBusy =
+    isSyncAllProfilesBusy ||
+    isBridgeAllBusy ||
+    isBotLabelAllBusy ||
+    isAppendBotNameAllBusy ||
+    Boolean(syncingProfileMappingId) ||
+    Boolean(bridgingMappingId);
   const bridgedMappingsForView = useMemo(
     () =>
       [...accountMappingsForView]
@@ -1749,6 +1777,26 @@ function App() {
     () => filteredGroupedMappings.reduce((total, group) => total + group.mappings.length, 0),
     [filteredGroupedMappings],
   );
+  useEffect(() => {
+    setVisibleRowsByGroupKey((previous) => {
+      const validGroupKeys = new Set(filteredGroupedMappings.map((group) => group.key));
+      const next: Record<string, number> = {};
+
+      for (const [groupKey, count] of Object.entries(previous)) {
+        if (validGroupKeys.has(groupKey)) {
+          next[groupKey] = count;
+        }
+      }
+
+      for (const group of filteredGroupedMappings) {
+        const defaultVisible = Math.min(group.mappings.length, ACCOUNT_ROWS_BATCH_SIZE);
+        const existing = next[group.key] || 0;
+        next[group.key] = Math.max(existing, defaultVisible);
+      }
+
+      return next;
+    });
+  }, [filteredGroupedMappings]);
   const groupKeysForCollapse = useMemo(() => groupedMappings.map((group) => group.key), [groupedMappings]);
   const allGroupsCollapsed = useMemo(
     () =>
@@ -2410,7 +2458,7 @@ function App() {
     if (!authHeaders) {
       return;
     }
-    if (isBotLabelAllBusy || isBridgeAllBusy || isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)) {
+    if (isAnyBulkAccountsActionBusy) {
       showNotice('info', 'Profile or bridge actions are running. Please wait.');
       return;
     }
@@ -2450,6 +2498,74 @@ function App() {
       setIsBotLabelAllBusy(false);
     }
   };
+
+  const handleAppendBotNameToAllAccounts = async () => {
+    if (!authHeaders) {
+      return;
+    }
+    if (isAnyBulkAccountsActionBusy) {
+      showNotice('info', 'A bulk accounts action is already running. Please wait.');
+      return;
+    }
+
+    const candidates = accountMappingsForView.filter((mapping) => canManageMapping(mapping));
+    if (candidates.length === 0) {
+      showNotice('info', 'No accounts available for display-name suffix update.');
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Append {bot} to display names for ${candidates.length} account(s)? This only appends when missing.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setIsAppendBotNameAllBusy(true);
+    try {
+      const response = await axios.post<BulkAppendBotNameAllResult>(
+        '/api/mappings/append-bot-name-all',
+        { mappingIds: candidates.map((mapping) => mapping.id) },
+        { headers: authHeaders },
+      );
+      const result = response.data;
+      await fetchData();
+      const firstFailure = result.failedMappings?.[0];
+      showNotice(
+        result.failed > 0 ? 'info' : 'success',
+        `Display-name append complete: ${result.appended} updated, ${result.alreadyAppended} already set, ${result.failed} failed.${
+          firstFailure ? ` First failure: ${firstFailure.bskyIdentifier} (${firstFailure.error})` : ''
+        }`,
+      );
+    } catch (error) {
+      handleAuthFailure(error, 'Failed to append {bot} to account display names.');
+    } finally {
+      setIsAppendBotNameAllBusy(false);
+    }
+  };
+
+  const handleApplyAllAccountsAction = async () => {
+    if (accountsBulkAction === 'sync_profiles') {
+      await handleSyncAllProfilesFromTwitter();
+      return;
+    }
+    if (accountsBulkAction === 'bridge_all') {
+      await handleBridgeAllEligible();
+      return;
+    }
+    if (accountsBulkAction === 'apply_bot_label') {
+      await handleAddBotLabelToAllAccounts();
+      return;
+    }
+    await handleAppendBotNameToAllAccounts();
+  };
+
+  const showMoreRowsForGroup = useCallback((groupKey: string) => {
+    setVisibleRowsByGroupKey((previous) => ({
+      ...previous,
+      [groupKey]: (previous[groupKey] || ACCOUNT_ROWS_BATCH_SIZE) + ACCOUNT_ROWS_BATCH_SIZE,
+    }));
+  }, []);
 
   const handleUpdateProfileSyncSource = async (mapping: AccountMapping, selectedSource: string) => {
     if (!authHeaders) {
@@ -3932,58 +4048,41 @@ function App() {
                       Add account
                     </Button>
                   ) : null}
+                  <select
+                    className={cn(selectClassName, 'h-9 w-[260px] px-2 py-1 text-xs')}
+                    value={accountsBulkAction}
+                    disabled={isAnyBulkAccountsActionBusy}
+                    onChange={(event) => setAccountsBulkAction(event.target.value as BulkAccountsAction)}
+                  >
+                    <option value="sync_profiles">Apply profile sync to all accounts</option>
+                    <option value="bridge_all">Apply fediverse bridge to eligible accounts</option>
+                    <option value="apply_bot_label">Apply automated-account label to all accounts</option>
+                    <option value="append_bot_name">Apply {'{bot}'} display-name suffix to all accounts</option>
+                  </select>
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={
-                      isSyncAllProfilesBusy || isBridgeAllBusy || isBotLabelAllBusy || Boolean(syncingProfileMappingId)
-                    }
+                    disabled={isAnyBulkAccountsActionBusy}
                     onClick={() => {
-                      void handleSyncAllProfilesFromTwitter();
+                      void handleApplyAllAccountsAction();
                     }}
                   >
-                    {isSyncAllProfilesBusy ? (
+                    {isAnyBulkAccountsActionBusy ? (
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
-                      <RefreshCw className="mr-2 h-4 w-4" />
-                    )}
-                    Sync all
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={
-                      isBridgeAllBusy || isSyncAllProfilesBusy || isBotLabelAllBusy || Boolean(syncingProfileMappingId)
-                    }
-                    onClick={() => {
-                      void handleBridgeAllEligible();
-                    }}
-                  >
-                    {isBridgeAllBusy ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    ) : (
+                    ) : accountsBulkAction === 'bridge_all' ? (
                       <Link2 className="mr-2 h-4 w-4" />
-                    )}
-                    {isBridgeAllBusy && bridgeAllProgress
-                      ? `Bridging ${bridgeAllProgress.completed}/${bridgeAllProgress.total}`
-                      : 'Bridge all'}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={
-                      isBotLabelAllBusy || isBridgeAllBusy || isSyncAllProfilesBusy || Boolean(syncingProfileMappingId)
-                    }
-                    onClick={() => {
-                      void handleAddBotLabelToAllAccounts();
-                    }}
-                  >
-                    {isBotLabelAllBusy ? (
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : accountsBulkAction === 'sync_profiles' ? (
+                      <RefreshCw className="mr-2 h-4 w-4" />
                     ) : (
                       <Bot className="mr-2 h-4 w-4" />
                     )}
-                    Add automated account label to all accounts
+                    {accountsBulkAction === 'sync_profiles'
+                      ? 'Apply sync all'
+                      : accountsBulkAction === 'bridge_all'
+                        ? 'Apply bridge all'
+                        : accountsBulkAction === 'apply_bot_label'
+                          ? 'Apply bot label all'
+                          : 'Apply append {bot} all'}
                   </Button>
                   {isBridgeAllBusy && bridgeAllProgress ? (
                     <Badge variant="outline" className="max-w-[280px] truncate">
@@ -4070,6 +4169,16 @@ function App() {
                   ) : null}
                 </div>
                 <div className="flex flex-wrap items-end justify-end gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setShowAccountAvatars((previous) => !previous)}
+                  >
+                    {showAccountAvatars ? 'Hide avatars (faster)' : 'Show avatars'}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => setShowAccountBios((previous) => !previous)}>
+                    {showAccountBios ? 'Hide bios (faster)' : 'Show bios'}
+                  </Button>
                   {accountsViewMode === 'grouped' ? (
                     <Button
                       size="sm"
@@ -4140,6 +4249,9 @@ function App() {
                   {filteredGroupedMappings.map((group, groupIndex) => {
                     const canCollapseGroup = accountsViewMode === 'grouped';
                     const collapsed = canCollapseGroup ? collapsedGroupKeys[group.key] === true : false;
+                    const visibleRows = visibleRowsByGroupKey[group.key] || ACCOUNT_ROWS_BATCH_SIZE;
+                    const renderedMappings = group.mappings.slice(0, visibleRows);
+                    const remainingMappingsCount = Math.max(0, group.mappings.length - renderedMappings.length);
 
                     return (
                       <div
@@ -4187,8 +4299,9 @@ function App() {
                                 No accounts in this folder yet.
                               </div>
                             ) : (
-                              <div className="overflow-x-auto">
-                                <table className="min-w-full text-left text-sm">
+                              <>
+                                <div className="overflow-x-auto">
+                                  <table className="min-w-full text-left text-sm">
                                   <thead className="border-b border-border text-xs uppercase tracking-wide text-muted-foreground">
                                     <tr>
                                       <th className="px-2 py-3">Owner</th>
@@ -4200,14 +4313,14 @@ function App() {
                                     </tr>
                                   </thead>
                                   <tbody>
-                                    {group.mappings.map((mapping) => {
+                                    {renderedMappings.map((mapping) => {
                                       const queued = isBackfillQueued(mapping.id);
                                       const active = isBackfillActive(mapping.id);
                                       const queuePosition = getBackfillEntry(mapping.id)?.position;
                                       const profile = getProfileForActor(mapping.bskyIdentifier);
                                       const profileHandle = profile?.handle || mapping.bskyIdentifier;
                                       const profileName = profile?.displayName || profileHandle;
-                                      const profileBio = profile?.description?.trim() || '';
+                                      const profileBio = showAccountBios ? profile?.description?.trim() || '' : '';
                                       const profileUrl = `https://bsky.app/profile/${profileHandle}`;
                                       const canManageThisMapping = canManageMapping(mapping);
                                       const canUseFediverseBridge = canBridgeToFediverse(profile?.createdAt);
@@ -4247,12 +4360,14 @@ function App() {
                                           </td>
                                           <td className="px-2 py-3 align-top">
                                             <div className="flex items-center gap-2">
-                                              {profile?.avatar ? (
+                                              {showAccountAvatars && profile?.avatar ? (
                                                 <img
                                                   className="h-8 w-8 rounded-full border border-border/70 object-cover"
                                                   src={profile.avatar}
                                                   alt={profileName}
                                                   loading="lazy"
+                                                  decoding="async"
+                                                  fetchPriority="low"
                                                 />
                                               ) : (
                                                 <div className="flex h-8 w-8 items-center justify-center rounded-full border border-border/70 bg-muted text-muted-foreground">
@@ -4321,7 +4436,7 @@ function App() {
                                                   !canManageThisMapping ||
                                                   !canManageGroupsPermission ||
                                                   isBridgeAllBusy ||
-                                                  isBotLabelAllBusy ||
+                                                  isAnyBulkAccountsActionBusy ||
                                                   isSyncAllProfilesBusy ||
                                                   Boolean(syncingProfileMappingId)
                                                 }
@@ -4351,7 +4466,7 @@ function App() {
                                                       value={mapping.profileSyncSourceUsername || ''}
                                                       disabled={
                                                         isBridgeAllBusy ||
-                                                        isBotLabelAllBusy ||
+                                                        isAnyBulkAccountsActionBusy ||
                                                         isSyncAllProfilesBusy ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         Boolean(bridgingMappingId)
@@ -4375,7 +4490,9 @@ function App() {
                                                     variant="outline"
                                                     size="sm"
                                                     disabled={
-                                                      isBridgeAllBusy || isBotLabelAllBusy || Boolean(syncingProfileMappingId)
+                                                      isBridgeAllBusy ||
+                                                      isAnyBulkAccountsActionBusy ||
+                                                      Boolean(syncingProfileMappingId)
                                                     }
                                                     onClick={() => startEditMapping(mapping)}
                                                   >
@@ -4386,7 +4503,7 @@ function App() {
                                                     size="sm"
                                                     disabled={
                                                       isBridgeAllBusy ||
-                                                      isBotLabelAllBusy ||
+                                                      isAnyBulkAccountsActionBusy ||
                                                       Boolean(syncingProfileMappingId) ||
                                                       isSyncAllProfilesBusy ||
                                                       Boolean(bridgingMappingId)
@@ -4408,7 +4525,7 @@ function App() {
                                                       size="sm"
                                                       disabled={
                                                         isBridgeAllBusy ||
-                                                        isBotLabelAllBusy ||
+                                                        isAnyBulkAccountsActionBusy ||
                                                         Boolean(bridgingMappingId) ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         isSyncAllProfilesBusy
@@ -4432,7 +4549,7 @@ function App() {
                                                         size="sm"
                                                         disabled={
                                                           isBridgeAllBusy ||
-                                                          isBotLabelAllBusy ||
+                                                          isAnyBulkAccountsActionBusy ||
                                                           Boolean(syncingProfileMappingId) ||
                                                           isSyncAllProfilesBusy
                                                         }
@@ -4448,7 +4565,7 @@ function App() {
                                                           size="sm"
                                                           disabled={
                                                             isBridgeAllBusy ||
-                                                            isBotLabelAllBusy ||
+                                                            isAnyBulkAccountsActionBusy ||
                                                             Boolean(syncingProfileMappingId) ||
                                                             isSyncAllProfilesBusy
                                                           }
@@ -4465,7 +4582,7 @@ function App() {
                                                           size="sm"
                                                           disabled={
                                                             isBridgeAllBusy ||
-                                                            isBotLabelAllBusy ||
+                                                            isAnyBulkAccountsActionBusy ||
                                                             Boolean(syncingProfileMappingId) ||
                                                             isSyncAllProfilesBusy
                                                           }
@@ -4484,7 +4601,7 @@ function App() {
                                                       size="sm"
                                                       disabled={
                                                         isBridgeAllBusy ||
-                                                        isBotLabelAllBusy ||
+                                                        isAnyBulkAccountsActionBusy ||
                                                         Boolean(syncingProfileMappingId) ||
                                                         isSyncAllProfilesBusy
                                                       }
@@ -4503,7 +4620,7 @@ function App() {
                                                   size="sm"
                                                   disabled={
                                                     isBridgeAllBusy ||
-                                                    isBotLabelAllBusy ||
+                                                    isAnyBulkAccountsActionBusy ||
                                                     Boolean(syncingProfileMappingId) ||
                                                     isSyncAllProfilesBusy
                                                   }
@@ -4521,8 +4638,21 @@ function App() {
                                       );
                                     })}
                                   </tbody>
-                                </table>
-                              </div>
+                                  </table>
+                                </div>
+                                {remainingMappingsCount > 0 ? (
+                                  <div className="border-t border-border/60 px-3 py-2">
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      onClick={() => showMoreRowsForGroup(group.key)}
+                                    >
+                                      Show {Math.min(ACCOUNT_ROWS_BATCH_SIZE, remainingMappingsCount)} more (
+                                      {remainingMappingsCount} remaining)
+                                    </Button>
+                                  </div>
+                                ) : null}
+                              </>
                             )}
                           </div>
                         </div>
