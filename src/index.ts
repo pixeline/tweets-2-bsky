@@ -707,17 +707,24 @@ interface DownloadedMedia {
   mimeType: string;
 }
 
-async function downloadMedia(url: string): Promise<DownloadedMedia> {
-  const response = await axios({
-    url,
-    method: 'GET',
-    responseType: 'arraybuffer',
-    timeout: 30000,
-  });
-  return {
-    buffer: Buffer.from(response.data as ArrayBuffer),
-    mimeType: (response.headers['content-type'] as string) || 'application/octet-stream',
-  };
+async function downloadMedia(url: string, timeoutMs = 30000): Promise<DownloadedMedia> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await axios({
+      url,
+      method: 'GET',
+      responseType: 'arraybuffer',
+      timeout: timeoutMs,
+      signal: controller.signal,
+    });
+    return {
+      buffer: Buffer.from(response.data as ArrayBuffer),
+      mimeType: (response.headers['content-type'] as string) || 'application/octet-stream',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function uploadToBluesky(agent: BskyAgent, buffer: Buffer, mimeType: string): Promise<BlobRef> {
@@ -1603,7 +1610,7 @@ async function processTweets(
             try {
               console.log(`[${twitterUsername}] 📥 Downloading video: ${videoUrl}`);
               updateAppStatus({ message: `Downloading video: ${path.basename(videoUrl)}` });
-              const { buffer, mimeType } = await downloadMedia(videoUrl);
+              const { buffer, mimeType } = await downloadMedia(videoUrl, 120000);
 
               if (buffer.length <= 90 * 1024 * 1024) {
                 const filename = videoUrl.split('/').pop() || 'video.mp4';
