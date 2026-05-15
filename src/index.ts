@@ -713,24 +713,14 @@ async function downloadMedia(url: string, timeoutMs = 30000): Promise<Downloaded
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await axios({
-      url,
-      method: 'GET',
-      responseType: 'stream',
-      timeout: 15000, // connection/headers phase only
+    const response = await fetch(url, {
       signal: controller.signal,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
     });
-    const mimeType = (response.headers['content-type'] as string) || 'application/octet-stream';
-    return await new Promise<DownloadedMedia>((resolve, reject) => {
-      const chunks: Buffer[] = [];
-      response.data.on('data', (chunk: Buffer) => chunks.push(chunk));
-      response.data.on('end', () => resolve({ buffer: Buffer.concat(chunks), mimeType }));
-      response.data.on('error', reject);
-      // Hard-kill the TCP stream when the wall-clock timeout fires
-      controller.signal.addEventListener('abort', () => {
-        response.data.destroy(new Error(`Download timed out after ${timeoutMs}ms`));
-      });
-    });
+    if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
+    const mimeType = response.headers.get('content-type') || 'application/octet-stream';
+    const arrayBuffer = await response.arrayBuffer();
+    return { buffer: Buffer.from(arrayBuffer), mimeType };
   } finally {
     clearTimeout(timer);
   }
