@@ -623,6 +623,7 @@ async function fetchSyndicationMedia(tweetUrl: string): Promise<{ images: string
     const res = await axios.get('https://publish.twitter.com/oembed', {
       params: { url: normalized },
       headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 10000,
     });
     const html = res.data?.html as string | undefined;
     if (!html) return { images: [] };
@@ -634,6 +635,7 @@ async function fetchSyndicationMedia(tweetUrl: string): Promise<{ images: string
     const syndicationUrl = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}`;
     const syndication = await axios.get(syndicationUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' },
+      timeout: 10000,
     });
     const data = syndication.data as Record<string, unknown>;
     const images = (data?.photos as { url?: string }[] | undefined)
@@ -714,14 +716,21 @@ async function downloadMedia(url: string, timeoutMs = 30000): Promise<Downloaded
     const response = await axios({
       url,
       method: 'GET',
-      responseType: 'arraybuffer',
-      timeout: timeoutMs,
+      responseType: 'stream',
+      timeout: 15000, // connection/headers phase only
       signal: controller.signal,
     });
-    return {
-      buffer: Buffer.from(response.data as ArrayBuffer),
-      mimeType: (response.headers['content-type'] as string) || 'application/octet-stream',
-    };
+    const mimeType = (response.headers['content-type'] as string) || 'application/octet-stream';
+    return await new Promise<DownloadedMedia>((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      response.data.on('data', (chunk: Buffer) => chunks.push(chunk));
+      response.data.on('end', () => resolve({ buffer: Buffer.concat(chunks), mimeType }));
+      response.data.on('error', reject);
+      // Hard-kill the TCP stream when the wall-clock timeout fires
+      controller.signal.addEventListener('abort', () => {
+        response.data.destroy(new Error(`Download timed out after ${timeoutMs}ms`));
+      });
+    });
   } finally {
     clearTimeout(timer);
   }
