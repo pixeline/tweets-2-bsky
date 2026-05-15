@@ -1,12 +1,14 @@
 services:
   tweets-2-bsky:
-    image: j4ckxyz/tweets-2-bsky:latest
+    build: .
+    image: tweets-2-bsky:local
     container_name: tweets-2-bsky
     restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
       TWEETS2BSKY_DATA_DIR: /app/data
+      SCHEDULED_ACCOUNT_TIMEOUT_MS: 1200000 # 20 minutes
     volumes:
       - tweets2bsky_data:/app/data
 
