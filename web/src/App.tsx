@@ -1467,7 +1467,8 @@ function App() {
     const updateCountdown = () => {
       const ms = status.nextCheckTime - Date.now();
       if (ms <= 0) {
-        setCountdown('Checking...');
+        const isActive = status.currentStatus?.state && status.currentStatus.state !== 'idle';
+        setCountdown(isActive ? 'Processing...' : 'Checking...');
         return;
       }
 
@@ -1482,7 +1483,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [status?.nextCheckTime]);
+  }, [status?.nextCheckTime, status?.currentStatus?.state]);
 
   useEffect(() => {
     return () => {
