@@ -32,13 +32,10 @@ ENV NODE_ENV=production \
   HOST=0.0.0.0 \
   PORT=3000 \
   TWEETS2BSKY_DATA_DIR=/app/data \
-  SCHEDULED_ACCOUNT_TIMEOUT_MS=480000 \
-  CHROME_BIN=/usr/bin/chromium \
-  PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+  SCHEDULED_ACCOUNT_TIMEOUT_MS=480000
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-    chromium \
     ca-certificates \
     tini \
   && rm -rf /var/lib/apt/lists/*
