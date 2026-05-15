@@ -1378,7 +1378,7 @@ async function processTweets(
     updateAppStatus({
       state: 'processing',
       currentAccount: twitterUsername,
-      processedCount: count,
+      processedCount: count - 1,
       totalCount: filteredTweets.length,
       message: `Inspecting tweet ${tweetId}`,
     });
