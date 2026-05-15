@@ -9,6 +9,7 @@ RUN apt-get update \
     python3 \
     make \
     g++ \
+    nodejs \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
