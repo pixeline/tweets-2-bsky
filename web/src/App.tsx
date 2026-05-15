@@ -1459,7 +1459,7 @@ function App() {
   }, [token, isAdmin, fetchRuntimeVersion, fetchUpdateStatus]);
 
   useEffect(() => {
-    if (activeTab !== 'overview' || !status?.nextCheckTime) {
+    if (!status?.nextCheckTime) {
       setCountdown('--');
       return;
     }
@@ -1482,7 +1482,7 @@ function App() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [activeTab, status?.nextCheckTime]);
+  }, [status?.nextCheckTime]);
 
   useEffect(() => {
     return () => {
@@ -4177,7 +4177,7 @@ function App() {
                 'h-full transition-all duration-300',
                 currentStatus.state === 'backfilling' ? 'bg-amber-500' : 'bg-emerald-500',
               )}
-              style={{ width: `${progressPercent || 100}%` }}
+              style={{ width: `${progressPercent}%` }}
             />
           </div>
           <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
@@ -5561,7 +5561,10 @@ function App() {
                         >
                           <td className="px-2 py-3 align-top text-xs text-muted-foreground">
                             {activity.created_at
-                              ? new Date(activity.created_at).toLocaleTimeString([], {
+                              ? new Date(activity.created_at).toLocaleString([], {
+                                  year: 'numeric',
+                                  month: 'short',
+                                  day: 'numeric',
                                   hour: '2-digit',
                                   minute: '2-digit',
                                 })
